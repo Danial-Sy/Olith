@@ -279,8 +279,8 @@ def save_manifest(version: str, tag: str, files: list[Path]) -> None:
 def stale_files(new_files: list[Path]) -> list[Path]:
     """Files the previous release installed that this one no longer ships.
 
-    Only files this updater put there are ever removed. Without a manifest —
-    the first update, or a copy installed by hand — nothing is deleted.
+    Only files this updater put there are ever removed. Without a manifest,
+    meaning the first update or a copy installed by hand, nothing is deleted.
     """
     previous = load_manifest().get("files")
     if not isinstance(previous, list):
@@ -366,7 +366,7 @@ def venv_python() -> Path:
 def refresh_dependencies() -> None:
     py = venv_python()
     if not py.exists():
-        log("No virtualenv here yet — run setup before launching.")
+        log("No virtualenv here yet. Run setup before launching.")
         return
     log("Requirements changed; updating Python packages…")
     try:

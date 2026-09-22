@@ -262,6 +262,8 @@ const state = {
   effortMeta: {},
   modelDefaults: {},
   computerUse: false,
+  // Whether this machine's desktop can be driven at all, from /api/models.
+  desktop: null,
   // Which model runs the job. One model per run.
   agentModel: null,
   abortController: null,
@@ -436,6 +438,7 @@ function beginInlineUserEdit(el, m) {
 async function resubmitEditedMessage(mid, text) {
   if (state.streaming) return;
   state.streaming = true;
+  document.body.classList.toggle("cu-running", isAgenticMode() && state.computerUse);
   state.abortController = new AbortController();
   setSendMode("stop");
   startPendingPoll();
@@ -775,6 +778,17 @@ function syncThinkToggle() {
     const showChip = showToggle && effectiveThinking;
     chip.hidden = !showChip;
   }
+
+  // Effort is a slider three menus deep, and it changes how long every reply
+  // takes. Naming the tier beside the model means the composer says what the
+  // next message will cost before it is sent.
+  const eChip = $("#effortChip");
+  if (eChip) {
+    const active = currentEffort();
+    eChip.textContent = state.effortMeta[active]?.label || active;
+    eChip.title = state.effort === null ? "Effort: this model's default" : "Reasoning effort";
+    eChip.hidden = state.effortLevels.length < 2;
+  }
 }
 
 
@@ -997,11 +1011,21 @@ function showCompact(show) {
 
 function currentModelKey(mode = state.mode) {
   if (isAgenticMode(mode)) {
-    // Computer use needs eyes, so it routes to whichever agentic model has them.
-    if (state.computerUse && state.visionModel) return state.visionModel;
+    // Computer use needs eyes. The chat's own pick keeps the job whenever it
+    // has them; only a blind pick is routed elsewhere. Always taking
+    // state.visionModel is what pinned the feature to one model no matter what
+    // the picker said.
+    if (state.computerUse && !modelMeta(state.agentModel)?.vision) {
+      return state.visionModel || state.agentModel;
+    }
     return state.agentModel;
   }
   return state.chatModel;
+}
+
+/** Every installed model that can drive the desktop: eyes plus tool calling. */
+function visionModels() {
+  return (state.registry?.roles?.vision) || (state.visionModel ? [state.visionModel] : []);
 }
 
 /** Deep reasoning is the chat model with thinking on, not a model of its own. */
@@ -1025,6 +1049,7 @@ async function loadModelRegistry() {
     if (m.effort) state.modelDefaults[m.id] = m.effort;
   });
   state.registry = reg;
+  state.desktop = reg.desktop || state.desktop;
   const active = reg.active || {};
   state.visionModel = active.vision || null;
   if (!state.chatModel || !state.modelsById[state.chatModel]) state.chatModel = active.chat || null;
@@ -1088,10 +1113,10 @@ function pickNote(role, blocked) {
   }
   if (role === "agentic") {
     return meta.can?.agentic
-      ? `${label} is loaded but is not assigned to Agentic. Pick one that is — Aether will warm it for you.`
-      : `${label} is loaded, but it has no tool calling, so it cannot run Agentic. Pick a model that does — Aether will warm it for you.`;
+      ? `${label} is loaded but is not assigned to Agentic. Pick one that is and Aether will warm it for you.`
+      : `${label} is loaded, but it has no tool calling, so it cannot run Agentic. Pick a model that does and Aether will warm it for you.`;
   }
-  return `${label} is loaded but is not assigned to Chat. Pick a model that is — Aether will warm it for you.`;
+  return `${label} is loaded but is not assigned to Chat. Pick a model that is and Aether will warm it for you.`;
 }
 
 /** Choose the model a tab switch should warm. Resolves to an id, or null when
@@ -1167,17 +1192,34 @@ function syncModelPicker() {
   const cuCheck = $("#computerUseCheck");
   const cuDesc = $("#computerUseDesc");
   if (cu) {
-    const ok = !!state.visionModel;
+    const hasEyes = visionModels().length > 0;
+    // Two ways this can be unavailable, and the user needs to know which:
+    // nothing installed can see, or the desktop itself cannot be driven.
+    const canDrive = state.desktop ? state.desktop.ok !== false : true;
+    const ok = hasEyes && canDrive;
+    const runsOn = currentModelKey();
     cu.disabled = !ok;
     cu.classList.toggle("disabled", !ok);
     cu.classList.toggle("active", !!state.computerUse);
     if (cuCheck) cuCheck.hidden = !state.computerUse;
     if (cuDesc) {
-      cuDesc.textContent = ok
-        ? `Screenshots and UI guidance (uses ${modelMeta(state.visionModel)?.label || state.visionModel})`
-        : "No installed model can see images";
+      // Aiming is a trained skill, not a side effect of having eyes, and the
+      // difference shows up as clicks that miss. Say so where the toggle is.
+      const grounded = visionModels().some((id) => modelMeta(id)?.grounding);
+      const runsOnLabel = modelMeta(runsOn)?.label || runsOn;
+      cuDesc.textContent = !hasEyes
+        ? "No installed model can both see and call tools"
+        : !canDrive
+          ? `Unavailable: ${state.desktop.reason || "this desktop cannot be driven"}`
+          : !grounded
+            ? `Runs on ${runsOnLabel}. Install Qwen3-VL from Models for accurate aiming.`
+            : modelMeta(state.agentModel)?.vision
+              ? "Aether clicks and types on your screen"
+              : `Aether clicks and types on your screen (runs on ${runsOnLabel})`;
     }
   }
+  const cuChip = $("#computerChip");
+  if (cuChip) cuChip.hidden = !(isAgenticMode() && state.computerUse);
   syncThinkToggle();
 }
 
@@ -1217,7 +1259,7 @@ async function warmModelKey(key) {
   const meta = modelMeta(key) || {};
   showModelWarm(true, meta.short || meta.label || key);
   try {
-    await api(`/api/warmup/model/${key}`, { method: "POST", body: "{}" });
+    await api(`/api/warmup/model/${encodeURIComponent(key)}`, { method: "POST", body: "{}" });
     state.warmedKey = key;
   } finally {
     showModelWarm(false);
@@ -1267,8 +1309,8 @@ async function syncWarmedKey() {
  *
  * Switching tabs is not a reason to change models: whatever is already in VRAM
  * carries over when it can serve the tab, so the switch costs nothing. Only a
- * model that cannot — no tool calling for Agentic, or unassigned to the tab —
- * forces a load, and then the choice of what to load is the user's.
+ * model that cannot serve it, with no tool calling for Agentic or unassigned
+ * to the tab, forces a load, and then what to load is the user's choice.
  */
 async function modelForTab(role) {
   const loaded = await syncWarmedKey();
@@ -1962,6 +2004,7 @@ function setSendMode(mode) {
 
 function finishStreamingUI() {
   state.streaming = false;
+  document.body.classList.remove("cu-running");
   state.abortController = null;
   stopPendingPoll();
   // The run is over, so the chip goes back to naming the selection.
@@ -2016,6 +2059,7 @@ async function sendMessage() {
   });
 
   state.streaming = true;
+  document.body.classList.toggle("cu-running", isAgenticMode() && state.computerUse);
   state.abortController = new AbortController();
   setSendMode("stop");
   startPendingPoll();
@@ -2456,10 +2500,148 @@ function autosizeInput() {
   ta.style.height = Math.min(180, ta.scrollHeight) + "px";
 }
 
-async function setComputerOverlay(enabled) {
+/** Reflect computer use in the app. The desktop marker is raised by the server
+ *  when a run starts and dropped when it ends, so arming the switch no longer
+ *  paints a border around an idle screen; turning it off still clears one a
+ *  stopped run left behind. */
+/** Accounts Aether is allowed to act in.
+ *
+ *  A sign-in happens in Aether's browser window, performed by the user: no
+ *  password is typed here, and none is stored. What persists afterwards is the
+ *  session in that browser's own profile, which is the only thing Google and
+ *  the rest actually accept. Keys for services that use them go to the
+ *  operating system's keyring and are never shown again.
+ */
+async function refreshConnections() {
+  const list = $("#connList");
+  const available = $("#connAvailable");
+  const foot = $("#connFoot");
+  if (!list) return;
+  let data;
   try {
-    await api("/api/computer-overlay", { method: "POST", body: JSON.stringify({ enabled: !!enabled }) });
-  } catch {}
+    data = await api("/api/connections");
+  } catch (e) {
+    list.innerHTML = `<p class="conn-empty">${e.message || "Could not load connections"}</p>`;
+    return;
+  }
+  state.connections = data;
+  list.innerHTML = "";
+  if (!data.connections.length) {
+    list.innerHTML = '<p class="conn-empty">Nothing connected yet.</p>';
+  }
+  data.connections.forEach((c) => list.appendChild(connectionRow(c)));
+  available.innerHTML = "";
+  data.available.forEach((c) => available.appendChild(offerRow(c)));
+  if (foot) {
+    foot.textContent = data.keyring.ok
+      ? "Sign-ins are kept as sessions in Aether's browser. Keys go to your system keyring."
+      : `Keys cannot be stored here: ${data.keyring.backend}. Browser sign-ins still work.`;
+  }
+}
+
+function connectionRow(c) {
+  const row = document.createElement("div");
+  row.className = `conn-row ${c.status === "connected" ? "live" : ""}`;
+  const dot = c.status === "connected" ? "●" : "○";
+  row.innerHTML = `
+    <div class="conn-main">
+      <span class="conn-dot">${dot}</span>
+      <span class="conn-name">${escapeHtml(c.label)}</span>
+      <span class="conn-status">${escapeHtml(c.status)}</span>
+    </div>
+    <div class="conn-note">${escapeHtml(c.note || "")}</div>`;
+  const actions = document.createElement("div");
+  actions.className = "conn-actions";
+  if (c.kind === "session") {
+    actions.appendChild(connButton("Sign in", async () => {
+      const r = await api(`/api/connections/${c.id}/sign-in`, { method: "POST", body: "{}" });
+      setStatus(r.next || "Browser opened");
+      await refreshConnections();
+    }));
+    actions.appendChild(connButton("Check", async () => {
+      const r = await api(`/api/connections/${c.id}/check`, { method: "POST", body: "{}" });
+      setStatus(r.status === "connected" ? `${c.label} is connected` : `${c.label} is not signed in yet`);
+      await refreshConnections();
+    }));
+  } else {
+    actions.appendChild(connButton(c.has_secret ? "Replace key" : "Add key", () => askForKey(c.id, c.label)));
+  }
+  actions.appendChild(connButton("Forget", async () => {
+    await api(`/api/connections/${c.id}`, { method: "DELETE" });
+    await refreshConnections();
+  }, "danger"));
+  row.appendChild(actions);
+  return row;
+}
+
+function offerRow(c) {
+  const row = document.createElement("div");
+  row.className = "conn-row offer";
+  row.innerHTML = `
+    <div class="conn-main"><span class="conn-name">${escapeHtml(c.label)}</span></div>
+    <div class="conn-note">${escapeHtml(c.note || "")}</div>`;
+  const actions = document.createElement("div");
+  actions.className = "conn-actions";
+  actions.appendChild(connButton("Connect", async () => {
+    await api("/api/connections", { method: "POST", body: JSON.stringify({ id: c.id }) });
+    if (c.kind === "session") {
+      const r = await api(`/api/connections/${c.id}/sign-in`, { method: "POST", body: "{}" });
+      setStatus(r.next || "Browser opened");
+    } else {
+      askForKey(c.id, c.label);
+    }
+    await refreshConnections();
+  }));
+  row.appendChild(actions);
+  return row;
+}
+
+function connButton(label, onClick, extra = "") {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = `conn-btn ${extra}`;
+  b.textContent = label;
+  b.onclick = async () => {
+    b.disabled = true;
+    try {
+      await onClick();
+    } catch (e) {
+      setStatus(e.message || "That did not work");
+    } finally {
+      b.disabled = false;
+    }
+  };
+  return b;
+}
+
+async function askForKey(id, label) {
+  // Typed once, sent straight to the keyring, never read back into the app.
+  const value = prompt(`Key or token for ${label}. It goes to your system keyring, not to a file here.`);
+  if (!value) return;
+  try {
+    await api(`/api/connections/${id}/secret`, {
+      method: "POST",
+      body: JSON.stringify({ value }),
+    });
+    setStatus(`${label} key stored`);
+  } catch (e) {
+    setStatus(e.message || "Could not store that key");
+  }
+  await refreshConnections();
+}
+
+function openConnections() {
+  const tab = document.querySelector('.side-tab[data-panel="connections"]');
+  if (tab) tab.click();
+  $("#app").classList.remove("sidebar-collapsed");
+}
+
+async function setComputerOverlay(enabled) {
+  if (!enabled) {
+    try {
+      await api("/api/computer-overlay", { method: "POST", body: JSON.stringify({ enabled: false }) });
+    } catch {}
+  }
   document.body.classList.toggle("cu-active", !!enabled);
 }
 
@@ -2515,6 +2697,43 @@ function wireUI() {
     };
   }
 
+  const addSite = $("#btnAddSite");
+  if (addSite) {
+    addSite.onclick = async () => {
+      // Any site, not just the three that ship: the registry is the same shape
+      // whatever is on the other end of it.
+      const url = prompt("Sign-in page of the site, e.g. https://app.example.com/login");
+      if (!url) return;
+      let host;
+      try {
+        host = new URL(url.startsWith("http") ? url : `https://${url}`).hostname;
+      } catch (_) {
+        return setStatus("That does not look like a web address");
+      }
+      const id = host.replace(/^www\./, "").split(".")[0];
+      await api("/api/connections", {
+        method: "POST",
+        body: JSON.stringify({ id, kind: "session", sign_in_url: url, label: host }),
+      });
+      const r = await api(`/api/connections/${id}/sign-in`, { method: "POST", body: "{}" });
+      setStatus(r.next || "Browser opened");
+      await refreshConnections();
+    };
+  }
+  const addKey = $("#btnAddKey");
+  if (addKey) {
+    addKey.onclick = async () => {
+      const name = prompt("What is this key for? e.g. openai, notion, home-assistant");
+      if (!name) return;
+      const id = name.trim().toLowerCase().replace(/\s+/g, "-");
+      await api("/api/connections", {
+        method: "POST",
+        body: JSON.stringify({ id, kind: "secret", label: name.trim() }),
+      });
+      await askForKey(id, name.trim());
+    };
+  }
+
   $$(".side-tab").forEach((tab) => {
     tab.onclick = () => {
       $$(".side-tab").forEach((t) => t.classList.remove("active"));
@@ -2522,6 +2741,7 @@ function wireUI() {
       tab.classList.add("active");
       $(`#panel-${tab.dataset.panel}`).classList.add("active");
       if (tab.dataset.panel === "models") refreshModelsPanel();
+      if (tab.dataset.panel === "connections") refreshConnections();
     };
   });
   wireLibrary();
@@ -2607,9 +2827,14 @@ function wireUI() {
   $("#btnComputerUse").onclick = async (e) => {
     e.stopPropagation();
     const next = !state.computerUse;
-    // currentModelKey() still sees computerUse=true when turning it off, so it
-    // reports the vision model and warms the one we are switching away from.
-    const key = next ? state.visionModel : state.agentModel;
+    // Turning it on keeps the model already selected whenever that model can
+    // see; only a blind selection is moved. Switching unconditionally to the
+    // one vision model is what made this feature look like it belonged to a
+    // single model. currentModelKey() still reads the old flag here, so the
+    // target is worked out from the selection rather than from it.
+    const key = next
+      ? (modelMeta(state.agentModel)?.vision ? state.agentModel : state.visionModel)
+      : state.agentModel;
     if (next && !key) return;
     const ok = await ensureModelWarm(key, {
       confirm: true,
@@ -2618,7 +2843,7 @@ function wireUI() {
     if (!ok) return;
     state.computerUse = next;
     state.mode = "agentic";
-    if (next && state.visionModel) state.agentModel = state.visionModel;
+    if (next) state.agentModel = key;
     syncModeUI();
     await setComputerOverlay(state.computerUse);
     await patchChatModel();
@@ -2654,6 +2879,11 @@ function wireUI() {
     if (!btn) return;
     const action = btn.dataset.action;
     closePlus();
+    if (action === "connections") {
+      openConnections();
+      await refreshConnections();
+      return;
+    }
     if (action === "files") {
       try {
         const picked = await api("/api/pick-files", { method: "POST", body: "{}" });

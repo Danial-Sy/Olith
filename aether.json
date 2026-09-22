@@ -1,6 +1,6 @@
 {
   "name": "Aether",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "launch": "Aether.bat",
   "launch_linux": "./aether.sh",
   "desktop_shortcut": "%USERPROFILE%\\Desktop\\Aether.lnk",

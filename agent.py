@@ -17,10 +17,20 @@ import time
 from pathlib import Path
 from typing import Any
 
+import browser
+import computer
+import policy as policy_mod
+import symbols
+from browser import ACTIONS as BROWSER_ACTIONS
+from computer import ACTIONS as COMPUTER_ACTIONS
 from config import DATA
 from storage import load_settings
 
 READ_FILE_CONTENT_MAX_CHARS = 7200
+# An outline earns its place only by being far cheaper than reading the file.
+# Full signatures are what make it expensive, and the leading parameters are
+# the part that identifies the definition.
+OUTLINE_SIGNATURE_CHARS = 90
 MAX_EDIT_RANGES = 64
 
 # Every tool overwrite snapshots the previous contents here first.
@@ -62,11 +72,27 @@ TOOL_DEFS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text file. Optionally slice by line range.",
+            # Two sentences, and the length matters: a four-sentence version
+            # cost qwen3-coder:30b two prompts, reproducibly.
+            "description": (
+                "Read a text file, one named function or class from it, or just its "
+                "outline. Prefer symbol to a line range when you know the name."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
+                    "symbol": {
+                        "type": "string",
+                        "description": (
+                            "Function or class to return, e.g. parse_version or "
+                            "Config.load. Python is exact; JS/TS is best effort."
+                        ),
+                    },
+                    "outline": {
+                        "type": "boolean",
+                        "description": "List what the file defines instead of reading it.",
+                    },
                     "start_line": {"type": "integer"},
                     "end_line": {"type": "integer"},
                 },
@@ -406,6 +432,137 @@ TOOL_DEFS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "computer",
+            "description": (
+                "Look at this machine's screen and drive its mouse and keyboard. Send "
+                "`actions` with every step you are already sure of, in order: one "
+                "screenshot comes back at the end, and each separate call costs a whole "
+                "turn. Coordinates are pixels on the screenshot you were last shown, not "
+                "on the physical display. Use run_shell to launch an application; use "
+                "this to work inside it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": (
+                            "Several steps in one turn, each the same shape as a single "
+                            'call: [{"action": "key", "text": "ctrl+alt+1"}, '
+                            '{"action": "type", "text": "The Title"}, '
+                            '{"action": "key", "text": "Return"}]. They run in order and '
+                            "stop at the first one refused. Use this whenever the next few "
+                            "steps do not depend on what the screen does in between."
+                        ),
+                    },
+                    "action": {
+                        "type": "string",
+                        # From the module that performs them, so the schema the
+                        # model reads and the dispatcher cannot disagree.
+                        "enum": list(COMPUTER_ACTIONS),
+                        "description": (
+                            "elements: the named widgets of the active window, each with a "
+                            "ref. screenshot: look, optionally at a region. click/"
+                            "double_click/right_click/middle_click/move: at a ref, or at "
+                            "x,y. drag: x,y to to_x,to_y. type: text at x,y (clicks there "
+                            "first when given). key: a combination in text. scroll: "
+                            "direction at x,y. wait: seconds."
+                        ),
+                    },
+                    "ref": {
+                        "type": "string",
+                        "description": (
+                            "A widget ref from the last `elements` call, e.g. a3. Aim with "
+                            "this rather than x,y wherever the window offers it: the click "
+                            "lands in the middle of that widget, with nothing to estimate."
+                        ),
+                    },
+                    "x": {"type": "integer", "description": "Horizontal pixel on the last screenshot."},
+                    "y": {"type": "integer", "description": "Vertical pixel on the last screenshot."},
+                    "to_x": {"type": "integer", "description": "Drag destination."},
+                    "to_y": {"type": "integer", "description": "Drag destination."},
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "Text to type, or for action=key the combination, "
+                            "e.g. ctrl+l, Return, alt+Tab, F5."
+                        ),
+                    },
+                    "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                    "amount": {"type": "integer", "description": "Scroll notches, default 3."},
+                    "confirm": {
+                        "type": "string",
+                        "description": (
+                            "Pass \"replace_selection\" to type or press Return over a "
+                            "selection on purpose. Without it, acting on a select-all is "
+                            "refused, because it overwrites the whole document."
+                        ),
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": (
+                            "Times to repeat a key press, 1-10. Use this instead of "
+                            "sending the same key again and again."
+                        ),
+                    },
+                    "seconds": {"type": "number", "description": "Seconds to wait, for action=wait."},
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": (
+                            "[x, y, width, height] on the last screenshot. With "
+                            "action=screenshot this returns that area magnified, which is how "
+                            "to read text too small to make out."
+                        ),
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser",
+            "description": (
+                "Drive a web page through the browser itself rather than through pixels: "
+                "elements come back as refs with names, text comes back as text, and typing "
+                "is one insert. Use this for anything in a browser, including web "
+                "applications like Google Docs, and the computer tool only for the desktop "
+                "around it. Aether opens its own browser window; sign in there once and it "
+                "stays signed in."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": list(BROWSER_ACTIONS),
+                        "description": (
+                            "open: go to url. snapshot: the clickable elements, each with a "
+                            "ref. read: the page as text. click/fill: act on a ref (fill "
+                            "replaces the field's contents with text). type: insert text "
+                            "wherever the caret is. key: a combination, e.g. ctrl+alt+1. "
+                            "scroll, back, status, close."
+                        ),
+                    },
+                    "url": {"type": "string"},
+                    "ref": {
+                        "type": "string",
+                        "description": "An element ref from the last snapshot, e.g. e12.",
+                    },
+                    "text": {"type": "string", "description": "Text to type, or the key combination."},
+                    "direction": {"type": "string", "enum": ["up", "down"]},
+                    "amount": {"type": "integer"},
+                    "count": {"type": "integer", "description": "Repeat a key press, 1-10."},
+                },
+                "required": ["action"],
+            },
+        },
+    },
 ]
 
 # A sub-agent inspects and reports, never mutates. Read-only means a delegation
@@ -450,6 +607,87 @@ def project_is_large(project_root: Path | None) -> bool:
 _TOOL_DEFS_NO_DELEGATE = [t for t in TOOL_DEFS if t["function"]["name"] != "delegate"]
 
 
+# What a wrong choice costs, most to least. One list decides which tools a
+# budgeted model gets and where each one sits in the list it is shown, so
+# ranking a new tool once keeps those two from disagreeing. The reading and
+# editing lead was measured rather than chosen.
+TOOL_PRIORITY = (
+    "read_file", "edit_file", "search_files", "run_shell", "browser", "computer",
+    "write_file",
+    "list_dir", "todo_write",
+    "validate_file", "append_file", "git_status", "check_toolchains",
+    "remember", "ask_user", "delegate",
+)
+
+# Names models reach for instead of ours. PA-Tool (arXiv:2510.07248) found this
+# error class dominates in small models, and that aligning it cut those errors
+# by 80%. The paper renames tools; aliasing instead is additive, since a model
+# emitting the real name never takes this path.
+TOOL_ALIASES = {
+    "bash": "run_shell", "shell": "run_shell", "terminal": "run_shell",
+    "execute_command": "run_shell", "execute_bash": "run_shell",
+    "run_command": "run_shell", "run_terminal_cmd": "run_shell",
+    "cat": "read_file", "open_file": "read_file", "view_file": "read_file",
+    "get_file": "read_file", "read": "read_file",
+    "create_file": "write_file", "new_file": "write_file",
+    "save_file": "write_file",
+    "str_replace": "edit_file", "replace_in_file": "edit_file",
+    "apply_patch": "edit_file", "modify_file": "edit_file",
+    "update_file": "edit_file", "patch_file": "edit_file",
+    "ls": "list_dir", "dir": "list_dir", "list_files": "list_dir",
+    "list_directory": "list_dir",
+    "grep": "search_files", "search": "search_files", "find": "search_files",
+    "ripgrep": "search_files", "search_code": "search_files",
+    "lint": "validate_file", "check_syntax": "validate_file",
+    "git": "git_status",
+    "todo": "todo_write", "update_todo": "todo_write",
+    "write_todo": "todo_write", "update_plan": "todo_write",
+    "save_memory": "remember", "memorize": "remember",
+    "ask": "ask_user", "ask_question": "ask_user",
+    "spawn_agent": "delegate", "subagent": "delegate",
+    **{k: "computer" for k in (
+        "screenshot", "take_screenshot", "capture_screen", "screen_capture",
+        "click", "mouse_click", "left_click", "double_click", "right_click",
+        "move_mouse", "mouse_move", "type_text", "keyboard_type", "press_key",
+        "key_press", "hotkey", "mouse_scroll", "mouse_drag", "computer_use",
+        "desktop", "gui",
+    )},
+}
+
+# An alias like `press_key` names the action too, and the arguments cannot
+# recover it: typing and a hotkey both carry only `text`.
+COMPUTER_ALIAS_ACTIONS = {
+    "screenshot": "screenshot", "take_screenshot": "screenshot",
+    "capture_screen": "screenshot", "screen_capture": "screenshot",
+    "click": "click", "mouse_click": "click", "left_click": "click",
+    "double_click": "double_click", "right_click": "right_click",
+    "move_mouse": "move", "mouse_move": "move",
+    "type_text": "type", "keyboard_type": "type",
+    "press_key": "key", "key_press": "key", "hotkey": "key",
+    "mouse_scroll": "scroll", "mouse_drag": "drag",
+}
+
+
+def apply_alias_defaults(raw_name: str, name: str, args: dict) -> dict:
+    """Fill in what the canonical name dropped when an alias carried it."""
+    if name != "computer" or not isinstance(args, dict) or args.get("action"):
+        return args
+    action = COMPUTER_ALIAS_ACTIONS.get(str(raw_name or "").strip().lower())
+    if not action:
+        return args
+    return {**args, "action": action}
+
+
+def canonical_tool_name(name: str) -> str:
+    """The registered tool a model meant. A real tool name always wins, so an
+    alias can never shadow one."""
+    if not isinstance(name, str):
+        return name
+    if name in _known_tool_names():
+        return name
+    return TOOL_ALIASES.get(name.strip().lower(), name)
+
+
 # Dropped in this order when the schemas would eat too much of a small window.
 # Everything after this list is what agentic work cannot be done without, so it
 # is never trimmed. ask_user goes last because losing it makes the agent guess.
@@ -480,7 +718,88 @@ def trim_tool_defs(defs: list[dict], ctx_limit: int | None) -> list[dict]:
     return kept
 
 
-def tool_defs_for(chat: dict | None, ctx_limit: int | None = None) -> list[dict]:
+ESSENTIAL_TOOLS = tuple(
+    t["function"]["name"] for t in TOOL_DEFS if t["function"]["name"] not in TRIM_ORDER
+)
+
+
+# Splitting on ". " alone cuts "e.g. parse_version" down to "e.g.", throwing
+# away the example that made the description worth keeping.
+_ABBREVIATIONS = ("e.g", "i.e", "etc", "vs", "cf", "approx", "ie", "eg")
+
+
+def _first_sentence(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    parts = text.split(". ")
+    head, i = parts[0], 1
+    while i < len(parts) and head.rsplit(" ", 1)[-1].lower() in _ABBREVIATIONS:
+        head += ". " + parts[i]
+        i += 1
+    return head.rstrip(".") + "."
+
+
+def _lean_prose(node: object) -> None:
+    """Trim every `description` in a parameter tree, in place.
+
+    Descriptions are prose wherever they appear, including inside nested
+    properties. What the call has to satisfy is `type`, `required`, `enum` and
+    `items`, and none of those are touched.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "description" and isinstance(value, str):
+                node[key] = _first_sentence(value)
+            else:
+                _lean_prose(value)
+    elif isinstance(node, list):
+        for item in node:
+            _lean_prose(item)
+
+
+def _lean_def(spec: dict) -> dict:
+    """The same schema with its prose cut to one sentence per description.
+
+    todo_write alone spends ~200 tokens explaining merge semantics a 3B will
+    not follow, and those are the tokens the work needs.
+    """
+    out = copy.deepcopy(spec)
+    fn = out["function"]
+    if fn.get("description"):
+        fn["description"] = _first_sentence(fn["description"]) or fn["description"]
+    _lean_prose(fn.get("parameters"))
+    return out if out != spec else spec
+
+
+def apply_policy(defs: list[dict], policy: dict | None) -> list[dict]:
+    """Budget and order the schemas for one model. The full-tier policy is the
+    identity, so a run on the tuned pair gets back exactly what it passed in."""
+    if not policy:
+        return defs
+    budget = policy.get("tool_budget")
+    kept = defs
+    if budget:
+        by_name = {t["function"]["name"]: t for t in defs}
+        # Rank present tools, essentials first so a budget can never drop one.
+        ranked = sorted(
+            by_name,
+            key=lambda n: (n not in ESSENTIAL_TOOLS, TOOL_PRIORITY.index(n)
+                           if n in TOOL_PRIORITY else len(TOOL_PRIORITY)),
+        )
+        chosen = set(ranked[:max(int(budget), len(ESSENTIAL_TOOLS))])
+        kept = [t for t in defs if t["function"]["name"] in chosen]
+    if policy.get("order_tools"):
+        rank = {n: i for i, n in enumerate(TOOL_PRIORITY)}
+        by_priority = sorted(kept, key=lambda t: rank.get(t["function"]["name"], len(rank)))
+        kept = policy_mod.edge_order(by_priority)
+    if policy.get("lean_schemas"):
+        kept = [_lean_def(t) for t in kept]
+    return kept
+
+
+def tool_defs_for(chat: dict | None, ctx_limit: int | None = None,
+                  profile: dict | None = None) -> list[dict]:
     """Tool schemas for this run. Sub-agents get a restricted, non-recursive set."""
     # Presence of the key marks a sub-run, not its truthiness. An empty spec is
     # falsy, and reading that as "not a sub-agent" hands the child delegate.
@@ -488,17 +807,25 @@ def tool_defs_for(chat: dict | None, ctx_limit: int | None = None) -> list[dict]
         # Set once per run by the loop, the only place that knows the project
         # root. Absent means gated off, which is the safe default.
         base = TOOL_DEFS if (chat or {}).get("delegate_available") else _TOOL_DEFS_NO_DELEGATE
-        return trim_tool_defs(base, ctx_limit)
+        # 821 tokens of schema for a desktop nobody asked it to touch, and a
+        # standing invitation to click on one. Off unless the chat turned it on.
+        if not (chat or {}).get("computer_use"):
+            base = [t for t in base if t["function"]["name"] not in ("computer", "browser")]
+        return trim_tool_defs(apply_policy(base, policy_mod.policy_for(profile)), ctx_limit)
     spec = chat.get("subagent") or {}
     allowed = {str(t) for t in (spec.get("tools") or SUBAGENT_DEFAULT_TOOLS)}
     # Never recursive: a sub-agent that can delegate can spawn without bound.
     allowed.discard("delegate")
+    # A sub-agent inspects and reports. Clicking is the least reversible thing
+    # Aether can do, and it belongs to the run the user is watching.
+    allowed.discard("computer")
+    allowed.discard("browser")
     picked = [t for t in TOOL_DEFS if t["function"]["name"] in allowed]
     # An empty allowlist would leave the sub-agent unable to do anything at all.
     picked = picked or [
         t for t in TOOL_DEFS if t["function"]["name"] in SUBAGENT_DEFAULT_TOOLS
     ]
-    return trim_tool_defs(picked, ctx_limit)
+    return trim_tool_defs(apply_policy(picked, policy_mod.policy_for(profile)), ctx_limit)
 
 
 # Never the answer to "where is my code". Scanning them floods results with
@@ -687,6 +1014,22 @@ def run_tool(
             return _remember(args, project_id)
         if name == "todo_write":
             return _todo_write(args, chat)
+        if name == "computer":
+            # Withholding the schema is only advice, and a model that names
+            # the tool anyway must not get the mouse.
+            if not (chat or {}).get("computer_use"):
+                return json.dumps({
+                    "error": "Computer use is off for this chat.",
+                    "hint": "Tell the user to turn it on in the model menu. Do not retry.",
+                })
+            return computer.run(args)
+        if name == "browser":
+            if not (chat or {}).get("computer_use"):
+                return json.dumps({
+                    "error": "Computer use is off for this chat.",
+                    "hint": "Tell the user to turn it on in the model menu. Do not retry.",
+                })
+            return browser.run(args)
         return json.dumps({"error": f"Unknown tool: {name}"})
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -1065,6 +1408,91 @@ def _list_dir(args: dict, project_root: Path | None) -> str:
     return json.dumps({"path": str(path), "entries": items}, indent=2)
 
 
+def _read_symbol(args: dict, path: Path, text: str) -> str | None:
+    """The outline or one definition, or None to fall through to a line read.
+
+    Falling through rather than erroring is deliberate: an unsupported
+    language or a file that does not parse should still be readable, and a
+    model that asked for a symbol has already told us which file it wants.
+    """
+    wants_outline = bool(args.get("outline"))
+    wanted = str(args.get("symbol") or "").strip()
+    if not wants_outline and not wanted:
+        return None
+
+    entries = symbols.outline(text, str(path))
+    if entries is None:
+        return json.dumps({
+            "path": str(path),
+            "symbols_supported": False,
+            "hint": ("Symbols are available for Python and JavaScript/TypeScript, and "
+                     "only when the file parses. Re-read with a line range, or use "
+                     "search_files to locate it."),
+            "revision": _file_revision(path),
+        })
+
+    if wants_outline and not wanted:
+        # One compact line per definition, not JSON objects. On server.py the
+        # object form cost 11,868 tokens against a 2,597 token whole-file read.
+        rendered: list[str] = []
+        used = 0
+        for e in entries:
+            line = f"{e['line']}-{e['end_line']} {e['kind'][:5]} {e['signature'][:OUTLINE_SIGNATURE_CHARS]}"
+            if used + len(line) + 1 > READ_FILE_CONTENT_MAX_CHARS:
+                break
+            rendered.append(line)
+            used += len(line) + 1
+        result = {
+            "path": str(path),
+            "outline": "\n".join(rendered),
+            "count": len(entries),
+            "lines": len(text.splitlines()),
+            "exact": all(e["exact"] for e in entries) if entries else True,
+            "revision": _file_revision(path),
+        }
+        if len(rendered) < len(entries):
+            result["truncated"] = True
+            result["shown"] = len(rendered)
+            result["hint"] = (f"{len(entries) - len(rendered)} more definitions. Use "
+                              "search_files to find one by name.")
+        return json.dumps(result)
+
+    found = symbols.find(text, str(path), wanted)
+    if not found:
+        # Naming what is there turns a dead end into the next call, the same
+        # way a bad path returns suggestions instead of just failing.
+        available = [e["name"] for e in entries]
+        return json.dumps({
+            "path": str(path),
+            "error": f"No function or class named {wanted!r} in this file.",
+            "available": available[:40],
+            "truncated_names": len(available) > 40,
+            "revision": _file_revision(path),
+        })
+
+    body = found["source"]
+    numbered = "\n".join(
+        f"{found['line'] + i}|{line}" for i, line in enumerate(body.splitlines()))
+    result = {
+        "path": str(path),
+        "symbol": found["name"],
+        "kind": found["kind"],
+        "start": found["line"],
+        "end": found["end_line"],
+        "exact": found["exact"],
+        "content": numbered[:READ_FILE_CONTENT_MAX_CHARS],
+        "revision": _file_revision(path),
+    }
+    if len(numbered) > READ_FILE_CONTENT_MAX_CHARS:
+        result["truncated"] = True
+        result["hint"] = (f"{found['name']} is longer than the output cap; continue with "
+                          f"a line range from {found['line']}.")
+    if not found["exact"]:
+        result["hint_boundaries"] = ("Boundaries for this language are matched by brace "
+                                     "counting and may be off. Verify before editing.")
+    return json.dumps(result)
+
+
 def _read_file(args: dict, project_root: Path | None) -> str:
     path, err = resolve_existing(args["path"], project_root, want_dir=False)
     if err:
@@ -1081,6 +1509,9 @@ def _read_file(args: dict, project_root: Path | None) -> str:
             "hint": "Binary file, contents not shown as text. Use run_shell (e.g. file, strings) if needed.",
         })
     text = raw.decode("utf-8", errors="replace")
+    symbol_result = _read_symbol(args, path, text)
+    if symbol_result is not None:
+        return symbol_result
     lines = text.splitlines()
     start = max(1, int(args.get("start_line") or 1))
     end = int(args.get("end_line") or len(lines))
@@ -2423,6 +2854,7 @@ def _as_tool_call(obj: object) -> dict | None:
     name = obj.get("name") or obj.get("tool") or obj.get("function")
     if isinstance(name, dict):
         obj, name = name, name.get("name")
+    raw_name, name = name, canonical_tool_name(name)
     if not isinstance(name, str) or name not in _known_tool_names():
         return None
     args = obj.get("arguments")
@@ -2437,7 +2869,11 @@ def _as_tool_call(obj: object) -> dict | None:
             return None
     if not isinstance(args, dict):
         return None
-    return {"id": name, "name": name, "arguments": args}
+    return {
+        "id": name,
+        "name": name,
+        "arguments": apply_alias_defaults(raw_name, name, args),
+    }
 
 
 def _calls_from_payload(payload: object) -> list[dict]:
@@ -2507,20 +2943,26 @@ def extract_tool_calls(message: dict) -> list[dict]:
         else:
             args = raw_args or {}
         if name:
+            raw_name, name = name, canonical_tool_name(name)
             calls.append({
                 "id": tc.get("id") or name,
                 "index": fn.get("index", tc.get("index")),
                 "name": name,
-                "arguments": args,
+                "arguments": apply_alias_defaults(raw_name, name, args),
             })
     content = message.get("content") or ""
     for m in TOOL_CALL_RE.finditer(content):
         try:
             obj = json.loads("{" + m.group(1) + "}")
-            name = obj.get("name") or obj.get("tool")
+            raw_name = obj.get("name") or obj.get("tool")
+            name = canonical_tool_name(raw_name)
             args = obj.get("arguments") or obj.get("parameters") or {}
             if name:
-                calls.append({"id": name, "name": name, "arguments": args})
+                calls.append({
+                    "id": name,
+                    "name": name,
+                    "arguments": apply_alias_defaults(raw_name, name, args),
+                })
         except Exception:
             pass
     # Alternative: ```tool ... ```
@@ -2528,9 +2970,16 @@ def extract_tool_calls(message: dict) -> list[dict]:
     for block in alt:
         try:
             obj = json.loads(block)
-            name = obj.get("name")
+            raw_name = obj.get("name")
+            name = canonical_tool_name(raw_name)
             if name:
-                calls.append({"id": name, "name": name, "arguments": obj.get("arguments") or {}})
+                calls.append({
+                    "id": name,
+                    "name": name,
+                    "arguments": apply_alias_defaults(
+                        raw_name, name, obj.get("arguments") or {}
+                    ),
+                })
         except Exception:
             pass
     # Only when the model produced nothing usable natively, so a model that does
@@ -2558,9 +3007,11 @@ def looks_like_broken_tool_call(content: str) -> str | None:
     if parse_content_tool_calls(text):
         return None
     text = candidate
-    for name in _known_tool_names():
+    # Aliases too: a mangled call is no less a call for having reached for the
+    # name the model learned in pretraining rather than ours.
+    for name in list(_known_tool_names()) + list(TOOL_ALIASES):
         if f'"{name}"' in text:
-            return name
+            return canonical_tool_name(name)
     return None
 
 
@@ -2969,6 +3420,17 @@ def tool_activity_line(name: str, arguments: dict | None = None, result: str | N
         hint = str(args.get("path") or args.get("query") or "")[:80]
     elif name == "delegate":
         hint = str(args.get("task") or "")[:80]
+    elif name == "browser":
+        hint = str(args.get("action") or "")
+        for key in ("url", "ref", "text"):
+            if args.get(key):
+                hint += f" {str(args[key])[:40]}"
+                break
+    elif name == "computer":
+        action = str(args.get("action") or "")
+        where = f" at {args.get('x')},{args.get('y')}" if args.get("x") is not None else ""
+        detail = str(args.get("text") or "")[:40]
+        hint = action + where + (f' "{detail}"' if detail else "")
     elif name == "todo_write":
         todos = args.get("todos") or []
         hint = ", ".join(

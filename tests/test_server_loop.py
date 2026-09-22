@@ -1759,10 +1759,24 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_parent_may_still_use_every_tool(self):
         # The guard must not restrict a normal run.
-        chat = {"id": "normal", "messages": [], "delegate_available": True}
+        chat = {
+            "id": "normal", "messages": [],
+            "delegate_available": True, "computer_use": True,
+        }
         self.assertEqual(
             server._allowed_tool_names(chat),
             {t["function"]["name"] for t in server.agent.TOOL_DEFS},
+        )
+
+    async def test_a_run_that_did_not_ask_for_the_desktop_is_not_given_it(self):
+        # The only tools a full parent run can be missing, and only because the
+        # chat did not turn computer use on. The browser is the same consent as
+        # the desktop: both act outside the project.
+        chat = {"id": "normal", "messages": [], "delegate_available": True}
+        self.assertEqual(
+            {t["function"]["name"] for t in server.agent.TOOL_DEFS}
+            - server._allowed_tool_names(chat),
+            {"computer", "browser"},
         )
 
     async def test_delegation_is_gated_on_project_size(self):

@@ -7,3 +7,7 @@ pydantic>=2,<3
 ddgs>=9,<10
 pillow>=10,<13
 pywebview>=5,<7
+# Browser control speaks DevTools over a websocket.
+websockets>=13,<18
+# Connection secrets go to the OS keyring, never to a file here.
+keyring>=24,<26

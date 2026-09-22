@@ -345,12 +345,34 @@ class RoleTests(unittest.TestCase):
         self.assertEqual(m.active("chat", {"model_active": {"chat": "deleted"}}, reg), "a")
 
     def test_the_default_pair_keeps_its_old_division_of_labour(self):
-        reg = m.installed()
-        if config.DEFAULT_CODER_MODEL not in reg:
-            self.skipTest("default pair not installed")
-        # Was DEFAULT_AGENT_KEY = "coder" and VISION_AGENT_KEY = "agent".
+        # Pinned rather than read off the host, so what is installed here
+        # cannot decide the answer.
+        reg = _reg(**{
+            config.DEFAULT_CODER_MODEL: {},
+            config.DEFAULT_AGENT_MODEL: {"vision": True, "think": True},
+        })
+
         self.assertEqual(m.active("agentic", {}, reg), config.DEFAULT_CODER_MODEL)
         self.assertEqual(m.vision_model({}, reg), config.DEFAULT_AGENT_MODEL)
+
+    def test_a_grounding_model_takes_computer_use_from_the_default(self):
+        reg = _reg(**{
+            config.DEFAULT_AGENT_MODEL: {"vision": True},
+            "qwen3-vl:32b": {"vision": True},
+        })
+
+        self.assertEqual(m.vision_model({}, reg), "qwen3-vl:32b")
+
+    def test_the_chat_s_own_pick_outranks_a_grounding_model(self):
+        reg = _reg(**{
+            config.DEFAULT_AGENT_MODEL: {"vision": True},
+            "qwen3-vl:32b": {"vision": True},
+        })
+
+        self.assertEqual(
+            m.vision_model({}, reg, preferred=config.DEFAULT_AGENT_MODEL),
+            config.DEFAULT_AGENT_MODEL,
+        )
 
 
 class ResolveTests(unittest.TestCase):

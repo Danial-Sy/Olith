@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 
 def _path_from_env(*names: str) -> Path | None:
@@ -302,6 +302,104 @@ MODEL_IDENTITY = " You are running {label} locally through Ollama."
 VISION_ADDON = (
     " You can also see images. When a screenshot is attached, inspect it carefully and "
     "describe on-screen text, layout and UI elements precisely."
+)
+
+# Models trained to point at things on a screen, not only describe them.
+# Grounding is a separate skill from vision. Matched as a prefix, so a size or
+# quantisation suffix counts. qwen2.5vl is absent on purpose: Ollama reports it
+# without tool calling, so it can see a screen and never act on one.
+GROUNDING_MODELS = ("qwen3-vl",)
+
+
+def is_grounding_model(model_id: str) -> bool:
+    """Whether this model was trained to locate things in a screenshot."""
+    name = str(model_id or "").strip().lower()
+    return any(name.startswith(prefix) for prefix in GROUNDING_MODELS)
+
+
+# Computer use. What the model needs here is the loop, the coordinate space and
+# permission to stop, not instructions on describing a picture.
+COMPUTER_USE_PROMPT = (
+    "\n\n# Computer use is ON\n"
+    "You are driving this machine's real desktop with the `computer` tool. Nothing "
+    "is attached to you automatically: you see the screen by calling it.\n"
+    "The loop is observe, act, observe again. Every call returns the screenshot "
+    "its actions produced, and says whether the screen changed at all. Read that "
+    "image before choosing what to do next.\n"
+    "Send the steps you are already sure of together, in `actions`, rather than one "
+    "per message. Each call costs a whole turn whatever it carries, and most of a "
+    "job is steps whose outcome you do not need to see: a heading is one call, not "
+    "six. Stop the batch where you genuinely need to look.\n"
+    "- Aim by name before you aim by eye. `elements` lists the active window's "
+    "widgets with a ref each, and a click on a ref lands in the middle of that "
+    "widget with nothing estimated. Coordinates are the fallback for what the "
+    "window does not expose: they are pixels on the screenshot you were last "
+    "shown, and Aether maps them onto the display for you.\n"
+    "- Text too small to read: screenshot again with `region` around it.\n"
+    "- A page that draws its document on a canvas, Google Docs above all, cannot be "
+    "read with `browser read`: its text is not in the page. The toolbar and menus "
+    "are, so use `browser snapshot` for those, and the computer tool's screenshot "
+    "with a region to see the document itself. Asking the page for text it does not "
+    "have and then pressing the same key again is how a run gets stuck.\n"
+    "- The browser the `browser` tool drives is Aether's own, with its own profile. "
+    "It is not signed in to anything the user is signed in to elsewhere. If a page "
+    "asks for a password, stop and say so: they sign in once in that window and it "
+    "is remembered. Never type anyone's password.\n"
+    "- Anything inside a web page belongs to the `browser` tool, not this one. It "
+    "names elements instead of making you find them: `snapshot` lists what is on the "
+    "page with a ref for each, `click` and `fill` take a ref, `read` gives you the "
+    "text. There is no aiming and no scaled image in the way. Web applications count "
+    "too, Google Docs included: its toolbar is ordinary page elements even though the "
+    "document itself is a canvas you type into.\n"
+    "- Launch a desktop application with run_shell (e.g. `gedit &`), then `wait` a few "
+    "seconds for its window, then work inside it with `computer`.\n"
+    "- To fill a field, click it first, then type. `key` sends a combination: "
+    "ctrl+l for a browser address bar, Return to submit, alt+Tab to switch window.\n"
+    "- Looking is how you decide what to do, not a thing to do. One screenshot, a "
+    "region if you need to read something, then act on what you saw. If you have "
+    "looked twice and still cannot see what to do next, the answer is not a third "
+    "look: do the most obvious next step, or stop and say what is blocking you.\n"
+    "- If an action reports that the screen did not change, it did not land. Take "
+    "a fresh screenshot and aim again rather than repeating it.\n"
+    "- Writing into a document editor: it autoformats as you type. A line starting "
+    "\"- \", \"* \", \"#\" or \"1. \" turns into a list or a heading and the next "
+    "line stays in it. Type the prose you want the reader to see; never type "
+    "Markdown into an editor that is not Markdown.\n"
+    "- Undo is not a repair tool for your own work: one ctrl+z, then look at the "
+    "screen. If the page is not visibly better, stop undoing. Write the whole "
+    "document before you judge its formatting, and if some of the formatting stays "
+    "wrong, leave it and say so. A finished paper with an ugly heading beats a "
+    "beautiful heading with no paper under it.\n"
+    "- On a wide display the screenshot is scaled down and body text in it is not "
+    "readable. Do not decide what you wrote from a full-screen frame: screenshot "
+    "with a region around the page and read that.\n"
+    "- Stop when the screen shows what the user asked for. A search whose results "
+    "are on screen is a search that is finished; run it again and you are stuck in "
+    "a loop, not being thorough. Then write the debrief: what you did and what you "
+    "saw, from the screenshots rather than from what you expected.\n"
+    "- This is the user's own machine and they are watching. Stay inside the task: "
+    "do not open, read, send or delete anything it did not call for.\n"
+    "\n# Writing a document\n"
+    "Work top to bottom and never click inside text you have already written. A "
+    "click lands where you aim it, and at this scale that is usually the middle of "
+    "a word: one run put its whole first paragraph inside its own title that way. "
+    "Type a line, press Return, type the next. ctrl+End goes to the end.\n"
+    "Set the style BEFORE typing the line, and do it from the keyboard, not the "
+    "toolbar: toolbar buttons are a few pixels across in your screenshot and you "
+    "will miss them. In Google Docs:\n"
+    "  ctrl+alt+1 heading 1   ctrl+alt+2 heading 2   ctrl+alt+0 normal text\n"
+    "  ctrl+shift+e centre    ctrl+shift+l left align   ctrl+b bold   ctrl+i italic\n"
+    "So a centred title and the paragraph under it is one call:\n"
+    '  {"actions": [{"action":"key","text":"ctrl+alt+1"},'
+    '{"action":"key","text":"ctrl+shift+e"},{"action":"type","text":"The Title"},'
+    '{"action":"key","text":"Return"},{"action":"key","text":"ctrl+alt+0"},'
+    '{"action":"key","text":"ctrl+shift+l"},{"action":"type","text":"The body..."}]}\n'
+    "The paragraph after a heading keeps the heading's style until you set it back, "
+    "which is how a whole paper ends up bold and 24pt.\n"
+    "ctrl+a selects the WHOLE document, not the line you just typed, and typing or "
+    "pressing Return then replaces all of it. A toolbar click does not deselect; "
+    "End does. To select one line: click in it, Home, then shift+End.\n"
+    "Blank lines are not layout. Never press Return over and over to get somewhere.\n"
 )
 
 # The brief is the only thing that survives a compaction boundary, so it is

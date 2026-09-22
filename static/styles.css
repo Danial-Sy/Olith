@@ -216,7 +216,9 @@ button:focus-visible,
 }
 
 .side-nav {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px;
+  /* Five tabs at a readable size do not fit one row in a narrow sidebar, so
+     they wrap into a tidy second row rather than shrinking into initials. */
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px;
   background: var(--bg2); padding: 4px; border-radius: 12px; border: 1px solid var(--line);
 }
 .side-tab {
@@ -230,8 +232,8 @@ button:focus-visible,
 }
 
 /* Every panel shares this scroller, so the clearance belongs here rather than
-   on each of them. Without it a full-width control — the compact slider is the
-   worst — runs under the scrollbar instead of stopping beside it. */
+   on each of them. Without it a full-width control, the compact slider worst
+   of all, runs under the scrollbar instead of stopping beside it. */
 .side-panels {
   flex: 1;
   overflow: auto;
@@ -1255,11 +1257,53 @@ textarea.dialog-field {
   align-items: center;
 }
 .path-row input { flex: 1; }
+/* The ring is an SVG on a square 28px box with no border-radius, so a
+   box-shadow draws a rectangle around it: the "black box" that appeared behind
+   the logo the moment computer use was switched on. drop-shadow follows the
+   artwork's own alpha, so the glow is a ring. */
 body.cu-active .brand-mark {
-  box-shadow: 0 0 0 2px rgba(255,45,85,0.35), 0 0 18px rgba(0,212,255,0.25);
+  filter: drop-shadow(0 0 4px rgba(255, 45, 85, 0.5))
+          drop-shadow(0 0 10px rgba(0, 212, 255, 0.32));
 }
 
 
+
+/* Connections: accounts Aether is allowed to act in. Reads as a list of
+   facts rather than a form, because the act of connecting happens in the
+   browser window, not here. */
+.conn-list { display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.conn-row {
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+  padding: 10px 11px;
+  background: rgba(255,255,255,0.02);
+}
+.conn-row.live { border-color: rgba(0,212,255,0.28); background: rgba(0,212,255,0.06); }
+.conn-main { display: flex; align-items: center; gap: 7px; }
+.conn-dot { color: var(--muted); font-size: 0.7rem; }
+.conn-row.live .conn-dot { color: var(--cyan); }
+.conn-name { font-weight: 600; font-size: 0.86rem; }
+.conn-status { margin-left: auto; font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+.conn-note { font-size: 0.72rem; color: var(--muted); margin-top: 3px; line-height: 1.35; }
+.conn-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.conn-btn {
+  font: inherit; font-size: 0.72rem; font-weight: 600;
+  padding: 4px 10px; border-radius: 999px; cursor: pointer;
+  border: 1px solid rgba(79,124,255,0.35);
+  background: rgba(79,124,255,0.12); color: var(--text);
+  transition: background var(--fast);
+}
+.conn-btn:hover:not(:disabled) { background: rgba(79,124,255,0.22); }
+.conn-btn:disabled { opacity: 0.5; cursor: default; }
+.conn-btn.danger { border-color: rgba(255,77,109,0.3); background: rgba(255,77,109,0.1); }
+.conn-empty, .conn-foot { font-size: 0.72rem; color: var(--muted); line-height: 1.4; padding: 2px 2px 0; }
+.conn-sep { border: none; border-top: 1px solid rgba(255,255,255,0.07); margin: 12px 0 8px; }
+.conn-add {
+  display: block; width: 100%; text-align: left;
+  font: inherit; font-size: 0.75rem; color: var(--muted);
+  background: none; border: none; padding: 5px 2px; cursor: pointer;
+}
+.conn-add:hover { color: var(--text); }
 
 /* Context meter dropdown */
 .ctx-wrap { position: relative; }
@@ -1541,6 +1585,33 @@ body.cu-active .brand-mark {
   border: 1px solid rgba(0, 212, 255, 0.28);
 }
 .think-chip[hidden] { display: none !important; }
+
+/* Computer use and effort ride beside the model name for the same reason the
+   Think chip does: what the next message will actually do is decided by three
+   toggles buried in a menu, and the composer is the only place the user is
+   looking when they press send. */
+.cu-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 0.62rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 999px;
+  background: rgba(255, 45, 85, 0.14); color: var(--red, #ff2d55);
+  border: 1px solid rgba(255, 45, 85, 0.32);
+}
+.cu-chip svg { opacity: 0.9; }
+.cu-chip[hidden], .effort-chip[hidden] { display: none !important; }
+/* Pulses only while a run is streaming, so it reads as "in progress" rather
+   than as decoration. */
+body.cu-running .cu-chip { animation: cu-chip-pulse 1.6s ease-in-out infinite; }
+@keyframes cu-chip-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 45, 85, 0.0); }
+  50% { box-shadow: 0 0 0 3px rgba(255, 45, 85, 0.16); }
+}
+.effort-chip {
+  font-size: 0.62rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 999px;
+  background: rgba(124, 92, 255, 0.14); color: var(--purple2, #7c5cff);
+  border: 1px solid rgba(124, 92, 255, 0.28);
+}
 
 .bubble .content .katex { font-size: 1.05em; }
 .bubble .content .katex-display { margin: 0.6em 0; overflow-x: auto; }

@@ -182,8 +182,8 @@ def normalize_tag(name: str) -> str:
     Hugging Face tags obey neither rule, so they pass through untouched.
     Ollama keeps the repository's own capitalisation in `ollama list`, so
     folding the case here would stop an installed model matching itself, and
-    a Hugging Face repository has no `latest` — the tag after the colon is a
-    quantization, and inventing one gets "model not found" from the pull.
+    a Hugging Face repository has no `latest`, because the tag after the colon
+    is a quantization and inventing one gets "model not found" from the pull.
     """
     value = (name or "").strip()
     if value.lower().startswith(("hf.co/", "huggingface.co/")):
@@ -404,14 +404,42 @@ def active(role: str, settings: dict | None = None, registry: dict | None = None
     return options[0]
 
 
-def vision_model(settings: dict | None = None, registry: dict | None = None) -> str | None:
-    """Computer use needs eyes, so it routes here rather than to the active agent."""
+def vision_models(settings: dict | None = None, registry: dict | None = None) -> list[str]:
+    """Every installed model that can both see and call tools.
+
+    Computer use needs both halves: eyes to read the screen and tool calling to
+    act on it. A vision-only model like gemma3 can describe a screenshot and
+    never click anything, so it is not an option here.
+    """
     reg = registry if registry is not None else installed(settings)
-    options = [m for m in models_for("agentic", settings, reg) if reg[m].get("vision")]
+    return [m for m in models_for("agentic", settings, reg) if reg[m].get("vision")]
+
+
+def vision_model(
+    settings: dict | None = None,
+    registry: dict | None = None,
+    preferred: str | None = None,
+) -> str | None:
+    """Which model computer use runs on.
+
+    `preferred` is the chat's own pick and wins whenever it can see, so any
+    vision model the user selects is the one that drives the desktop. Without
+    that the feature was pinned to whatever `active("agentic")` returned, and
+    choosing a different vision model in the picker changed nothing.
+    """
+    reg = registry if registry is not None else installed(settings)
+    options = vision_models(settings, reg)
     if not options:
         return None
-    preferred = active("agentic", settings, reg)
-    return preferred if preferred in options else options[0]
+    if preferred in options:
+        return preferred
+    # Nothing was chosen, so prefer a grounding-trained model: seeing a button
+    # and saying where it is are different skills.
+    grounded = [m for m in options if config.is_grounding_model(m)]
+    if grounded:
+        return grounded[0]
+    fallback = active("agentic", settings, reg)
+    return fallback if fallback in options else options[0]
 
 
 def context_limit(model_id: str, role: str, settings: dict | None = None, profile: dict | None = None) -> int:

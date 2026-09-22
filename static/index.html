@@ -38,6 +38,7 @@
         <button class="side-tab" data-panel="projects">Projects</button>
         <button class="side-tab" data-panel="memory">Memory</button>
         <button class="side-tab" data-panel="models">Models</button>
+        <button class="side-tab" data-panel="connections">Connections</button>
       </nav>
 
       <div class="side-panels">
@@ -67,6 +68,16 @@
           <div class="panel-label">Add a model</div>
           <button class="btn-ghost full" id="btnBrowseLibrary">Browse the libraries</button>
           <p class="ctx-hint">Every model on Ollama, and every GGUF on Hugging Face.</p>
+        </div>
+        <div class="side-panel" id="panel-connections">
+          <div class="panel-label">Connected</div>
+          <div class="conn-list" id="connList"></div>
+          <div class="panel-label">Add</div>
+          <div class="conn-list" id="connAvailable"></div>
+          <hr class="conn-sep" />
+          <button type="button" class="conn-add" id="btnAddSite">+ Sign in to another site</button>
+          <button type="button" class="conn-add" id="btnAddKey">+ Keep an API key</button>
+          <p class="conn-foot" id="connFoot"></p>
         </div>
         <div class="side-panel" id="panel-settings">
           <label class="field">
@@ -202,6 +213,7 @@
                 <button data-action="folder"><span class="mi">📁</span> Add project folder</button>
                 <hr />
                 <button data-action="websearch" id="btnWebSearchToggle"><span class="mi">🌐</span> Web search <span class="check" id="webSearchCheck" hidden>✓</span></button>
+                <button data-action="connections"><span class="mi">🔗</span> Connections</button>
               </div>
             </div>
 
@@ -211,6 +223,11 @@
                   <span class="model-trigger-label-wrap">
                     <span class="model-trigger-label" id="modelTriggerLabel">Qwen3.8 27B</span>
                     <span class="think-chip" id="thinkChip" hidden>Think</span>
+                    <span class="cu-chip" id="computerChip" hidden title="Computer use is on">
+                      <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+                        <path fill="currentColor" d="M2 3h12v8H2zM6 13h4v1H6z"/>
+                      </svg>Computer</span>
+                    <span class="effort-chip" id="effortChip" hidden>High</span>
                   </span>
                   <svg class="chev" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M4.5 6.5L8 10l3.5-3.5"/></svg>
                 </button>

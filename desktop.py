@@ -28,6 +28,8 @@ def _env() -> dict:
     env = ollama_env()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    # The server serves its own consent page, so it has to know where it is.
+    env["AETHER_PORT"] = str(PORT)
     return env
 
 

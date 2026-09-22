@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import html
 import itertools
 import json
 import os
@@ -17,7 +18,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
@@ -33,7 +34,10 @@ import models as reg
 import library as lib
 from config import COMPACT_PROMPT, ROOT, TITLE_PROMPT, UPLOADS, VERSION
 from config import effort_for as cfg_effort_for
+import browser
+import computer
 import computer_overlay
+import connections
 import memory_router
 
 app = FastAPI(title="Aether", version=VERSION)
@@ -337,9 +341,13 @@ async def warmup_status():
     }
 
 
-@app.post("/api/warmup/model/{key}")
+@app.post("/api/warmup/model/{key:path}")
 async def warmup_model(key: str):
-    """Warm a single model (used when switching). Leaves that model loaded."""
+    """Warm a single model (used when switching). Leaves that model loaded.
+
+    The key is a whole path segment run: a Hugging Face GGUF keeps its
+    repository in its id, so `hf.co/owner/repo:Q6_K` carries slashes that a
+    plain `{key}` cannot match, and the switch answered 404 Not Found."""
     settings, registry = _registry()
     model_id = key
     role = "agentic" if key in reg.models_for("agentic", settings, registry) else "chat"
@@ -461,6 +469,9 @@ def _installed_view(settings: dict, registry: dict, budget: int) -> list[dict]:
             **profile,
             "roles": assigned.get(model_id) or [],
             "can": {role: reg.can_serve(profile, role) for role in config.ROLES},
+            # Trained to point at things on a screen, not just describe them.
+            # The model menu says so, since it decides whether clicks land.
+            "grounding": config.is_grounding_model(model_id),
             "active": {role: active.get(role) == model_id for role in config.ROLES},
             "utility": model_id in utility,
             "fit": reg.fit_report(profile, budget),
@@ -478,10 +489,18 @@ async def api_models():
     settings, registry = _registry()
     hw = reg.hardware()
     budget = int(hw.get("usable_bytes") or 0)
+    can_drive, why = computer.available()
     return {
         "hardware": hw,
+        # Whether this desktop can be driven at all. It rides here because the
+        # model menu is where computer use is turned on.
+        "desktop": {"ok": can_drive, "reason": why},
         "installed": _installed_view(settings, registry, budget),
-        "roles": {role: reg.models_for(role, settings, registry) for role in config.ROLES},
+        "roles": {
+            **{role: reg.models_for(role, settings, registry) for role in config.ROLES},
+            # Not a role of its own: the set any chat may run computer use on.
+            "vision": reg.vision_models(settings, registry),
+        },
         "active": {
             **{role: reg.active(role, settings, registry) for role in config.ROLES},
             "vision": reg.vision_model(settings, registry),
@@ -728,7 +747,8 @@ async def api_patch_chat(cid: str, body: ChatPatch):
     chat = st.save_chat(chat)
     if body.computer_use is not None:
         try:
-            computer_overlay.set_overlay(bool(chat.get("computer_use")))
+            if not chat.get("computer_use"):
+                computer_overlay.set_overlay(False)
         except Exception:
             pass
     return chat
@@ -793,15 +813,19 @@ def _model_key(chat: dict, reasoning: bool | None = None, model_key: str | None 
     role = _role(chat, reasoning)
     if model_key:
         wanted = model_key
-
-        if wanted in reg.models_for(role, settings, registry):
+        # A per-request override still has to be able to do the job: handing a
+        # blind model to a computer-use chat gives it a mouse and no eyes.
+        blind = chat.get("computer_use") and not (registry.get(wanted) or {}).get("vision")
+        if not blind and wanted in reg.models_for(role, settings, registry):
             return wanted
     if role == "agentic":
+        sel = chat.get("model_id") or chat.get("agent_model")
         if chat.get("computer_use"):
-            eyes = reg.vision_model(settings, registry)
+            # The chat's own pick if it can see, and only otherwise a model
+            # chosen for it.
+            eyes = reg.vision_model(settings, registry, preferred=model_key or sel)
             if eyes:
                 return eyes
-        sel = chat.get("model_id") or chat.get("agent_model")
         if sel in reg.models_for("agentic", settings, registry):
             return sel
         chosen = reg.active("agentic", settings, registry)
@@ -893,6 +917,13 @@ def _num_ctx_for(chat: dict, model_key: str, msgs: list[dict] | None = None) -> 
 def _ctx_limit(model_id: str, role: str = "chat") -> int:
     settings, registry = _registry()
     return reg.context_limit(model_id, role, settings, registry.get(model_id) or {})
+
+
+def _profile(model_id: str) -> dict:
+    """The capability profile the tool policy is derived from. An empty one
+    means full tier, so a model we cannot size keeps the whole surface."""
+    _, registry = _registry()
+    return registry.get(model_id) or {}
 
 
 # Replaying every tool result verbatim overruns num_ctx, and Ollama truncates the
@@ -1169,6 +1200,162 @@ def _rejection_nudge(rejections: dict[str, dict]) -> str:
     )
 
 
+# How many screenshots keep their pixels in the prompt. Each frame is ~2.4k
+# tokens, and anything older than the last action is a caption.
+COMPUTER_FRAME_KEEP = 2
+
+
+def _mark_computer(chat: dict | None, on: bool) -> None:
+    """Raise or drop the on-screen marker around a run that drives the desktop.
+
+    Bound to the run rather than to the toggle: an agentic chat sitting idle
+    with computer use armed is not using the computer, and a border that never
+    goes away stops meaning anything. What the toggle shows is the badge in the
+    composer; what this shows is that something is happening right now.
+    """
+    try:
+        if on and not (chat or {}).get("computer_use"):
+            return
+        if on:
+            # Desktop state (what is selected, how many blank lines) belongs to
+            # the run, not to the process.
+            computer.begin_run()
+        computer_overlay.set_overlay(bool(on), label="Aether is using your computer")
+    except Exception:
+        pass
+
+
+# Consecutive desktop actions that leave the screen untouched before the run is
+# told to stop trying.
+COMPUTER_STALL_LIMIT = 4
+
+
+# Identical desktop actions in a row before the run is corrected, counting past
+# the screenshots a model takes between them, and how many corrections it gets
+# before the run ends instead.
+COMPUTER_REPEAT_LIMIT = 4
+COMPUTER_REPEAT_BLOCKS = 3
+# Looks in a row with nothing done between them. Observations are exempt from
+# the duplicate-call guard, so this is the only brake on a run that keeps
+# looking: one took 265 screenshots without acting on any of them.
+LOOK_LIMIT = 5
+
+
+# Acting on the world, as opposed to looking at it. Both tools reach the same
+# screen, so a run-away through one is a run-away through the other.
+_WORLD_TOOLS = ("computer", "browser")
+# Calls that only observe. Counting them would reset the run of repeats this is
+# here to catch, since a model that looks between every keystroke is working
+# normally.
+_LOOKING = {"screenshot", "wait", "elements", "snapshot", "read", "status"}
+
+
+def _is_a_look(call: dict) -> bool:
+    """Whether this call only observes. Observations are never duplicates."""
+    if call.get("name") not in _WORLD_TOOLS:
+        return False
+    args = call.get("arguments") or {}
+    steps = args.get("actions")
+    if isinstance(steps, list) and steps:
+        return all(
+            str((a or {}).get("action") or "").strip().lower() in _LOOKING
+            for a in steps if isinstance(a, dict)
+        )
+    return str(args.get("action") or "").strip().lower() in _LOOKING
+
+
+def _computer_repeat_key(args: dict, tool: str = "computer") -> str | None:
+    """Identity of an action for the run-away check, or None for a look.
+
+    Deliberately not keyed on which tool sent it. Pressing ctrl+a through the
+    desktop and then through the browser is the same thing happening to the
+    same screen twice, and treating the door as part of the identity would let
+    a run alternate its way out of the guard.
+    """
+    steps = (args or {}).get("actions")
+    if isinstance(steps, list) and steps:
+        # A batch is one identity, so two identical batches are a run-away and
+        # a batch differing in its last step is a different plan.
+        keys = [_computer_repeat_key(a, tool) for a in steps if isinstance(a, dict)]
+        keys = [k for k in keys if k]
+        return json.dumps(keys) if keys else None
+    action = str((args or {}).get("action") or "").strip().lower()
+    if action in _LOOKING:
+        return None
+    return json.dumps(
+        [action, args.get("x"), args.get("y"), args.get("text"),
+         args.get("ref"), args.get("direction"), args.get("count")],
+        sort_keys=True, default=str,
+    )
+
+
+def _computer_progress(result: str, stalls: int) -> tuple[str, int]:
+    """Count desktop actions that changed nothing, and end a run producing only
+    those.
+
+    The duplicate-call guard keys on identical arguments, and a model getting
+    nowhere on a desktop does not repeat itself: it nudges the coordinates and
+    tries again, which is a fresh signature every time. What actually says "this
+    is not working" is the screen. Four actions in a row that left it untouched
+    mean nothing is reaching the desktop, not that the fifth aim will be right.
+    """
+    try:
+        payload = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        return result, stalls
+    if not isinstance(payload, dict) or payload.get("error"):
+        return result, stalls
+    if payload.get("action") == "screenshot" or payload.get("screen_changed"):
+        return result, 0
+    stalls += 1
+    if stalls < COMPUTER_STALL_LIMIT:
+        return result, stalls
+    return json.dumps({
+        "error": f"{stalls} desktop actions in a row left the screen unchanged.",
+        "hint": (
+            "Nothing you send is reaching the desktop, so a fifth attempt will not "
+            "land either. Stop acting now and tell the user what you were trying to "
+            "do and what the screen shows instead."
+        ),
+    }), stalls
+
+
+def _prune_stored_frames(chat: dict) -> None:
+    """Drop the pixels of superseded screenshots from the saved transcript.
+
+    The render already stops sending them; this stops storing them. One frame is
+    ~40 KB of base64 and the chat file is rewritten after every tool call, so a
+    long desktop job would be writing megabytes per step to keep pictures of a
+    screen that has since changed.
+    """
+    frames = [m for m in (chat.get("messages") or []) if m.get("computer_frame")]
+    for m in frames[:-COMPUTER_FRAME_KEEP]:
+        if m.pop("images", None):
+            m["content"] = "[screen] an earlier screenshot, no longer stored."
+
+
+def _frame_message(frame: dict) -> dict:
+    """A screenshot the computer tool produced, as a turn the model can see.
+
+    It rides as a user message because that is the role every vision model's
+    chat template renders images for. Ollama accepts `images` on a tool message
+    and most templates then drop them, which is the silent version of this
+    feature not working: the model acts on a screen it was never shown. The
+    flags mark it as machinery rather than something the user said.
+    """
+    return {
+        "role": "user",
+        "content": (
+            f"[screen] {frame['w']}x{frame['h']}, after the action above. "
+            "Coordinates you send are pixels on this image."
+        ),
+        "images": [frame["b64"]],
+        "computer_frame": True,
+        "quiet": True,
+        "ts": time.time(),
+    }
+
+
 def _call_signature(call: dict, project_root: Path | None) -> str:
     """Identity for the repeat guard, including the target file's revision.
 
@@ -1182,6 +1369,11 @@ def _call_signature(call: dict, project_root: Path | None) -> str:
     """
     args = call.get("arguments") or {}
     payload: dict[str, Any] = {"n": call.get("name"), "a": args}
+    if call.get("name") in _WORLD_TOOLS:
+        # Clicking the same button twice is ordinary work, so a repeat here is
+        # an action that left the world as it was. Each tool answers for itself:
+        # the frame id for the desktop, the page counter for the browser.
+        payload["world"] = (computer.frame_id(), browser.state_id())
     target = args.get("path")
     if isinstance(target, str) and target:
         try:
@@ -1207,7 +1399,7 @@ def _current_run_messages(chat: dict) -> list[dict]:
     start = 0
     for idx in range(len(msgs) - 1, -1, -1):
         m = msgs[idx]
-        if m.get("role") == "user" and not m.get("agent_nudge"):
+        if m.get("role") == "user" and not m.get("agent_nudge") and not m.get("computer_frame"):
             start = idx
             break
     return msgs[start:]
@@ -1235,7 +1427,7 @@ def _build_messages(
         sys += "\n\n" + lib_block
     if chat_role == "agentic":
         sys += agent.tools_system_addon(
-            agent.tool_defs_for(chat, _ctx_limit(model_key, chat_role))
+            agent.tool_defs_for(chat, _ctx_limit(model_key, chat_role), _profile(model_key))
         )
         proj = st.get_project(chat["project_id"]) if chat.get("project_id") else None
         if proj:
@@ -1255,13 +1447,18 @@ def _build_messages(
         if plan:
             sys += "\n\n" + plan
     if chat.get("computer_use"):
-        sys += (
-            "\n\n# Computer use is ON\n"
-            "Screenshots of the desktop may be attached. Inspect them carefully, describe "
-            "on-screen text and layout precisely, locate UI elements, and give concrete next "
-            "actions (click targets, keys, menu paths). Be explicit that coordinates are "
-            "approximate."
-        )
+        sys += config.COMPUTER_USE_PROMPT
+        linked = connections.prompt_block()
+        if linked:
+            # Which accounts are live changes the plan, and knowing stops a run
+            # trying to log in to something it cannot log in to.
+            sys += "\n\n" + linked
+        ok, why = computer.available()
+        if not ok:
+            sys += (
+                f"\n\nThe desktop cannot be driven right now: {why}. Say so and do the "
+                "parts of the task that do not need it."
+            )
     all_msgs = chat.get("messages") or []
     # Everything before the newest boundary is covered by its summary, already in
     # `sys`, so rendering starts just after it. The boundary is a real message,
@@ -1285,6 +1482,10 @@ def _build_messages(
     horizon_abs = _horizon_index(all_msgs, boundary)
     detail_from = (horizon_abs - (boundary + 1)) if horizon_abs >= 0 else 0
     superseded = _superseded_reads(render)
+    # Only the newest frame shows the screen as it is now. The rest keep their
+    # caption and lose the pixels, which would fill the window in ten steps.
+    frame_idxs = [i for i, mm in enumerate(render) if mm.get("computer_frame")]
+    live_frames = set(frame_idxs[-COMPUTER_FRAME_KEEP:])
     keep_tool_turns: set[int] | None = None
     if tool_replay_limit is not None:
         # Explicit narrowing (the length-truncation recovery lane) deliberately
@@ -1371,6 +1572,13 @@ def _build_messages(
                 )
             pending_tool_calls = bool(tool_calls)
             msgs.append(entry)
+            continue
+        if m.get("computer_frame") and idx not in live_frames:
+            msgs.append({
+                "role": "user",
+                "content": "[screen] an earlier screenshot, no longer shown.",
+            })
+            pending_tool_calls = False
             continue
         if role not in ("user", "system") or not content and not m.get("images"):
             continue
@@ -1459,7 +1667,7 @@ def _estimate_chat_tokens(chat: dict, model_key: str, msgs: list[dict] | None = 
     used = oc.estimate_messages_tokens(msgs)
     # The schema is sent beside messages and consumes the same KV context.
     if _role(chat) == "agentic":
-        defs = agent.tool_defs_for(chat, _ctx_limit(model_key, "agentic"))
+        defs = agent.tool_defs_for(chat, _ctx_limit(model_key, "agentic"), _profile(model_key))
         used += oc.estimate_tokens(json.dumps(defs, ensure_ascii=False)) + 128
     return int(used * _estimate_bias(chat, model_key))
 
@@ -2107,10 +2315,7 @@ async def api_send(cid: str, body: SendMessage):
     chat["effort"] = effort
     _start_new_job(chat)
     st.save_chat(chat)
-    try:
-        computer_overlay.set_overlay(bool(chat.get("computer_use")))
-    except Exception:
-        pass
+    _mark_computer(chat, True)
 
     async def event_stream():
         queue: asyncio.Queue = asyncio.Queue()
@@ -2179,6 +2384,7 @@ async def api_send(cid: str, body: SendMessage):
                 except Exception as e:
                     await emit({"type": "error", "message": str(e)})
                 finally:
+                    _mark_computer(None, False)
                     await queue.put(None)
             finally:
                 _gen_lock.release()
@@ -2204,6 +2410,27 @@ async def api_send(cid: str, body: SendMessage):
                     pass
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+def _empty_reply_reason(meta: dict, final_chunk: dict) -> str:
+    """Why a model that loaded fine still wrote nothing.
+
+    Ollama gives a GGUF that carries no chat template a passthrough one, so the
+    role tags Aether sends render into a prompt the weights never saw and a base
+    or text-completion model answers with an immediate end-of-sequence. That
+    reads as a dead app, so name the cause rather than showing a blank bubble.
+    """
+    label = meta.get("label") or meta.get("id") or "The model"
+    reason = str(final_chunk.get("done_reason") or "")
+    generated = final_chunk.get("eval_count")
+    if reason == "stop" and isinstance(generated, int) and generated <= 1:
+        return (
+            f"{label} ended its turn without generating anything. That usually "
+            "means it is a base or text-completion model with no chat template, "
+            "so it cannot hold a conversation. Pick an instruct or chat model."
+        )
+    detail = f" (stopped on {reason})" if reason else ""
+    return f"{label} returned an empty response{detail}. Try again, or pick another model."
 
 
 async def _plain_stream(chat: dict, meta: dict, model_key: str, effort: str | None = None, think: bool | None = None):
@@ -2242,6 +2469,7 @@ async def _plain_stream(chat: dict, meta: dict, model_key: str, effort: str | No
     # Ollama 400s on think=true for a model without the capability.
     if think_flag and not meta.get("think"):
         think_flag = False
+    final_chunk: dict = {}
     async for chunk in oc.stream_chat(meta["id"], msgs, keep_alive=meta["keep_alive"], options=opts, think=think_flag):
         msg = chunk.get("message") or {}
         native = msg.get("thinking") or ""
@@ -2258,8 +2486,17 @@ async def _plain_stream(chat: dict, meta: dict, model_key: str, effort: str | No
         elif native:
             yield {"type": "delta", "content": assistant.get("content") or "", "thinking": assistant.get("thinking") or ""}
         if chunk.get("done"):
+            final_chunk = chunk
             break
     body, parsed = _split_thinking(full)
+    if not (body or full).strip() and not (assistant.get("thinking") or "").strip():
+        # A turn that generated nothing is not a turn: persisting it leaves a
+        # blank bubble and replays an empty message into the next prompt.
+        if chat.get("messages") and chat["messages"][-1] is assistant:
+            chat["messages"].pop()
+        st.save_chat(chat)
+        yield {"type": "error", "message": _empty_reply_reason(meta, final_chunk)}
+        return
     assistant["content"] = body or full
     if parsed:
         assistant["thinking"] = parsed
@@ -2400,9 +2637,10 @@ _PROMPT_EVENTS = frozenset({
 })
 
 
-def _allowed_tool_names(chat: dict, ctx_limit: int | None = None) -> set[str]:
+def _allowed_tool_names(chat: dict, ctx_limit: int | None = None,
+                        profile: dict | None = None) -> set[str]:
     """Tools this run may actually execute, not merely the ones it was offered."""
-    return {t["function"]["name"] for t in agent.tool_defs_for(chat, ctx_limit)}
+    return {t["function"]["name"] for t in agent.tool_defs_for(chat, ctx_limit, profile)}
 
 
 async def _run_subagent(
@@ -2509,6 +2747,16 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
     call_rejections: dict[str, dict] = {}
     repeat_stalls = 0
     no_action_stalls = 0
+    # Desktop actions in a row that produced no visible change.
+    computer_stalls = 0
+    # The last desktop action that was not a look, how many times running, and
+    # how often it has been refused.
+    last_desktop_action: str | None = None
+    desktop_repeats = 0
+    desktop_blocks = 0
+    # Looks since anything was last done, and how often that has been refused.
+    looks_in_a_row = 0
+    look_blocks = 0
     # Whether the previous failed sample ran out of clock (as opposed to
     # returning nothing). The two need opposite recovery budgets.
     last_stall_timed_out = False
@@ -2637,6 +2885,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         # instead of jumping at the end. Taken from the prompt just rendered.
         step_used = _estimate_chat_tokens(chat, active_key, msgs=msgs)
         step_limit = _ctx_limit(active_key, "agentic")
+        step_profile = _profile(active_key)
         yield {
             "type": "context",
             "used": step_used,
@@ -2699,7 +2948,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
             # replay that was intentionally discarded above.
             prompt_tokens = oc.estimate_messages_tokens(msgs)
             prompt_tokens += oc.estimate_tokens(
-                json.dumps(agent.tool_defs_for(chat, step_limit), ensure_ascii=False)
+                json.dumps(agent.tool_defs_for(chat, step_limit, step_profile), ensure_ascii=False)
             ) + 384
             available = max(2048, recovery_ctx - prompt_tokens - 1024)
             current_predict = int(opts.get("num_predict") or 8192)
@@ -2750,7 +2999,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                     msgs,
                     keep_alive=active_meta["keep_alive"],
                     options=opts,
-                    tools=agent.tool_defs_for(chat, _ctx_limit(active_key, "agentic")),
+                    tools=agent.tool_defs_for(chat, _ctx_limit(active_key, "agentic"), step_profile),
                     # Only the opening sample thinks. Thinking on every round
                     # eats the whole output budget before a call is emitted.
                     think=bool(think_flag and not action_only and step == 0),
@@ -2806,7 +3055,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
             # a count that omits them is not what the model receives.
             "prompt_tokens_sent": (
                 oc.estimate_messages_tokens(msgs)
-                + oc.estimate_tokens(json.dumps(agent.tool_defs_for(chat, step_limit), ensure_ascii=False))
+                + oc.estimate_tokens(json.dumps(agent.tool_defs_for(chat, step_limit, step_profile), ensure_ascii=False))
                 + 128
             ),
             # prompt_eval_count is the full prompt length whether or not the
@@ -2880,10 +3129,18 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
             assistant["thinking"] = "\n".join(work_log)
             st.save_chat(chat)
             yield {"type": "message", "message": {**assistant, "content": "", "thinking": assistant["thinking"]}}
+            # Appended after the loop, not inside it: a user message between
+            # tool_calls and the next result breaks the sequence Ollama
+            # expects.
+            pending_frames: list[dict] = []
             for call in calls:
                 sig = _call_signature(call, project_root)
-                call_counts[sig] = call_counts.get(sig, 0) + 1
-                if call_counts[sig] > 2:
+                # Looking again is not repeating yourself. The guard below
+                # assumes identical arguments mean an identical result, which is
+                # false for an observation, and blocking those blinds a run.
+                if not _is_a_look(call):
+                    call_counts[sig] = call_counts.get(sig, 0) + 1
+                if call_counts.get(sig, 0) > 2:
                     # Hand back a correction instead of the same result again.
                     repeat_stalls += 1
                     # A rejected call is a different failure from a repeated
@@ -2924,15 +3181,149 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                         "quiet": True,
                     }
                     continue
+                if _is_a_look(call):
+                    looks_in_a_row += 1
+                    if looks_in_a_row > LOOK_LIMIT:
+                        look_blocks += 1
+                        if look_blocks >= COMPUTER_REPEAT_BLOCKS:
+                            assistant["content"] = (
+                                "I spent this run looking at the screen without doing "
+                                "anything with what I saw, so I stopped instead of "
+                                "carrying on. Whatever is on screen is where I got to. "
+                                "Tell me the one next thing you want changed and I will "
+                                "do that rather than survey it again."
+                            )
+                            assistant["interim"] = False
+                            assistant["thinking"] = "\n".join(work_log)
+                            chat["interrupted"] = True
+                            st.save_chat(chat)
+                            yield {
+                                "type": "delta",
+                                "content": assistant["content"],
+                                "thinking": assistant["thinking"],
+                            }
+                            yield {"type": "message", "message": assistant}
+                            return
+                        chat["messages"].append({
+                            "role": "tool",
+                            "name": call["name"],
+                            "content": json.dumps({
+                                "error": (
+                                    f"Refused: {looks_in_a_row} looks in a row with nothing "
+                                    "done in between."
+                                ),
+                                "hint": (
+                                    "You have seen the screen. Looking again will show you "
+                                    "the same thing, because nothing has happened since. Do "
+                                    "the next step now, or if the job is finished, stop and "
+                                    "write the debrief."
+                                ),
+                            }),
+                            "ts": time.time(),
+                            "quiet": True,
+                        })
+                        st.save_chat(chat)
+                        yield {
+                            "type": "delta",
+                            "content": "",
+                            "thinking": _log(
+                                f"[loop guard] refused a {looks_in_a_row}th look with no "
+                                f"action between"
+                            ),
+                            "quiet": True,
+                        }
+                        continue
+                else:
+                    looks_in_a_row = 0
+                    look_blocks = 0
+                # The duplicate-call guard cannot see this one: pressing Return
+                # changes the screen every time, so the folded frame is new on
+                # every press. Here the repetition itself is the signal.
+                repeat_key = (
+                    _computer_repeat_key(call["arguments"], call["name"])
+                    if call["name"] in _WORLD_TOOLS else None
+                )
+                if repeat_key is not None:
+                    if repeat_key == last_desktop_action:
+                        desktop_repeats += 1
+                    else:
+                        last_desktop_action = repeat_key
+                        desktop_repeats, desktop_blocks = 1, 0
+                    if desktop_repeats >= COMPUTER_REPEAT_LIMIT:
+                        # Not reset here: every further repeat of the same
+                        # action is refused until a different one arrives.
+                        desktop_blocks += 1
+                        if desktop_blocks >= COMPUTER_REPEAT_BLOCKS:
+                            # Told three times and still sending it. The stall
+                            # counter cannot end this, since a screenshot
+                            # between two presses resets it.
+                            assistant["content"] = (
+                                "I kept sending the same thing to the same place and it was "
+                                "not getting the job done, so I stopped rather than carry "
+                                "on pressing it. Whatever is on screen now is where I got "
+                                "to; ctrl+z will undo anything I typed that you do not "
+                                "want. Tell me what it should look like and I will take a "
+                                "different route."
+                            )
+                            assistant["interim"] = False
+                            assistant["thinking"] = "\n".join(work_log)
+                            chat["interrupted"] = True
+                            st.save_chat(chat)
+                            yield {
+                                "type": "delta",
+                                "content": assistant["content"],
+                                "thinking": assistant["thinking"],
+                            }
+                            yield {"type": "message", "message": assistant}
+                            return
+                        chat["messages"].append({
+                            "role": "tool",
+                            "name": call["name"],
+                            "content": json.dumps({
+                                "error": (
+                                    f"Refused: this is the same action on the screen "
+                                    f"{desktop_repeats} times in a row."
+                                ),
+                                "hint": (
+                                    "Repeating it again will not help, and it will be "
+                                    "refused again. Take a screenshot, read what is "
+                                    "actually on screen, and either do something different "
+                                    "or stop and report. To undo a mess use ctrl+z; to "
+                                    "repeat a key or a scroll on purpose use count or "
+                                    "amount in one call."
+                                ),
+                            }),
+                            "ts": time.time(),
+                            "quiet": True,
+                        })
+                        st.save_chat(chat)
+                        yield {
+                            "type": "delta",
+                            "content": "",
+                            "thinking": _log(
+                                f"[loop guard] refused desktop action repeated "
+                                f"{desktop_repeats} times"
+                            ),
+                            "quiet": True,
+                        }
+                        continue
                 # tool_start already drives the status line. Logging the activity
                 # line here as well printed every tool twice in the thinking log.
                 yield {"type": "tool_start", "name": call["name"], "arguments": call["arguments"]}
+                if call["name"] == "computer":
+                    # The person watching their own cursor move gets to read
+                    # what it is doing, on the desktop, not only in the app.
+                    computer_overlay.set_label(computer.status_line(call["arguments"]))
+                elif call["name"] == "browser":
+                    computer_overlay.set_label(
+                        f"Aether is using the browser ({call['arguments'].get('action')})"
+                    )
                 # Withholding a schema is advice, not enforcement: run_tool
                 # dispatches on name, so a withheld tool still executes.
-                if call["name"] not in _allowed_tool_names(chat, step_limit):
+                if call["name"] not in _allowed_tool_names(chat, step_limit, step_profile):
                     result = json.dumps({
                         "error": f"{call['name']} is not available in this sub-task.",
-                        "available": sorted(_allowed_tool_names(chat, step_limit)),
+                        "available": sorted(_allowed_tool_names(chat, step_limit, step_profile)),
                         "hint": "Use one of the available tools, or report what you have found.",
                     })
                 elif call["name"] == "delegate":
@@ -3073,6 +3464,8 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                         chat.get("project_id"),
                         chat=chat,
                     )
+                if call["name"] == "computer":
+                    result, computer_stalls = _computer_progress(result, computer_stalls)
                 # Success is judged on the real result, before any offloading
                 # rewrites it into a pointer.
                 tool_succeeded = _tool_succeeded(call["name"], result)
@@ -3089,6 +3482,10 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                     "ts": time.time(),
                     "quiet": True,
                 })
+                if call["name"] == "computer":
+                    frame = computer.pop_frame()
+                    if frame:
+                        pending_frames.append(frame)
                 if not tool_succeeded:
                     try:
                         payload = json.loads(result)
@@ -3153,6 +3550,12 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                     yield {"type": "todos", **prog}
                     if tool_succeeded:
                         plan_checkpoint_due = False
+            if pending_frames:
+                for frame in pending_frames:
+                    chat["messages"].append(_frame_message(frame))
+                _prune_stored_frames(chat)
+                computer_overlay.set_label("Aether is using your computer")
+                st.save_chat(chat)
             if repeat_stalls >= repeat_limit:
                 # An open plan is authority to recover on its own. Bounded
                 # retries beat asking the user to re-order work already planned.
@@ -3453,10 +3856,7 @@ async def api_resubmit_message(cid: str, mid: str, body: ResubmitBody):
     # for the previous attempt must not carry over.
     _start_new_job(chat)
     st.save_chat(chat)
-    try:
-        computer_overlay.set_overlay(bool(chat.get("computer_use")))
-    except Exception:
-        pass
+    _mark_computer(chat, True)
 
     async def event_stream():
         queue: asyncio.Queue = asyncio.Queue()
@@ -3508,6 +3908,7 @@ async def api_resubmit_message(cid: str, mid: str, body: ResubmitBody):
                 except Exception as e:
                     await emit({"type": "error", "message": str(e)})
                 finally:
+                    _mark_computer(None, False)
                     await queue.put(None)
 
         task = asyncio.create_task(run())
@@ -3617,6 +4018,140 @@ async def api_context(cid: str):
     }
 
 
+class ConnectionIn(BaseModel):
+    id: str
+    label: str | None = None
+    kind: str | None = None
+    sign_in_url: str | None = None
+    note: str | None = None
+
+
+class SecretIn(BaseModel):
+    value: str
+
+
+# Aether's own face on a sign-in. The window opens on this page rather than on
+# someone else's login form, so it can say who is asking and for what.
+CONSENT_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Aether wants to connect to {label}</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: #0b0d14; color: #edf2ff;
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }}
+  .card {{
+    width: min(560px, calc(100vw - 48px)); padding: 34px 36px 30px;
+    background: #12151f; border: 1px solid rgba(255,255,255,0.09); border-radius: 18px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.45);
+  }}
+  .brand {{ display: flex; align-items: center; gap: 11px; margin-bottom: 22px; }}
+  .ring {{
+    width: 30px; height: 30px; border-radius: 50%;
+    background: conic-gradient(#ff2d55, #7c5cff, #4f7cff, #00d4ff, #ff2d55);
+    -webkit-mask: radial-gradient(circle, transparent 54%, #000 56%);
+    mask: radial-gradient(circle, transparent 54%, #000 56%);
+  }}
+  .brand b {{ font-size: 1.06rem; letter-spacing: 0.05em; font-weight: 700; }}
+  h1 {{ font-size: 1.34rem; margin: 0 0 10px; font-weight: 650; }}
+  p {{ margin: 0 0 14px; color: #b9c2d6; }}
+  ul {{ margin: 0 0 22px; padding-left: 19px; color: #b9c2d6; }}
+  li {{ margin-bottom: 6px; }}
+  .row {{ display: flex; gap: 10px; align-items: center; }}
+  a.go {{
+    display: inline-block; text-decoration: none; font-weight: 650;
+    padding: 11px 20px; border-radius: 11px; color: #fff;
+    background: linear-gradient(135deg, #4f7cff, #7c5cff);
+  }}
+  .later {{ color: #8b95a5; font-size: 0.86rem; }}
+  .foot {{ margin-top: 22px; padding-top: 15px; border-top: 1px solid rgba(255,255,255,0.07);
+          font-size: 0.82rem; color: #8b95a5; }}
+</style></head>
+<body><main class="card">
+  <div class="brand"><div class="ring"></div><b>AETHER</b></div>
+  <h1>Aether wants to connect to {label}</h1>
+  <p>This window belongs to Aether, on your own machine. It opened because you
+     pressed Connect in the Connections panel.</p>
+  <ul>
+    <li>You sign in on {label}'s own page, in this window. Aether does not fill
+        the form and never sees your password.</li>
+    <li>What Aether keeps afterwards is the session, in its own browser profile,
+        the same thing any browser keeps. You can end it any time with Forget.</li>
+    <li>It lets Aether work in your {label} account when you ask it to. Nothing
+        happens in there on its own.</li>
+  </ul>
+  <div class="row">
+    <a class="go" href="{sign_in_url}">Continue to {label}</a>
+    <span class="later">Then go back to Aether and press Check.</span>
+  </div>
+  <p class="foot">If you did not press Connect in Aether, close this window.
+     Nothing has been shared.</p>
+</main></body></html>
+"""
+
+
+@app.get("/connect/{cid}", response_class=HTMLResponse)
+async def api_connect_page(cid: str):
+    """Aether's own page, shown before any service's sign-in."""
+    entry = connections.spec(cid)
+    if entry is None or not entry.get("sign_in_url"):
+        raise HTTPException(404, "No such connection.")
+    return HTMLResponse(CONSENT_PAGE.format(
+        label=html.escape(entry.get("label") or cid),
+        sign_in_url=html.escape(entry["sign_in_url"], quote=True),
+    ))
+
+
+@app.get("/api/connections")
+async def api_connections():
+    return connections.listing()
+
+
+@app.post("/api/connections")
+async def api_add_connection(body: ConnectionIn):
+    try:
+        return connections.add(body.id, body.label, body.kind, body.sign_in_url, body.note)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/connections/{cid}/sign-in")
+async def api_connection_sign_in(cid: str):
+    try:
+        return connections.sign_in(cid)
+    except KeyError as e:
+        raise HTTPException(404, f"No connection called {cid}.") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/connections/{cid}/check")
+async def api_connection_check(cid: str):
+    try:
+        return connections.check(cid)
+    except KeyError as e:
+        raise HTTPException(404, f"No connection called {cid}.") from e
+
+
+@app.post("/api/connections/{cid}/secret")
+async def api_connection_secret(cid: str, body: SecretIn):
+    """The value goes straight to the OS keyring. It is never stored here, never
+    logged, and never returned."""
+    if not body.value.strip():
+        raise HTTPException(400, "A key cannot be empty.")
+    try:
+        return connections.store_secret(cid, body.value)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+
+
+@app.delete("/api/connections/{cid}")
+async def api_forget_connection(cid: str):
+    return connections.forget(cid)
+
+
 @app.post("/api/computer-overlay")
 async def api_computer_overlay(body: dict):
     enabled = bool(body.get("enabled"))
@@ -3628,7 +4163,7 @@ async def api_computer_overlay(body: dict):
 
 @app.get("/api/computer-overlay")
 async def api_computer_overlay_get():
-    return {"enabled": computer_overlay.is_active()}
+    return computer_overlay.status()
 
 
 @app.post("/api/pick-folder")
@@ -3734,4 +4269,5 @@ async def api_search(q: str = Form(...)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="127.0.0.1", port=7878, reload=False)
+    port = int(os.environ.get("AETHER_PORT") or 7878)
+    uvicorn.run("server:app", host="127.0.0.1", port=port, reload=False)
