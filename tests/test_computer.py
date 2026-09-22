@@ -86,6 +86,28 @@ class ActionValidationTests(unittest.TestCase):
         self.assertIn("Unknown action", out["error"])
         self.assertIn("screenshot", out["hint"])
 
+    def test_an_unknown_action_is_named_even_with_no_desktop_at_all(self):
+        """A mistyped action is wrong whatever machine it arrives on.
+
+        Checked before the screen is probed, so a headless box answers the
+        question that was asked rather than reporting that it has no display.
+        """
+        with patch.object(computer, "available", return_value=(False, "no display")):
+            out = json.loads(computer.run({"action": "teleport"}))
+            batch = json.loads(computer.run({"actions": [
+                {"action": "click", "x": 1, "y": 1},
+                {"action": "teleport"},
+            ]}))
+
+        self.assertIn("Unknown action", out["error"])
+        self.assertIn("Unknown action", batch["error"])
+
+    def test_an_unavailable_desktop_still_refuses_a_real_action(self):
+        with patch.object(computer, "available", return_value=(False, "no display")):
+            out = json.loads(computer.run({"action": "screenshot"}))
+
+        self.assertIn("unavailable", out["error"])
+
     def test_a_click_without_coordinates_is_refused_before_it_runs(self):
         out = json.loads(computer.run({"action": "click"}))
         # Reached the argument check, or the machine has no desktop at all; both

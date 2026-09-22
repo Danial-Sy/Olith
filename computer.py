@@ -793,14 +793,9 @@ STEP_PAUSE = 0.25
 
 def _perform(args: dict, drv: Any, sw: int, sh: int) -> dict:
     """One action, no capture. Returns what it did, or an `error` it refused."""
-    action = str((args or {}).get("action") or "").strip().lower()
-    if action in ("screen_shot", "capture", "look"):
-        action = "screenshot"
+    action = _canonical(args)
     if action not in ACTIONS:
-        return {
-            "error": f"Unknown action {action!r}",
-            "hint": f"Use one of: {', '.join(ACTIONS)}",
-        }
+        return _unknown_action(action)
 
     x, y = args.get("x"), args.get("y")
     point = None
@@ -900,6 +895,19 @@ def _perform(args: dict, drv: Any, sw: int, sh: int) -> dict:
     return done
 
 
+def _canonical(args: dict) -> str:
+    """The action a step names, under the spelling this module uses."""
+    action = str((args or {}).get("action") or "").strip().lower()
+    return "screenshot" if action in ("screen_shot", "capture", "look") else action
+
+
+def _unknown_action(action: str) -> dict:
+    return {
+        "error": f"Unknown action {action!r}",
+        "hint": f"Use one of: {', '.join(ACTIONS)}",
+    }
+
+
 def _steps(args: dict) -> list[dict] | None:
     """The actions a call carries, when it carries more than one."""
     raw = (args or {}).get("actions")
@@ -918,6 +926,13 @@ def run(args: dict) -> str:
     global _frame
 
     args = args or {}
+    # Before the desktop is probed: an action that does not exist is wrong on
+    # any machine, and saying so needs no screen.
+    for step in _steps(args) or [args]:
+        action = _canonical(step)
+        if action != "batch" and action not in ACTIONS:
+            return json.dumps(_unknown_action(action))
+
     ok, why = available()
     if not ok:
         return json.dumps({
