@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -122,7 +123,7 @@ class WizardTests(unittest.TestCase):
 
         self.assertEqual(sizes, ["tiny", "small", "medium", "default"])
 
-    def test_a_24gb_card_gets_the_pair_aether_was_tuned_on(self):
+    def test_a_24gb_card_gets_the_pair_olith_was_tuned_on(self):
         tags, _ = self._choose(_hw(24, 32))
 
         self.assertIn("qwen3.8:27b", tags)
@@ -155,7 +156,7 @@ class WizardTests(unittest.TestCase):
 
     def test_models_already_present_are_not_counted_as_downloads(self):
         tags, out = self._choose(_hw(24, 32), installed={"qwen3.8:27b", "qwen3-coder:30b",
-                                                         "qwen2.5:0.5b"})
+                                                         "qwen2.5:0.5b", "nomic-embed-text:latest"})
         self.assertIn("already installed", out)
 
     def test_the_library_is_pointed_at_for_typing_your_own(self):
@@ -205,10 +206,10 @@ class CustomTagTests(unittest.TestCase):
 
 
 class ManifestConsistencyTests(unittest.TestCase):
-    """aether.json is documentation, so nothing catches it drifting on its own."""
+    """olith.json is documentation, so nothing catches it drifting on its own."""
 
     def setUp(self):
-        self.manifest = json.loads((ROOT / "aether.json").read_text(encoding="utf-8"))
+        self.manifest = json.loads((ROOT / "olith.json").read_text(encoding="utf-8"))
 
     def test_the_stated_defaults_are_the_real_ones(self):
         import config
@@ -218,6 +219,7 @@ class ManifestConsistencyTests(unittest.TestCase):
         self.assertEqual(defaults["agentic"], config.DEFAULT_CODER_MODEL)
         self.assertEqual(defaults["vision"], config.DEFAULT_AGENT_MODEL)
         self.assertEqual(defaults["titles"], config.TITLE_MODEL_ID)
+        self.assertEqual(defaults["embeddings"], config.EMBEDDING_MODEL_ID)
 
     def test_the_stated_windows_are_the_real_ones(self):
         import config
@@ -233,3 +235,32 @@ class ManifestConsistencyTests(unittest.TestCase):
         import config
 
         self.assertEqual(self.manifest["version"], config.VERSION)
+
+
+class EmbeddingSetupTests(unittest.TestCase):
+    def test_normal_and_custom_choices_include_embeddings(self):
+        self.assertIn(setup.reg.config.EMBEDDING_MODEL_ID, setup.default_tags())
+        self.assertIn(setup.reg.config.EMBEDDING_MODEL_ID, setup.MODEL_SETS["chat"])
+        with patch("builtins.input", side_effect=["", "qwen3:8b", ""]), \
+             patch.object(setup.reg, "manifest_size", return_value=100), \
+             contextlib.redirect_stdout(io.StringIO()):
+            chosen, total = setup.choose_custom(setup.reg.load_catalog(), set())
+        self.assertIn(setup.reg.config.EMBEDDING_MODEL_ID, chosen)
+        self.assertEqual(total, len(chosen) * 100)
+
+    def test_setup_enables_new_settings_and_preserves_saved_preferences(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(setup, "ROOT", Path(folder)), patch.object(setup, "log"):
+            setup.configure_semantic_search([setup.reg.config.EMBEDDING_MODEL_ID])
+            path = Path(folder) / "data/settings/settings.json"
+            settings = json.loads(path.read_text())
+            self.assertTrue(settings["semantic_search"])
+            self.assertEqual(settings["embedding_device"], "cpu")
+            settings.update({"semantic_search": False, "embedding_model": "custom", "theme": "saved"})
+            path.write_text(json.dumps(settings))
+            setup.configure_semantic_search([setup.reg.config.EMBEDDING_MODEL_ID])
+            self.assertEqual(json.loads(path.read_text()), settings)
+
+    def test_model_sets_without_embeddings_do_not_change_settings(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(setup, "ROOT", Path(folder)):
+            setup.configure_semantic_search([setup.reg.config.TITLE_MODEL_ID])
+            self.assertFalse((Path(folder) / "data/settings/settings.json").exists())

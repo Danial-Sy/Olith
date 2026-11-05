@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Olith
+Comment=Local Olith desktop chat (Ollama)
+Exec=olith.sh
+Path=.
+Icon=olith
+Terminal=false
+Categories=Utility;
+Keywords=AI;Chat;LLM;Ollama;Agent;
+StartupNotify=false
+StartupWMClass=olith
+SingleMainWindow=true

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Olith app icon</title>
+  <desc id="desc">A luminous, faceted O monolith on a deep blue rounded square.</desc>
+  <defs>
+    <linearGradient id="tile" x1="76" y1="54" x2="430" y2="466" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#17233d"/>
+      <stop offset="0.52" stop-color="#0c1220"/>
+      <stop offset="1" stop-color="#070a12"/>
+    </linearGradient>
+    <linearGradient id="stone" x1="132" y1="112" x2="382" y2="412" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#65eaff"/>
+      <stop offset="0.34" stop-color="#4f7cff"/>
+      <stop offset="0.7" stop-color="#8b5cf6"/>
+      <stop offset="1" stop-color="#ef476f"/>
+    </linearGradient>
+    <linearGradient id="facet" x1="116" y1="148" x2="346" y2="342" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".55"/>
+      <stop offset=".48" stop-color="#ffffff" stop-opacity=".08"/>
+      <stop offset="1" stop-color="#09101f" stop-opacity=".46"/>
+    </linearGradient>
+    <linearGradient id="inner" x1="210" y1="184" x2="314" y2="330" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#00d4ff" stop-opacity=".34"/>
+      <stop offset="1" stop-color="#7c5cff" stop-opacity=".05"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#03050b" flood-opacity=".56"/>
+    </filter>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="16"/>
+    </filter>
+  </defs>
+
+  <!-- The dark mineral tile keeps the mark legible in light and dark desktop themes. -->
+  <rect x="28" y="28" width="456" height="456" rx="112" fill="url(#tile)" filter="url(#shadow)"/>
+  <rect x="29.5" y="29.5" width="453" height="453" rx="110.5" fill="none" stroke="#a9c5ff" stroke-opacity=".18" stroke-width="3"/>
+
+  <!-- A quiet pool of light sits behind the carved opening. -->
+  <ellipse cx="256" cy="270" rx="112" ry="126" fill="#536dfe" opacity=".2" filter="url(#glow)"/>
+  <path d="M225 178h62l35 36v84l-35 36h-62l-35-36v-84z" fill="url(#inner)"/>
+
+  <!-- Main O: one even-odd vector path, cut like an eight-sided standing stone. -->
+  <path fill="url(#stone)" fill-rule="evenodd" d="M202 86h108l98 86v168l-98 86H202l-98-86V172zm25 101-32 30v78l32 30h58l32-30v-78l-32-30z"/>
+
+  <!-- Broad translucent facets add depth without weakening the small-size silhouette. -->
+  <path d="M202 86h54v101h-29l-32 30-91-45z" fill="url(#facet)" opacity=".48"/>
+  <path d="M310 86l98 86-91 45-32-30h-29V86z" fill="#b9b7ff" opacity=".14"/>
+  <path d="M104 340l91-45 32 30h29v101h-54z" fill="#0dd8f2" opacity=".16"/>
+  <path d="M317 295l91 45-98 86h-54V325h29z" fill="#3d175f" opacity=".22"/>
+
+  <!-- Chiselled edge lines remain sparse and intentional. -->
+  <path d="M202 87l25 100M310 87l-25 100M105 172l90 45M407 172l-90 45" fill="none" stroke="#e7f5ff" stroke-opacity=".22" stroke-width="3" stroke-linecap="round"/>
+  <path d="M105 340l90-45M407 340l-90-45M202 425l25-100M310 425l-25-100" fill="none" stroke="#050815" stroke-opacity=".28" stroke-width="3" stroke-linecap="round"/>
+
+</svg>

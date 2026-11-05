@@ -63,7 +63,7 @@ function Find-Ollama {
     $command = Get-Command ollama.exe -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }
     $candidates = @(
-        $env:AETHER_OLLAMA,
+        $env:OLITH_OLLAMA,
         "C:\AI\ollama\ollama.exe",
         "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe",
         "$env:ProgramFiles\Ollama\ollama.exe"
@@ -79,12 +79,12 @@ function Find-Ollama {
 function Install-WithWinget([string]$Id, [string]$Name) {
     $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
     if (-not $winget) {
-        Stop-Setup "$Name is missing and Windows Package Manager (winget) is unavailable. Install $Name manually, then run Install-Aether.bat again."
+        Stop-Setup "$Name is missing and Windows Package Manager (winget) is unavailable. Install $Name manually, then run Install-Olith.bat again."
     }
     Write-Host "Installing $Name with winget..."
     & $winget.Source install --exact --id $Id --accept-package-agreements --accept-source-agreements --silent
     if ($LASTEXITCODE -ne 0) {
-        Stop-Setup "winget could not install $Name (exit $LASTEXITCODE). Install it manually, then run Install-Aether.bat again."
+        Stop-Setup "winget could not install $Name (exit $LASTEXITCODE). Install it manually, then run Install-Olith.bat again."
     }
     Refresh-Path
 }
@@ -285,14 +285,14 @@ function Choose-Models($Python, $Plan, [string[]]$Installed) {
 
     switch ($answer) {
         "1" { return @($Plan.default.tags) }
-        "3" { return @(Read-CustomTags $Python $Plan) }
+        "3" { return @($Plan.utility_tags) + @(Read-CustomTags $Python $Plan) }
         default { return @($Plan.recommended.tags) }
     }
 }
 
 function Set-OllamaEnvironment([string]$Ollama) {
     $values = @{
-        AETHER_OLLAMA = $Ollama
+        OLITH_OLLAMA = $Ollama
         OLLAMA_KV_CACHE_TYPE = "q8_0"
         OLLAMA_FLASH_ATTENTION = "1"
         OLLAMA_NUM_PARALLEL = "1"
@@ -304,28 +304,28 @@ function Set-OllamaEnvironment([string]$Ollama) {
     }
 }
 
-function New-AetherShortcuts {
+function New-OlithShortcuts {
     $shell = New-Object -ComObject WScript.Shell
     $desktop = [Environment]::GetFolderPath("Desktop")
     $programs = [Environment]::GetFolderPath("Programs")
     $target = "$env:WINDIR\System32\wscript.exe"
-    $arguments = "//nologo `"$Root\Aether.vbs`""
-    $icon = "$Root\static\assets\aether.ico"
+    $arguments = "//nologo `"$Root\Olith.vbs`""
+    $icon = "$Root\static\assets\olith.ico"
 
     foreach ($folder in @($desktop, $programs)) {
         if (-not (Test-Path -LiteralPath $folder)) { continue }
-        $shortcut = $shell.CreateShortcut((Join-Path $folder "Aether.lnk"))
+        $shortcut = $shell.CreateShortcut((Join-Path $folder "Olith.lnk"))
         $shortcut.TargetPath = $target
         $shortcut.Arguments = $arguments
         $shortcut.WorkingDirectory = $Root
-        $shortcut.Description = "Aether local AI desktop agent"
+        $shortcut.Description = "Olith local AI desktop agent"
         if (Test-Path -LiteralPath $icon) { $shortcut.IconLocation = "$icon,0" }
         $shortcut.Save()
     }
 }
 
 try {
-    Write-Host "Aether Setup Wizard" -ForegroundColor Magenta
+    Write-Host "Olith Setup Wizard" -ForegroundColor Magenta
     Write-Host "Installs local dependencies, Ollama models, and desktop shortcuts."
 
     Write-Step "Checking Python 3.11+"
@@ -345,7 +345,7 @@ try {
     }
     if (-not $ollama) { Stop-Setup "Ollama was installed but could not be located. Restart Windows and run this installer again." }
     Write-Host "Ollama: $ollama"
-    $env:AETHER_OLLAMA = $ollama
+    $env:OLITH_OLLAMA = $ollama
 
     Write-Step "Configuring Ollama"
     Set-OllamaEnvironment $ollama
@@ -353,7 +353,7 @@ try {
 
     Write-Step "Starting Ollama"
     if (-not (Wait-Ollama $ollama)) {
-        Stop-Setup "Ollama was found but its API did not become ready at $(Get-OllamaApiBase). Restart Windows, then run Install-Aether.bat again."
+        Stop-Setup "Ollama was found but its API did not become ready at $(Get-OllamaApiBase). Restart Windows, then run Install-Olith.bat again."
     }
     Write-Host "Ollama API is ready: $(Get-OllamaApiBase)"
 
@@ -382,7 +382,7 @@ try {
         Write-Host "Skipping model downloads."
     } elseif (-not $plan) {
         Write-Warning "Could not read the model catalog; falling back to the default pair."
-        $chosen = @("qwen2.5:0.5b", "qwen3.8:27b", "qwen3-coder:30b")
+        $chosen = @("qwen2.5:0.5b", "nomic-embed-text:latest", "qwen3.8:27b", "qwen3-coder:30b")
     } else {
         $chosen = Choose-Models $python $plan $installed
     }
@@ -416,7 +416,7 @@ try {
         }
     }
 
-    Write-Step "Creating Aether environment and installing models"
+    Write-Step "Creating Olith environment and installing models"
     $setupArgs = @($python.Prefix) + @((Join-Path $Root "setup.py"))
     if ($SkipModels) {
         $setupArgs += "--skip-models"
@@ -424,16 +424,16 @@ try {
         $setupArgs += @("--tags") + $chosen
     }
     & $python.Exe @setupArgs
-    if ($LASTEXITCODE -ne 0) { Stop-Setup "Aether's Python setup failed (exit $LASTEXITCODE)." }
+    if ($LASTEXITCODE -ne 0) { Stop-Setup "Olith's Python setup failed (exit $LASTEXITCODE)." }
 
     if (-not $NoShortcut) {
         Write-Step "Creating shortcuts"
-        New-AetherShortcuts
-        Write-Host "Created Aether shortcuts on the Desktop and in the Start Menu."
+        New-OlithShortcuts
+        Write-Host "Created Olith shortcuts on the Desktop and in the Start Menu."
     }
 
-    Write-Host "`nAether is ready." -ForegroundColor Green
-    Write-Host "Open the Aether desktop shortcut, or run Aether.bat from this folder."
+    Write-Host "`nOlith is ready." -ForegroundColor Green
+    Write-Host "Open the Olith desktop shortcut, or run Olith.bat from this folder."
     if (-not $NonInteractive) { [void](Read-Host "Press Enter to close setup") }
     exit 0
 } catch {

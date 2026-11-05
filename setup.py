@@ -6,7 +6,8 @@
 Usage:
   python setup.py              # full install + all models
   python setup.py --skip-models
-  python setup.py --models chat   # title + chat only
+  python setup.py --models chat   # utilities + chat
+  python setup.py --models embeddings  # just the embedding model
   python setup.py --models all
 """
 from __future__ import annotations
@@ -27,8 +28,8 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = f"http://{OLLAMA_HOST}"
 
-# models.py imports only the standard library, so it works here, before pip has
-# run. Everything about which model is which lives in catalog.json, not here.
+# models.py uses the standard library and can run before pip installs.
+# Keep model definitions in catalog.json.
 sys.path.insert(0, str(ROOT))
 import models as reg  # noqa: E402
 
@@ -46,18 +47,19 @@ def _tier_tags(tier: dict) -> list[str]:
 
 
 def default_tags() -> list[str]:
-    """The pair Aether was built and tuned on, plus the title model."""
+    """The pair Olith was built and tuned on, plus the utility models."""
     catalog = reg.load_catalog()
     tier = next((t for t in catalog.get("tiers") or [] if t.get("id") == "default"), None)
     if not tier:
-        return [reg.config.TITLE_MODEL_ID, reg.config.DEFAULT_CHAT_MODEL,
+        return [reg.config.TITLE_MODEL_ID, reg.config.EMBEDDING_MODEL_ID, reg.config.DEFAULT_CHAT_MODEL,
                 reg.config.DEFAULT_CODER_MODEL]
     return _tier_tags({**tier, "utility": catalog.get("utility")})
 
 
 MODEL_SETS = {
     "titles": [reg.config.TITLE_MODEL_ID],
-    "chat": [reg.config.TITLE_MODEL_ID, reg.config.DEFAULT_CHAT_MODEL],
+    "embeddings": [reg.config.EMBEDDING_MODEL_ID],
+    "chat": [reg.config.TITLE_MODEL_ID, reg.config.EMBEDDING_MODEL_ID, reg.config.DEFAULT_CHAT_MODEL],
     "all": default_tags(),
 }
 
@@ -81,6 +83,15 @@ def ensure_python() -> None:
     if sys.version_info < (3, 11):
         die(f"Python 3.11+ required (found {sys.version.split()[0]})")
     log(f"Python {sys.version.split()[0]}")
+
+
+def ensure_project_home() -> None:
+    folder = reg.config.PROJECT_HOME.expanduser()
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        die(f"Could not create Olith's projects folder {folder}: {exc}")
+    log(f"Projects folder: {folder.resolve()}")
 
 
 def _create_venv_via_virtualenv(distro_py: str) -> None:
@@ -162,9 +173,38 @@ def pip_install(py: Path) -> None:
     log("Python packages ready (FastAPI, search/ddgs, pywebview, Pillow).")
 
 
+def install_language_servers() -> None:
+    """Python LSP comes from pip; provision JS/TS when its runtime is present."""
+    npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
+    prefix = ROOT / "data" / "tools" / "language-servers"
+    launcher = prefix / "node_modules/.bin" / ("typescript-language-server.cmd" if os.name == "nt" else "typescript-language-server")
+    package = prefix / "node_modules/typescript-language-server/package.json"
+    try:
+        compatible = json.loads(package.read_text(encoding="utf-8"))["version"].startswith("4.")
+    except (OSError, ValueError, KeyError):
+        compatible = False
+    if launcher.exists() and compatible:
+        log("JavaScript/TypeScript language server already installed.")
+        return
+    if not npm:
+        log("Python language server ready. JS/TS navigation will use project tools when Node.js is installed.")
+        return
+    try:
+        node = shutil.which("node")
+        node_version = subprocess.check_output([node, "--version"], text=True, timeout=5) if node else "v0"
+        if int(node_version.strip().lstrip("v").split(".")[0]) < 18:
+            log("JS/TS language navigation needs Node.js 18+; syntax indexing remains available.")
+            return
+        log("Installing local JavaScript/TypeScript language tools…")
+        subprocess.run([npm, "install", "--prefix", str(prefix), "--no-audit", "--no-fund",
+                        "typescript@^5", "typescript-language-server@^4"], check=True, timeout=180)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        log(f"JS/TS language tools unavailable ({exc}); syntax indexing remains available.")
+
+
 def find_ollama() -> str | None:
     # config.py is not importable on a fresh clone, so detect the same way
-    env = (os.environ.get("AETHER_OLLAMA") or os.environ.get("OLLAMA_BIN") or "").strip()
+    env = (os.environ.get("OLITH_OLLAMA") or os.environ.get("OLLAMA_BIN") or "").strip()
     if env and Path(env).exists():
         return env
     which = shutil.which("ollama")
@@ -289,8 +329,7 @@ def pull_models(bin_path: str, tags: list[str]) -> None:
         rc = subprocess.call([bin_path, "pull", tag])
         if rc != 0:
             die(f"ollama pull {tag} failed (exit {rc})")
-        # Do not trust exit status alone: verify the model is visible in the same
-        # Ollama store Aether will use. This catches wrong-host/store setups.
+        # Verify the model in Olith's Ollama store after the pull succeeds.
         have = installed_models(bin_path)
         if not model_is_installed(have, tag):
             die(
@@ -350,7 +389,7 @@ def choose_models(installed: set[str], non_interactive: bool = False) -> list[st
     print()
     print("Which models?")
     print("-------------")
-    default_size = _print_choice(1, "Default", "What Aether was built and tuned on. Needs about 24 GB of VRAM.", default, installed)
+    default_size = _print_choice(1, "Default", "What Olith was built and tuned on. Needs about 24 GB of VRAM.", default, installed)
     print()
     sized_for = ("CPU only, so this is sized for speed rather than for what fits."
                  if hw.get("cpu_only") else f"Sized for {usable_gb:.0f} GB of usable memory.")
@@ -360,8 +399,7 @@ def choose_models(installed: set[str], non_interactive: bool = False) -> list[st
     print(f"     Any tag from {catalog.get('library_url')}. Checked before anything downloads.")
     print()
 
-    # Recommended is sized for this machine, so it is the default answer unless
-    # it is already the tuned pair, in which case the two choices are the same.
+    # Default to this machine's recommendation unless it matches the default pair.
     pick = "1" if set(recommended) == set(default) else "2"
     if non_interactive:
         log(f"Non-interactive: choosing {pick}")
@@ -388,12 +426,15 @@ def choose_custom(catalog: dict, installed: set[str]) -> tuple[list[str], int]:
     print()
     print(f"Browse models at {catalog.get('library_url')} and copy the tag, for example qwen3:8b.")
     print("Enter one tag per line. Blank line when done.")
-    chosen: list[str] = [reg.config.TITLE_MODEL_ID]
-    total = 0
+    chosen = _tier_tags({"utility": catalog.get("utility")})
+    if not chosen:
+        chosen = [reg.config.TITLE_MODEL_ID, reg.config.EMBEDDING_MODEL_ID]
+    utility_count = len(chosen)
+    total, _ = download_size(chosen, installed)
     while True:
         raw = input("  tag: ").strip()
         if not raw:
-            if len(chosen) > 1:
+            if len(chosen) > utility_count:
                 break
             print("     At least one model is needed.")
             continue
@@ -410,6 +451,27 @@ def choose_custom(catalog: dict, installed: set[str]) -> tuple[list[str], int]:
         chosen.append(tag)
         print(f"     {tag} found, {size / GIB:.1f} GB.")
     return chosen, total
+
+
+def configure_semantic_search(tags: list[str]) -> None:
+    """Make the bundled feature ready, without overwriting saved preferences."""
+    if not model_is_installed(set(tags), reg.config.EMBEDDING_MODEL_ID):
+        return
+    path = ROOT / "data" / "settings" / "settings.json"
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(settings, dict):
+            raise ValueError("Settings must be an object")
+        settings.setdefault("semantic_search", True)
+        settings.setdefault("embedding_model", reg.config.EMBEDDING_MODEL_ID)
+        settings.setdefault("embedding_device", "cpu")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+        temp.replace(path)
+        log("Semantic code search is ready; existing Settings choices were preserved.")
+    except (OSError, ValueError) as exc:
+        log(f"Embedding model installed. Could not update Settings: {exc}")
 
 
 def linux_notes() -> None:
@@ -441,7 +503,7 @@ def install_desktop_entry() -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Install Aether (venv, deps, Ollama models).")
+    p = argparse.ArgumentParser(description="Install Olith (venv, deps, Ollama models).")
     p.add_argument("--skip-models", action="store_true", help="Skip ollama pull")
     p.add_argument(
         "--models",
@@ -459,14 +521,16 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    print("Aether setup")
+    print("Olith setup")
     print("============")
     ensure_python()
+    ensure_project_home()
     (ROOT / "data" / "chats").mkdir(parents=True, exist_ok=True)
     (ROOT / "data" / "uploads").mkdir(parents=True, exist_ok=True)
     (ROOT / "data" / "settings").mkdir(parents=True, exist_ok=True)
     py = ensure_venv()
     pip_install(py)
+    install_language_servers()
 
     ollama = find_ollama()
     if not ollama:
@@ -486,6 +550,7 @@ def main() -> None:
             else:
                 tags = choose_models(installed_models(ollama), non_interactive=args.yes)
             pull_models(ollama, tags)
+            configure_semantic_search(tags)
 
     install_desktop_entry()
 
@@ -493,11 +558,11 @@ def main() -> None:
     print()
     print("Done. Launch with:")
     if sys.platform == "win32":
-        print("  Aether.bat")
+        print("  Olith.bat")
         print("  or:  .venv\\Scripts\\pythonw.exe desktop.py")
     else:
-        print("  the Aether icon on your Desktop or in the app menu")
-        print("  or:  ./aether.sh")
+        print("  the Olith icon on your Desktop or in the app menu")
+        print("  or:  ./olith.sh")
         print("  or:  .venv/bin/python desktop.py")
     print()
 

@@ -19,30 +19,28 @@ from typing import Any
 
 import browser
 import computer
+import connections
 import policy as policy_mod
 import symbols
+import repo_index
+import language_servers
 from browser import ACTIONS as BROWSER_ACTIONS
 from computer import ACTIONS as COMPUTER_ACTIONS
 from config import DATA
 from storage import load_settings
 
 READ_FILE_CONTENT_MAX_CHARS = 7200
-# An outline earns its place only by being far cheaper than reading the file.
-# Full signatures are what make it expensive, and the leading parameters are
-# the part that identifies the definition.
+# Keep outlines short; leading parameters are enough to identify a definition.
 OUTLINE_SIGNATURE_CHARS = 90
 MAX_EDIT_RANGES = 64
 
 # Every tool overwrite snapshots the previous contents here first.
 BACKUP_DIR = DATA / "backups"
 BACKUP_KEEP = 10
-# Oversized tool results are written here and replaced in the prompt by a
-# head/tail excerpt plus the path. Truncating throws away the tail the model
-# usually needs next. Offloading loses nothing: it can re-read any range.
+# Save large tool results to disk. Keep the head, tail and file path in the prompt.
 TOOLOUT_DIR = DATA / "toolout"
 TOOLOUT_KEEP = 60
-# Above this the result is offloaded. Matches the render-time truncation point,
-# so anything that would have been cut is now a file instead.
+# Save tool results above the render limit to disk.
 OFFLOAD_CHARS = 8000
 OFFLOAD_HEAD_CHARS = 3000
 OFFLOAD_TAIL_CHARS = 1200
@@ -50,7 +48,9 @@ OFFLOAD_TAIL_CHARS = 1200
 # This cap only guards against a runaway command eating memory.
 SHELL_OUTPUT_HARD_CAP = 400_000
 MAX_EDIT_TOTAL_CHARS = 120_000
-REPLAY_ELISION_PREFIX = "[Aether replay elision:"
+MAX_WRITE_CHARS = 12_000
+INTERNAL_VERIFICATION_COMMAND = "[Olith automatic project verification]"
+REPLAY_ELISION_PREFIX = "[Olith replay elision:"
 
 TOOL_DEFS = [
     {
@@ -86,7 +86,7 @@ TOOL_DEFS = [
                         "type": "string",
                         "description": (
                             "Function or class to return, e.g. parse_version or "
-                            "Config.load. Python is exact; JS/TS is best effort."
+                            "Config.load. Parser-backed boundaries where supported."
                         ),
                     },
                     "outline": {
@@ -95,6 +95,9 @@ TOOL_DEFS = [
                     },
                     "start_line": {"type": "integer"},
                     "end_line": {"type": "integer"},
+                    "language_action": {"type": "string", "enum": ["diagnostics", "definition", "references", "hover", "rename"], "description": "Use the project's language server at start_line and character. Rename returns proposed edits."},
+                    "character": {"type": "integer", "minimum": 0, "description": "Zero-based UTF-16 column for language navigation."},
+                    "new_name": {"type": "string", "description": "New identifier for a language-server rename preview."},
                 },
                 "required": ["path"],
             },
@@ -105,10 +108,9 @@ TOOL_DEFS = [
         "function": {
             "name": "write_file",
             "description": (
-                "Create a NEW text file. If the path already exists this is rejected, use "
-                "edit_file to change it or append_file to add to it. A file is written once, "
-                "when it is created, and edited from then on. Python, JavaScript, JSON and "
-                "HTML are syntax-checked automatically."
+                "Create a file, or replace an existing one with complete new content. For a "
+                "small change to an existing file, edit_file is cheaper. Python, JavaScript, "
+                "JSON and HTML are syntax-checked automatically."
             ),
             "parameters": {
                 "type": "object",
@@ -116,14 +118,9 @@ TOOL_DEFS = [
                     "path": {"type": "string"},
                     "content": {
                         "type": "string",
-                        "maxLength": 12000,
-                        "description": "Complete file content, at most 12,000 characters.",
-                    },
-                    "overwrite": {
-                        "type": "boolean",
                         "description": (
-                            "Replace an existing file. Only when the user explicitly asked to "
-                            "rewrite or replace that file from scratch, never to apply edits."
+                            "Complete file content. A new file is at most 12,000 characters; "
+                            "continue it with append_file. Replacing a file sends all of it."
                         ),
                     },
                 },
@@ -211,13 +208,15 @@ TOOL_DEFS = [
         "type": "function",
         "function": {
             "name": "search_files",
-            "description": "Search for a regex/text pattern in project files.",
+            "description": "Search project files: regex by default; hybrid for concepts, symbols for definitions, references for identifier occurrences, map for dependencies.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string"},
                     "glob": {"type": "string", "description": "e.g. **/*.py"},
                     "path": {"type": "string", "description": "Subfolder to search"},
+                    "mode": {"type": "string", "enum": ["regex", "hybrid", "symbols", "references", "map"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
                 "required": ["pattern"],
             },
@@ -270,8 +269,11 @@ TOOL_DEFS = [
         "type": "function",
         "function": {
             "name": "git_status",
-            "description": "Show git status / recent log for the project if it is a repo.",
-            "parameters": {"type": "object", "properties": {}},
+            "description": "Inspect Git or manage GitHub for the active repository, signed in as the connected GitHub account. Shell git may have no GitHub login, so use this for remote work instead of shell git push, gh, or looking for tokens. Olith handles mutation approvals according to the user's Approval mode setting. To publish a committed local repo, call create_repo with options name, description and publish=true: it adds origin and pushes under one approval. New repos are private; pass private=false only if the user asked for a public one. Use pull/checks before merge_pull and supply the reviewed head sha. Never force push. options holds action fields (branch, paths, message, number, title, body, head, base, sha).",
+            "parameters": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["status", "diff", "branches", "fetch", "pull_ff", "push", "stage", "unstage", "commit", "branch", "checkout", "merge", "abort_merge", "repos", "create_repo", "pulls", "pull", "checks", "create_pull", "update_pull", "merge_pull", "issues", "create_issue", "comment", "review"]},
+                "options": {"type": "object", "additionalProperties": True}
+            }},
         },
     },
 
@@ -532,7 +534,7 @@ TOOL_DEFS = [
                 "elements come back as refs with names, text comes back as text, and typing "
                 "is one insert. Use this for anything in a browser, including web "
                 "applications like Google Docs, and the computer tool only for the desktop "
-                "around it. Aether opens its own browser window; sign in there once and it "
+                "around it. Olith opens its own browser window; sign in there once and it "
                 "stays signed in."
             ),
             "parameters": {
@@ -565,25 +567,17 @@ TOOL_DEFS = [
     },
 ]
 
-# A sub-agent inspects and reports, never mutates. Read-only means a delegation
-# can always be re-run and the parent stays the only thing that writes.
+# Sub-tasks inspect and report. The parent makes all changes.
 SUBAGENT_DEFAULT_TOOLS = ("list_dir", "read_file", "search_files", "run_shell", "git_status")
-# Bounded so a confused sub-task cannot burn the run. It ends the sub-run
-# cleanly rather than refusing the model's next move.
+# End a sub-task with a summary when its tool budget is spent.
 SUBAGENT_MAX_STEPS = 16
-# Gated on project size. The schema costs 324 tokens on every request, and on a
-# small project that is a permanent tax for a tool the model never reaches for:
-# there is no context pressure a fresh window would relieve.
+# Offer delegation only on large projects, where a fresh context window helps.
 DELEGATE_MIN_FILES = 300
 _large_project_cache: dict[str, bool] = {}
 
 
 def project_is_large(project_root: Path | None) -> bool:
-    """Whether a project is big enough that delegation earns its schema.
-
-    Stops counting at the threshold, so the walk is bounded, and caches per root
-    for the process, since this is consulted several times per agent step.
-    """
+    """Check project size for delegation. Stop at the threshold and cache the result per root."""
     if project_root is None:
         return False
     key = str(project_root)
@@ -604,25 +598,28 @@ def project_is_large(project_root: Path | None) -> bool:
     return result
 
 
+TOOL_DEFS.extend([
+    {"type": "function", "function": {"name": "connection_tools",
+        "description": "Discover tools and input schemas from enabled direct service connections. Pass a service ID or a focused query.",
+        "parameters": {"type": "object", "properties": {"server": {"type": "string"}, "query": {"type": "string"}}}}},
+    {"type": "function", "function": {"name": "connection_call",
+        "description": "Call a service tool discovered with connection_tools. Olith handles action approvals according to the user's Approval mode setting.",
+        "parameters": {"type": "object", "properties": {"server": {"type": "string"}, "tool": {"type": "string"},
+            "arguments": {"type": "object"}}, "required": ["server", "tool", "arguments"]}}},
+])
 _TOOL_DEFS_NO_DELEGATE = [t for t in TOOL_DEFS if t["function"]["name"] != "delegate"]
 
 
-# What a wrong choice costs, most to least. One list decides which tools a
-# budgeted model gets and where each one sits in the list it is shown, so
-# ranking a new tool once keeps those two from disagreeing. The reading and
-# editing lead was measured rather than chosen.
+# Use the same measured priority order for tool selection and display.
 TOOL_PRIORITY = (
     "read_file", "edit_file", "search_files", "run_shell", "browser", "computer",
     "write_file",
     "list_dir", "todo_write",
     "validate_file", "append_file", "git_status", "check_toolchains",
-    "remember", "ask_user", "delegate",
+    "remember", "ask_user", "delegate", "connection_tools", "connection_call",
 )
 
-# Names models reach for instead of ours. PA-Tool (arXiv:2510.07248) found this
-# error class dominates in small models, and that aligning it cut those errors
-# by 80%. The paper renames tools; aliasing instead is additive, since a model
-# emitting the real name never takes this path.
+# Accept common tool names from other models without changing our own names.
 TOOL_ALIASES = {
     "bash": "run_shell", "shell": "run_shell", "terminal": "run_shell",
     "execute_command": "run_shell", "execute_bash": "run_shell",
@@ -688,13 +685,10 @@ def canonical_tool_name(name: str) -> str:
     return TOOL_ALIASES.get(name.strip().lower(), name)
 
 
-# Dropped in this order when the schemas would eat too much of a small window.
-# Everything after this list is what agentic work cannot be done without, so it
-# is never trimmed. ask_user goes last because losing it makes the agent guess.
-TRIM_ORDER = ("delegate", "remember", "git_status", "check_toolchains",
+# Drop optional tools in this order when context is tight. Keep ask_user until last.
+TRIM_ORDER = ("connection_call", "connection_tools", "delegate", "remember", "git_status", "check_toolchains",
               "validate_file", "append_file", "ask_user")
-# All 14 schemas cost ~4.1k tokens. A third of a small window spent describing
-# tools leaves nothing for the work, and the model reads less of what matters.
+# Base schemas cost about 4.1k tokens. Trim optional tools for small windows.
 SCHEMA_BUDGET_FRACTION = 0.15
 
 
@@ -741,12 +735,7 @@ def _first_sentence(text: str) -> str:
 
 
 def _lean_prose(node: object) -> None:
-    """Trim every `description` in a parameter tree, in place.
-
-    Descriptions are prose wherever they appear, including inside nested
-    properties. What the call has to satisfy is `type`, `required`, `enum` and
-    `items`, and none of those are touched.
-    """
+    """Shorten schema descriptions in place. Keep types, required fields, enums and items unchanged."""
     if isinstance(node, dict):
         for key, value in node.items():
             if key == "description" and isinstance(value, str):
@@ -759,11 +748,7 @@ def _lean_prose(node: object) -> None:
 
 
 def _lean_def(spec: dict) -> dict:
-    """The same schema with its prose cut to one sentence per description.
-
-    todo_write alone spends ~200 tokens explaining merge semantics a 3B will
-    not follow, and those are the tokens the work needs.
-    """
+    """Return a schema copy with each description shortened to one sentence."""
     out = copy.deepcopy(spec)
     fn = out["function"]
     if fn.get("description"):
@@ -811,15 +796,19 @@ def tool_defs_for(chat: dict | None, ctx_limit: int | None = None,
         # standing invitation to click on one. Off unless the chat turned it on.
         if not (chat or {}).get("computer_use"):
             base = [t for t in base if t["function"]["name"] not in ("computer", "browser")]
+        import mcp_connections
+        if not mcp_connections.active():
+            base = [t for t in base if t["function"]["name"] not in ("connection_tools", "connection_call")]
         return trim_tool_defs(apply_policy(base, policy_mod.policy_for(profile)), ctx_limit)
     spec = chat.get("subagent") or {}
     allowed = {str(t) for t in (spec.get("tools") or SUBAGENT_DEFAULT_TOOLS)}
     # Never recursive: a sub-agent that can delegate can spawn without bound.
     allowed.discard("delegate")
-    # A sub-agent inspects and reports. Clicking is the least reversible thing
-    # Aether can do, and it belongs to the run the user is watching.
+    # Keep desktop and browser actions in the parent run.
     allowed.discard("computer")
     allowed.discard("browser")
+    allowed.discard("connection_call")
+    allowed.discard("connection_tools")
     picked = [t for t in TOOL_DEFS if t["function"]["name"] in allowed]
     # An empty allowlist would leave the sub-agent unable to do anything at all.
     picked = picked or [
@@ -828,8 +817,7 @@ def tool_defs_for(chat: dict | None, ctx_limit: int | None = None,
     return trim_tool_defs(apply_policy(picked, policy_mod.policy_for(profile)), ctx_limit)
 
 
-# Never the answer to "where is my code". Scanning them floods results with
-# dependency noise and makes every failed path lookup crawl thousands of files.
+# Skip dependency folders when suggesting paths.
 IGNORE_DIRS = frozenset({
     ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".idea", ".vscode",
@@ -839,8 +827,7 @@ IGNORE_DIRS = frozenset({
     "blobs", "snapshots", "checkpoints", ".ollama", "wandb",
 })
 
-# Binary-ish payloads that are technically decodable as text and so slip past the
-# null-byte check. Tokenizer vocabs and arrow caches give meaningless hits.
+# Skip text-decodable binary data such as tokenizer files and Arrow caches.
 BINARY_SUFFIXES = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf",
     ".exe", ".dll", ".so", ".dylib", ".bin", ".gguf", ".pt", ".pth",
@@ -886,8 +873,7 @@ def _allowed_roots(project_root: Path | None) -> list[Path]:
 def resolve_path(path: str, project_root: Path | None) -> Path:
     raw = Path(path or ".").expanduser()
     if not raw.is_absolute():
-        # Relative paths hang off the project when there is one; otherwise the home
-        # directory, so the agent is still usable with no project attached.
+        # Resolve relative paths under the project, or the home folder when no project is set.
         base = project_root or Path.home()
         candidate = (base / raw).resolve()
     else:
@@ -918,8 +904,7 @@ def _path_suggestions(rel: str, project_root: Path, limit: int = 6) -> list[str]
     scanned = 0
     # Exact suffix match first: **/reedus_companion/scripts/foo.py
     for p in project_root.rglob(Path(needle).name):
-        # Hard cap: an unbounded rglob over a repo with a .venv takes seconds and
-        # returns nothing useful, and this fires on EVERY missed path.
+        # Cap path suggestions to avoid scanning large dependency trees.
         scanned += 1
         if scanned > 20000:
             break
@@ -982,7 +967,47 @@ def resolve_existing(path: str, project_root: Path | None, *, want_dir: bool | N
     })
 
 
-def run_tool(
+def run_tool(name: str, args: dict, project_root: Path | None,
+             project_id: str | None = None, chat: dict | None = None) -> str:
+    import editor_bridge
+    ident = (chat or {}).get("editor_session_id")
+    baseline = None
+    if ident and name in {"write_file", "edit_file", "append_file"}:
+        try:
+            target = resolve_path(args.get("path") or "", project_root)
+            baseline = (target.resolve(), target.read_bytes() if target.exists() else None)
+        except (ValueError, OSError) as error:
+            return json.dumps({"error": str(error)})
+    with editor_bridge.writing(ident, baseline):
+        if name == "run_shell":
+            blocked = _rewrite_shell_guard(args.get("command") or "", project_root, chat)
+            if blocked:
+                return json.dumps(blocked)
+        editor_bridge.take_reformatted()
+        result = _run_tool(name, args, project_root, project_id, chat)
+        if editor_bridge.take_reformatted():
+            try:
+                payload = json.loads(result)
+                payload["note"] = "VS Code reformatted the file on save. Re-read the range before anchoring another edit there."
+                result = json.dumps(payload)
+            except (TypeError, ValueError):
+                pass
+        return result
+
+
+def is_internal_verification_command(command: str) -> bool:
+    return str(command or "").strip().casefold() == INTERNAL_VERIFICATION_COMMAND.casefold()
+
+
+def _rewrite_shell_guard(command: str, root: Path | None, chat: dict | None) -> dict | None:
+    if is_internal_verification_command(command):
+        return {"error": "Internal verification label is not a shell command", "changed": False,
+                "verification": (chat or {}).get("verification"),
+                "hint": "Use the verification report as evidence. Run only actual project commands for failed or missing checks; otherwise finish the task."}
+    return None
+
+
+def _run_tool(
     name: str,
     args: dict,
     project_root: Path | None,
@@ -1004,12 +1029,20 @@ def run_tool(
             return _search_files(args, project_root)
         if name == "run_shell":
             return _run_shell(args, project_root)
+        if name in {"connection_tools", "connection_call"}:
+            import mcp_connections
+            if (chat or {}).get("subagent"):
+                return json.dumps({"error": "Direct service connections are unavailable in sub-tasks"})
+            return json.dumps(mcp_connections.discover(args) if name == "connection_tools" else mcp_connections.call(args))
         if name == "check_toolchains":
             return _check_toolchains()
         if name == "validate_file":
             return _validate_file(args, project_root)
         if name == "git_status":
-            return _git_status(project_root)
+            if not args.get("action") or args.get("action") == "status":
+                return _git_status(project_root)
+            import github_tools
+            return json.dumps(github_tools.execute(project_root, args["action"], **(args.get("options") or {})))
         if name == "remember":
             return _remember(args, project_id)
         if name == "todo_write":
@@ -1029,22 +1062,26 @@ def run_tool(
                     "error": "Computer use is off for this chat.",
                     "hint": "Tell the user to turn it on in the model menu. Do not retry.",
                 })
-            return browser.run(args)
+            return _flag_expired_sign_in(browser.run(args))
         return json.dumps({"error": f"Unknown tool: {name}"})
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+def _flag_expired_sign_in(raw: str) -> str:
+    result = json.loads(raw)
+    note = connections.expired_sign_in_note(str(result.get("url") or ""))
+    if not note:
+        return raw
+    # First, so a long snapshot being cut down cannot take it with it.
+    return json.dumps({"sign_in_expired": note, **result})
 
 
 _TODO_STATUSES = frozenset({"pending", "in_progress", "completed", "cancelled"})
 
 
 def _normalize_todo(raw: dict, allow_partial: bool = False) -> dict | None:
-    """Normalize one todo. allow_partial permits a status-only merge update.
-
-    Requiring content on every update rejected the obvious way to close a
-    milestone, {"id": "copy-mp3", "status": "completed"}, and the model then
-    burned steps guessing at the shape.
-    """
+    """Normalize a todo. Allow status-only changes when allow_partial is set."""
     if not isinstance(raw, dict):
         return None
     tid = str(raw.get("id") or "").strip()
@@ -1075,19 +1112,10 @@ def _todo_match_key(item: dict) -> str:
 
 
 def carry_forward_completions(old: list[dict], new_todos: list[dict]) -> list[str]:
-    """Re-apply terminal statuses that a merge=false rewrite silently dropped.
+    """Keep finished milestones when a rewritten plan resets all of them.
 
-    Qwen re-emits the whole plan mid-run, usually to expand the step it is about
-    to start, and regenerates every item as "pending" because it does not track
-    its own statuses. merge=false replaced the list wholesale, so a run that had
-    finished four milestones and was partway through the fifth came back reading
-    zero of six and started the job over.
-
-    A deliberate reopen still works. A rewrite that keeps ANY previously finished
-    item finished is treated as the model knowing the state, and is left exactly
-    as sent; only a rewrite that has forgotten all of them is repaired. Matching
-    is by id first, then by normalized content, because a regenerated plan often
-    keeps the wording and changes the ids.
+    Match by ID, then normalized content. Leave deliberate reopens alone when the
+    new plan still keeps at least one finished item.
     """
     finished_by_id = {
         t["id"]: t["status"]
@@ -1205,6 +1233,17 @@ def _todo_write(args: dict, chat: dict | None) -> str:
         return json.dumps({"error": "todos must be a non-empty array"})
     merge = bool(args.get("merge"))
     old = list(chat.get("agent_todos") or [])
+    messages = chat.get("messages") or []
+    user_index = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user" and not messages[i].get("agent_nudge") and not messages[i].get("computer_frame")), None)
+    scope = None
+    if user_index is not None:
+        user = messages[user_index]
+        scope = str(user.get("id") or user.get("ts") or user_index) + ":" + hashlib.sha256((user.get("content") or "").encode()).hexdigest()[:16]
+        previous = chat.get("agent_plan_scope")
+        previous_result = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "tool" and messages[i].get("name") == "todo_write"), None)
+        resume = user.get("resume_job") or user.get("course_correct") or re.fullmatch(r"\s*(?:continue|resume|go on|keep going|finish it)[.!]*\s*", (user.get("content") or "").split("\n\n")[0], re.I)
+        if not resume and ((previous and previous != scope) or (previous is None and previous_result is not None and previous_result < user_index)):
+            old = []
     known_ids = {t.get("id") for t in old if t.get("id")}
     normalized: list[dict] = []
     for raw in incoming:
@@ -1243,6 +1282,14 @@ def _todo_write(args: dict, chat: dict | None) -> str:
     else:
         new_todos = normalized
         restored_ids = carry_forward_completions(old, new_todos)
+    if scope is not None:
+        for item in new_todos:
+            prior = next((task for task in old if task.get("id") == item.get("id") and _todo_match_key(task) == _todo_match_key(item)), None)
+            if prior and prior.get("status") in {"completed", "cancelled"} and item.get("status") in {"pending", "in_progress"}:
+                item["status"] = prior["status"]
+                if item["id"] not in restored_ids:
+                    restored_ids.append(item["id"])
+        chat["agent_plan_scope"] = scope
 
     old_by_id = {t.get("id"): t for t in old if t.get("id")}
     partial_note: dict | None = None
@@ -1261,10 +1308,7 @@ def _todo_write(args: dict, chat: dict | None) -> str:
             )
             attempted = [t.get("id") for t in newly_finished]
             if active_id in attempted:
-                # Apply the active milestone and defer the rest instead of
-                # rejecting the call. A rejection advances nothing, so a model
-                # closing out its plan could never reach open=0. Partial
-                # acceptance moves the plan forward by exactly one milestone.
+                # Complete the active milestone and leave the others for later calls.
                 deferred = [tid for tid in attempted if tid != active_id]
                 deferred_set = set(deferred)
                 for t in new_todos:
@@ -1292,7 +1336,7 @@ def _todo_write(args: dict, chat: dict | None) -> str:
                     },
                     "hint": (
                         f"None of these is the active milestone ({active_id!r}). Complete that "
-                        "one first; Aether promotes the next pending item automatically."
+                        "one first; Olith promotes the next pending item automatically."
                     ),
                 })
         old_active = next(
@@ -1359,7 +1403,7 @@ def _todo_write(args: dict, chat: dict | None) -> str:
         instructions = "All todos completed (open=0). Give the final answer now. Do not restart the plan."
     if restored_ids:
         instructions = (
-            f"This merge=false rewrite dropped {len(restored_ids)} milestone(s) you had already "
+            f"This plan update reopened {len(restored_ids)} milestone(s) you had already "
             f"finished ({', '.join(str(i) for i in restored_ids)}); their completed status was "
             "restored. That work is done, do not redo it. Resume from the item now in_progress. "
             "Use merge=true to change statuses; merge=false is only for a genuinely new plan. "
@@ -1409,12 +1453,7 @@ def _list_dir(args: dict, project_root: Path | None) -> str:
 
 
 def _read_symbol(args: dict, path: Path, text: str) -> str | None:
-    """The outline or one definition, or None to fall through to a line read.
-
-    Falling through rather than erroring is deliberate: an unsupported
-    language or a file that does not parse should still be readable, and a
-    model that asked for a symbol has already told us which file it wants.
-    """
+    """Return an outline or definition. Return None for a normal line read if parsing is unavailable."""
     wants_outline = bool(args.get("outline"))
     wanted = str(args.get("symbol") or "").strip()
     if not wants_outline and not wanted:
@@ -1509,6 +1548,12 @@ def _read_file(args: dict, project_root: Path | None) -> str:
             "hint": "Binary file, contents not shown as text. Use run_shell (e.g. file, strings) if needed.",
         })
     text = raw.decode("utf-8", errors="replace")
+    if args.get("language_action"):
+        if not project_root or not load_settings().get("language_servers", True):
+            return json.dumps({"available": False, "reason": "Language navigation needs an active project and enabled language servers."})
+        path.relative_to(project_root.resolve())
+        return json.dumps(language_servers.inspect_file(project_root, path, args["language_action"],
+                                                       int(args.get("start_line") or 1), int(args.get("character") or 0), str(args.get("new_name") or "")))
     symbol_result = _read_symbol(args, path, text)
     if symbol_result is not None:
         return symbol_result
@@ -1560,77 +1605,10 @@ def _read_file(args: dict, project_root: Path | None) -> str:
     return json.dumps(result)
 
 
-# A write_file that replaces a substantial file with less content is almost
-# always a regeneration that drops whatever the model did not reproduce. One
-# such call destroyed ~10,000 characters of working code.
-OVERWRITE_MIN_EXISTING_CHARS = 4000
-OVERWRITE_SHRINK_RATIO = 0.9
-
-
-def _overwrite_guard(path: Path, content: str, overwrite: bool) -> dict | None:
-    """write_file creates files. Changing one that exists is edit_file's job.
-
-    A file is written once, when it is created, and edited from then on. Letting
-    write_file replace an existing file means every call is a chance to silently
-    drop whatever the model did not retype, which is how a 687-line
-    game became 16k chars of unrelated code.
-    """
-    try:
-        if not path.is_file():
-            return None
-        existing = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    if not existing.strip():
-        return None
-    lines = existing.count("\n") + 1
-    if not overwrite:
-        return {
-            "error": "File already exists, use edit_file not write_file",
-            "path": str(path),
-            "changed": False,
-            "existing_chars": len(existing),
-            "existing_lines": lines,
-            "hint": (
-                f"{path.name} already has {lines} lines. write_file is for creating a file; "
-                "changing one is edit_file with find/replace anchors, or append_file to add "
-                "to the end. Rewriting the whole file loses everything you do not retype. "
-                "Only if the user explicitly asked you to replace this file from scratch, "
-                "call write_file again with overwrite=true."
-            ),
-        }
-    # Even an explicit rewrite does not get to quietly delete most of the file.
-    if (
-        len(existing) >= OVERWRITE_MIN_EXISTING_CHARS
-        and len(content) < len(existing) * OVERWRITE_SHRINK_RATIO
-    ):
-        return {
-            "error": "Refusing to shrink an existing file, even with overwrite",
-            "path": str(path),
-            "changed": False,
-            "existing_chars": len(existing),
-            "existing_lines": lines,
-            "submitted_chars": len(content),
-            "hint": (
-                f"This would drop about {len(existing) - len(content)} characters. If the user "
-                "really asked for a smaller replacement, confirm it with ask_user first, "
-                "quoting the current size. Otherwise use edit_file."
-            ),
-        }
-    return None
-
-
 def offload_tool_output(name: str, content: str, chat_id: str, seq: int) -> str | None:
-    """Write an oversized tool result to disk, returning a pointer payload.
+    """Save a large result to disk and return its head, tail and path.
 
-    The reference behaviour from Claude Code and Cursor: keep the head and tail
-    in context, put the whole thing on the filesystem, and let the agent read the
-    range it actually wants. Truncation is lossy in the worst place, since the
-    tail is usually what the model needs next, and a one-line receipt was lossy
-    everywhere.
-
-    Returns None when the result is small enough to send verbatim, so the common
-    case costs one len() check.
+    Return None if it fits in the prompt as it is.
     """
     if len(content or "") <= OFFLOAD_CHARS:
         return None
@@ -1648,8 +1626,7 @@ def offload_tool_output(name: str, content: str, chat_id: str, seq: int) -> str 
                 old.unlink(missing_ok=True)
             return str(path)
         except OSError:
-            # Offloading must never be the reason a tool call fails; the caller
-            # falls back to sending (and truncating) the result as usual.
+            # If saving output fails, return it normally and let rendering truncate it.
             return None
 
     def _pointer(path: str, body: str) -> dict:
@@ -1706,13 +1683,7 @@ def offload_tool_output(name: str, content: str, chat_id: str, seq: int) -> str 
 
 
 def _snapshot_before_write(path: Path) -> None:
-    """Keep the previous contents of a file before a tool overwrites it.
-
-    Guards catch the destructive shapes we know about. A backup catches the ones
-    we do not: recovering the game destroyed by one bad write meant stitching it
-    out of chat transcripts, which only worked because the reads happened to
-    cover every line.
-    """
+    """Back up the current file before a tool replaces it."""
     try:
         if not path.is_file() or path.stat().st_size == 0:
             return
@@ -1735,6 +1706,17 @@ def _snapshot_before_write(path: Path) -> None:
         return
 
 
+def _save_source(path: Path, content: str, candidate: Path | None = None) -> None:
+    import editor_bridge
+    if editor_bridge.replace(path, content):
+        if candidate:
+            candidate.unlink(missing_ok=True)
+    elif candidate:
+        os.replace(candidate, path)
+    else:
+        path.write_text(content, encoding="utf-8")
+
+
 def _write_file(args: dict, project_root: Path | None) -> str:
     path = resolve_path(args["path"], project_root)
     content = args.get("content") or ""
@@ -1745,15 +1727,26 @@ def _write_file(args: dict, project_root: Path | None) -> str:
             "changed": False,
             "hint": "Use read_file to inspect the current file, then send only real source text.",
         })
-    blocked = _overwrite_guard(path, content, bool(args.get("overwrite")))
-    if blocked:
-        return json.dumps(blocked)
+    previous = None
+    if path.is_file():
+        try:
+            previous = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            previous = None
+    # A rewrite has to carry the whole file, so the chunk cap only applies to new files.
+    if len(content) > MAX_WRITE_CHARS and not path.is_file():
+        return json.dumps({"error": "File content exceeds the per-call limit", "changed": False,
+                           "path": str(path),
+                           "maximum_chars": MAX_WRITE_CHARS, "requested": len(content),
+                           "hint": "Create a compact valid foundation, then add coherent chunks with append_file."})
     path.parent.mkdir(parents=True, exist_ok=True)
     result: dict[str, Any] = {
         "ok": True,
         "path": str(path),
         "bytes": len(content.encode("utf-8")),
     }
+    if previous is not None:
+        result["replaced"] = {"lines_before": previous.count("\n") + 1, "lines_after": content.count("\n") + 1}
     validated_suffixes = {".py", ".js", ".mjs", ".cjs", ".json", ".html", ".htm"}
     if path.suffix.lower() in validated_suffixes:
         candidate: Path | None = None
@@ -1762,7 +1755,7 @@ def _write_file(args: dict, project_root: Path | None) -> str:
                 "w",
                 encoding="utf-8",
                 dir=str(path.parent),
-                prefix=f".{path.stem}.aether-write-",
+                prefix=f".{path.stem}.olith-write-",
                 suffix=path.suffix,
                 delete=False,
             ) as handle:
@@ -1785,14 +1778,14 @@ def _write_file(args: dict, project_root: Path | None) -> str:
             if path.exists():
                 candidate.chmod(path.stat().st_mode)
             _snapshot_before_write(path)
-            os.replace(candidate, path)
+            _save_source(path, content, candidate)
             candidate = None
         finally:
             if candidate:
                 candidate.unlink(missing_ok=True)
     else:
         _snapshot_before_write(path)
-        path.write_text(content, encoding="utf-8")
+        _save_source(path, content)
     result["changed"] = True
     return json.dumps(result)
 
@@ -1803,6 +1796,10 @@ def _append_file(args: dict, project_root: Path | None) -> str:
         return err
     assert path is not None
     chunk = str(args.get("content") or "")
+    if len(chunk) > MAX_WRITE_CHARS:
+        return json.dumps({"error": "Chunk exceeds the per-call limit", "changed": False,
+                           "maximum_chars": MAX_WRITE_CHARS, "requested": len(chunk),
+                           "hint": "Append a smaller coherent chunk instead of regenerating the entire file."})
     if REPLAY_ELISION_PREFIX in chunk:
         return json.dumps({
             "error": "Refusing to write an internal replay-elision marker",
@@ -1845,7 +1842,8 @@ def _append_file(args: dict, project_root: Path | None) -> str:
             "path": str(path),
             "changed": False,
         })
-    path.write_text(updated, encoding="utf-8")
+    _snapshot_before_write(path)
+    _save_source(path, updated)
     return json.dumps({
         "ok": True,
         "path": str(path),
@@ -1863,6 +1861,9 @@ def _commit_edit(
     path: Path, updated_source: str, result: dict, project_root: Path | None
 ) -> str:
     """Validate a candidate file and swap it in, or keep the original untouched."""
+    if not updated_source.strip() and path.read_text(encoding="utf-8", errors="replace").strip():
+        return json.dumps({"error": "Refusing to blank an existing file", "changed": False,
+                           "hint": "Keep the source and apply a targeted edit."})
     validated_suffixes = {".py", ".js", ".mjs", ".cjs", ".json", ".html", ".htm"}
     if path.suffix.lower() in validated_suffixes:
         candidate: Path | None = None
@@ -1871,7 +1872,7 @@ def _commit_edit(
                 "w",
                 encoding="utf-8",
                 dir=str(path.parent),
-                prefix=f".{path.stem}.aether-",
+                prefix=f".{path.stem}.olith-",
                 suffix=path.suffix,
                 delete=False,
             ) as handle:
@@ -1893,14 +1894,14 @@ def _commit_edit(
                 return json.dumps(result)
             candidate.chmod(path.stat().st_mode)
             _snapshot_before_write(path)
-            os.replace(candidate, path)
+            _save_source(path, updated_source, candidate)
             candidate = None
         finally:
             if candidate:
                 candidate.unlink(missing_ok=True)
     else:
         _snapshot_before_write(path)
-        path.write_text(updated_source, encoding="utf-8")
+        _save_source(path, updated_source)
     result["changed"] = True
     return json.dumps(result)
 
@@ -1913,9 +1914,7 @@ def _edit_file_anchored(
     applied = []
     for index, spec in enumerate(specs):
         find = str(spec.get("find") or "")
-        # `replace` absent is not the same as `replace: ""`. Coercing a missing
-        # key to empty turns the call into a silent deletion that still reports
-        # ok, and later anchors then fail because their code is gone.
+        # Require the replace key. A missing key must not silently delete text.
         if spec.get("replace") is not None:
             replace = str(spec["replace"])
         elif spec.get("content") is not None:
@@ -1943,9 +1942,7 @@ def _edit_file_anchored(
             })
         count = updated_source.count(find)
         if count == 0:
-            # Refusing without showing what is there costs a reread per attempt,
-            # which is what the redundant-read guard blocks. Hand back the
-            # closest real lines so the anchor can be fixed in one step.
+            # Return the closest matching lines so the model can fix its anchor.
             probe = next((ln for ln in find.splitlines() if ln.strip()), "")
             nearest = []
             if probe:
@@ -1998,9 +1995,7 @@ def _edit_file_anchored(
             "inserted_lines": len(replace.splitlines()),
         })
     if updated_source == source:
-        # Every anchor matched and the file is byte-identical, so nothing
-        # happened. Reporting ok here resets the stall counters and lets a
-        # milestone complete with no real change behind it.
+        # Report no change when the matched edit leaves the file unchanged.
         return json.dumps({
             "error": "Edit changed nothing",
             "path": str(path),
@@ -2058,9 +2053,7 @@ def _edit_file(args: dict, project_root: Path | None) -> str:
                 "validating each batch before continuing."
             ),
         })
-    # Anchored edits. Line numbers go stale the moment an earlier edit lands, so
-    # a model has to reread between every change. Matching on surrounding text
-    # survives its own edits.
+    # Match edits by surrounding text so earlier changes do not invalidate line numbers.
     anchored = [sp for sp in specs if isinstance(sp, dict) and sp.get("find")]
     if anchored:
         if len(anchored) != len(specs):
@@ -2154,13 +2147,14 @@ def _edit_file(args: dict, project_root: Path | None) -> str:
 
 def _search_files_grep(grep_bin: str, base: Path, pattern: str, glob: str) -> str | None:
     """grep-backed search. Returns None if grep could not run, so caller can fall back."""
-    cmd = [grep_bin, "-r", "-I", "-n", "-i"]
+    # -H keeps the filename when base is a single file, so the parser below still works.
+    cmd = [grep_bin, "-r", "-I", "-n", "-i", "-H"]
+    anchor = base.parent if base.is_file() else base
     # Prefer PCRE so Python-style patterns (\d, \b, lookarounds) behave the same.
     probe = subprocess.run([grep_bin, "-P", "x", "-q"], input="x", text=True, capture_output=True)
     cmd.append("-P" if probe.returncode in (0, 1) else "-E")
-    # --exclude-dir behaves the same across GNU grep, BSD grep and ugrep, so it
-    # is the only filter we delegate. --include/--exclude precedence differs
-    # between them, so suffix and glob filtering happen in Python below.
+    # Use grep only for directory exclusions. Apply suffix and glob filters in
+    # Python because grep versions handle their precedence differently.
     for d in sorted(IGNORE_DIRS):
         cmd.append(f"--exclude-dir={d}")
     cmd.append("--exclude-dir=models--*")
@@ -2189,7 +2183,7 @@ def _search_files_grep(grep_bin: str, base: Path, pattern: str, glob: str) -> st
             skipped += 1
             continue
         try:
-            rel = str(fp.relative_to(base)).replace("\\", "/")
+            rel = str(fp.relative_to(anchor)).replace("\\", "/")
         except ValueError:
             rel = fpath
         if inc and not (fnmatch(rel, glob) or fnmatch(rel, inc) or fnmatch(fp.name, inc)):
@@ -2214,16 +2208,48 @@ def _search_files_grep(grep_bin: str, base: Path, pattern: str, glob: str) -> st
 
 def _search_files(args: dict, project_root: Path | None) -> str:
     base = resolve_path(args.get("path") or ".", project_root)
+    mode = args.get("mode") or "regex"
+    if mode != "regex":
+        if not project_root:
+            return json.dumps({"error": "Indexed search needs an active project."})
+        root = resolve_path(str(project_root), project_root)
+        try:
+            subpath = base.relative_to(root).as_posix()
+        except ValueError:
+            return json.dumps({"error": "Indexed search stays inside the active project."})
+        index = repo_index.ProjectIndex(root)
+        query = str(args.get("pattern") or "")
+        if mode == "map":
+            return json.dumps({"map": index.repo_map(query), "hint": "Read current source before editing."})
+        settings = load_settings()
+        if mode == "references" and settings.get("language_servers", True):
+            definitions = index.search(query, "symbols", 20, subpath=subpath, glob=args.get("glob") or "")["hits"]
+            if len(definitions) == 1:
+                entry = definitions[0]
+                target = root / entry["file"]
+                source = target.read_text(encoding="utf-8").splitlines()
+                wanted = entry["name"].split(".")[-1]
+                for line in range(entry["line"] - 1, min(entry["end_line"], entry["line"] + 12)):
+                    match = re.search(r"\b" + re.escape(wanted) + r"\b", source[line])
+                    if match:
+                        try:
+                            position = len(source[line][:match.start()].encode("utf-16-le")) // 2
+                            result = language_servers.inspect_file(root, target, "references", line + 1, position)
+                            if result.get("available"):
+                                return json.dumps(result)
+                        except Exception:
+                            pass
+                        break
+        embedder = repo_index.OllamaEmbedder(settings) if settings.get("semantic_search") and mode == "hybrid" else None
+        return json.dumps(index.search(query, mode, args.get("limit", 8), subpath=subpath,
+                                       glob=args.get("glob") or "", embedder=embedder))
     pattern = args["pattern"]
     glob = args.get("glob") or "**/*"
     rx = re.compile(pattern, re.IGNORECASE)
     hits = []
     skipped_vendor = 0
-    # os.walk with in-place dirnames pruning, not Path.glob: glob descends into
-    # node_modules and HF caches before letting us filter, ~38s on a real ML
-    # repo. Pruning never enters those trees.
-    # Fast path is grep, which does the same work in under a second and skips
-    # binaries with -I. Falls back to the Python walk when grep is missing.
+    # Prune ignored folders before entering them. Use grep when available,
+    # with a Python walk as the fallback.
     grep_bin = shutil_which("grep")
     if grep_bin:
         got = _search_files_grep(grep_bin, base, pattern, glob)
@@ -2237,7 +2263,9 @@ def _search_files(args: dict, project_root: Path | None) -> str:
         pat = glob[3:] if glob.startswith("**/") else glob
         matcher = lambda rel: _fnmatch(rel, glob) or _fnmatch(Path(rel).name, pat)
 
-    for dirpath, dirnames, filenames in os.walk(base):
+    anchor = base.parent if base.is_file() else base
+    walk = [(str(anchor), [], [base.name])] if base.is_file() else os.walk(base)
+    for dirpath, dirnames, filenames in walk:
         here = Path(dirpath)
         # Prune before descending.
         keep = []
@@ -2260,7 +2288,7 @@ def _search_files(args: dict, project_root: Path | None) -> str:
                 skipped_vendor += 1
                 continue
             try:
-                rel = str(p.relative_to(base)).replace("\\", "/")
+                rel = str(p.relative_to(anchor)).replace("\\", "/")
             except ValueError:
                 continue
             if matcher and not matcher(rel):
@@ -2286,8 +2314,7 @@ def _search_files(args: dict, project_root: Path | None) -> str:
     return json.dumps(out, indent=2)
 
 
-# The only operations safe_auto stops. Everything else runs unattended, because
-# the point of the mode is an agent that finishes a job.
+# Commands that need review in safe_auto. Other commands can run automatically.
 _DESTRUCTIVE_BINS = frozenset({
     # irreversible data loss
     "rm", "rmdir", "shred", "truncate",
@@ -2328,11 +2355,7 @@ _SYSTEM_PREFIXES = (
 
 
 def _is_destructive(binary: str) -> bool:
-    """Whether a program name is on the review list, including variants.
-
-    Filesystem tools ship as mkfs.ext4, mkfs.vfat and friends, so an exact
-    match on "mkfs" alone let a disk format through.
-    """
+    """Match programs on the review list, including variants such as mkfs.ext4."""
     name = (binary or "").lower()
     return name in _DESTRUCTIVE_BINS or name.split(".", 1)[0] in {"mkfs", "fsck"}
 
@@ -2350,13 +2373,9 @@ _SHELL_SEPARATORS = frozenset({"|", "||", "&&", "&", ";", ";;", "\n", "(", ")"})
 
 
 def _shell_segments(cmd: str) -> list[list[str]] | None:
-    """Split a command line into argv segments, honouring quotes.
+    """Split shell commands into argument lists while preserving quoted separators.
 
-    Splitting on the metacharacters with a regex before parsing quotes tore
-    patterns such as ``grep "a\\|b"`` in half; the halves then failed to lex and
-    an ordinary search was reported as "unbalanced quotes". Lexing first keeps
-    quoted metacharacters inside their argument. Returns None if the command
-    genuinely does not parse.
+    Return None if the command cannot be parsed.
     """
     lexer = shlex.shlex(cmd, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
@@ -2371,8 +2390,7 @@ def _shell_segments(cmd: str) -> list[list[str]] | None:
         if skip_next:
             skip_next = False
             continue
-        # Redirections are checked as raw text, not commands. Drop the operator
-        # and its target so `pytest 2>&1 | tail` leaves no bare "1".
+        # Remove redirection operators and targets before checking program names.
         if tok and ("<" in tok or ">" in tok) and all(ch in "<>&" for ch in tok):
             skip_next = True
             continue
@@ -2412,74 +2430,86 @@ def shell_is_inspection(cmd: str) -> bool:
     return saw_segment
 
 
-def shell_primary_binary(cmd: str) -> str:
-    """The program name of the first segment, for 'always allow this program'."""
-    segments = _shell_segments(cmd or "")
-    if not segments:
-        return ""
-    words = segments[0]
-    while words and re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", words[0]):
-        words = words[1:]
-    return Path(words[0]).name if words else ""
-
-
-def classify_shell(cmd: str) -> tuple[str, str]:
-    """Return ("safe"|"review", reason) for a shell command.
-
-    "safe" means it runs without interrupting the user when shell_approval_mode
-    is "safe_auto". The policy is a denylist, not an allowlist: an agent that
-    asks before every unrecognised command is not autonomous, and the earlier
-    allowlist stopped ordinary work (cp, arbitrary python, docker) far more
-    often than it stopped anything dangerous. Review is reserved for what a
-    user would actually want to catch: destroying data, escalating privilege,
-    changing the machine, or running code fetched from the network.
-    """
-    text = (cmd or "").strip()
-    if not text:
-        return "review", "empty command"
+def _line_review(text: str) -> str | None:
+    """Risk in the command line as a whole, which no single program can vouch for."""
     low = text.lower()
     for bad in _REVIEW_PATTERNS:
         if bad in low:
-            return "review", f"writes to a system path ({bad.strip()!r})"
+            return f"writes to a system path ({bad.strip()!r})"
     if _PIPE_TO_SHELL.search(text):
-        return "review", "pipes downloaded content into a shell"
-    segments = _shell_segments(text)
-    if segments is None:
-        return "review", "unbalanced quotes"
-    # Command substitution can hide a destructive call from the scan below, so
-    # only inspect it when it is present rather than refusing outright.
+        return "pipes downloaded content into a shell"
+    if _shell_segments(text) is None:
+        return "unbalanced quotes"
+    # Inspect command substitutions for commands that need review.
     for inner in re.findall(r"\$\(([^()]*)\)|`([^`]*)`", text):
         nested = (inner[0] or inner[1] or "").strip()
         if nested:
             verdict, why = classify_shell(nested)
             if verdict == "review":
-                return "review", f"command substitution runs something risky: {why}"
-    for words in segments:
-        while words and re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", words[0]):
-            words = words[1:]
-        if not words:
-            continue
-        binary = Path(words[0]).name
-        rest = words[1:]
-        if _is_destructive(binary):
-            return "review", f"{binary!r} can destroy data or change the system"
-        # A runner's arguments are program names too (find -exec rm, xargs shred).
-        if binary in _COMMAND_RUNNERS and any(
-            _is_destructive(Path(word).name) for word in rest
-        ):
-            risky = next(word for word in rest if _is_destructive(Path(word).name))
-            return "review", f"runs {risky!r} through {binary!r}"
-        if binary in _WRITES_FILES and _writes_system_path(rest):
-            return "review", f"{binary} writes to a system path"
-        if binary == "git":
-            sub = rest[0] if rest else ""
-            if sub in _GIT_REVIEW:
-                return "review", f"git {sub} publishes or discards work"
-            if sub == "reset" and any(a == "--hard" for a in rest):
-                return "review", "git reset --hard discards uncommitted work"
-            if sub == "clean" and any(a.startswith("-") and "f" in a for a in rest):
-                return "review", "git clean -f deletes untracked files"
+                return f"command substitution runs something risky: {why}"
+    return None
+
+
+def _segment_review(words: list[str]) -> tuple[str, str] | None:
+    """The (program, reason) when one segment of a command needs review."""
+    while words and re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", words[0]):
+        words = words[1:]
+    if not words:
+        return None
+    binary = Path(words[0]).name
+    rest = words[1:]
+    if _is_destructive(binary):
+        return binary, f"{binary!r} can destroy data or change the system"
+    # A runner's arguments are program names too (find -exec rm, xargs shred).
+    if binary in _COMMAND_RUNNERS and any(
+        _is_destructive(Path(word).name) for word in rest
+    ):
+        risky = next(word for word in rest if _is_destructive(Path(word).name))
+        return binary, f"runs {risky!r} through {binary!r}"
+    if binary in _WRITES_FILES and _writes_system_path(rest):
+        return binary, f"{binary} writes to a system path"
+    if binary == "git":
+        sub = rest[0] if rest else ""
+        if sub in _GIT_REVIEW:
+            return binary, f"git {sub} publishes or discards work"
+        if sub == "reset" and any(a == "--hard" for a in rest):
+            return binary, "git reset --hard discards uncommitted work"
+        if sub == "clean" and any(a.startswith("-") and "f" in a for a in rest):
+            return binary, "git clean -f deletes untracked files"
+    return None
+
+
+def shell_review_binaries(cmd: str) -> list[str]:
+    """Return the programs that need approval. Return none when the command text itself needs review."""
+    text = (cmd or "").strip()
+    if not text or _line_review(text):
+        return []
+    hits = (_segment_review(words) for words in _shell_segments(text))
+    return list(dict.fromkeys(hit[0] for hit in hits if hit))
+
+
+def classify_shell(cmd: str) -> tuple[str, str]:
+    """Return a shell command's classification and reason.
+
+    In safe_auto mode, review destructive commands, privilege changes, system
+    changes and downloaded code. Other commands can run without a prompt.
+    """
+    text = (cmd or "").strip()
+    if not text:
+        return "review", "empty command"
+    why = _line_review(text)
+    if why:
+        return "review", why
+    for words in _shell_segments(text):
+        hit = _segment_review(words)
+        if hit:
+            return "review", hit[1]
     return "safe", "no destructive or privileged operation"
+
+
+_GIT_LOGIN_FAILURE = re.compile(
+    r"(?:could not read (?:Username|Password) for|Authentication failed for) 'https://github\.com"
+)
 
 
 def _run_shell(args: dict, project_root: Path | None) -> str:
@@ -2499,15 +2529,14 @@ def _run_shell(args: dict, project_root: Path | None) -> str:
             else ["cmd.exe", "/d", "/s", "/c", cmd]
         )
     else:
-        # pip installs and python3 test runs must resolve to the same
-        # interpreter. Ubuntu's /usr/bin/python3 ships without pip, so a conda
-        # prefix that has both leads the PATH.
+        # Use the same Python for pip and tests. Prefer a conda install with pip
+        # when system Python lacks it.
         env["PATH"] = _toolchain_path(env.get("PATH", ""))
         # Lets `npm i -g` succeed without sudo instead of failing on /usr/lib.
         env.setdefault("npm_config_prefix", str(Path.home() / ".npm-global"))
         if re.search(r"(^|[;&|]\s*)python(\s|$)", cmd) and not shutil_which("python", env["PATH"]):
             cmd = re.sub(r"(^|[;&|]\s*)python(\s|$)", r"\1python3\2", cmd)
-        command = ["/bin/bash", "-lc", cmd]
+        command = ["/bin/bash", "-lc", "set -o pipefail\n" + cmd]
     try:
         proc = subprocess.run(
             command,
@@ -2518,12 +2547,14 @@ def _run_shell(args: dict, project_root: Path | None) -> str:
             timeout=timeout,
             env=env,
         )
-        # Keep it whole up to a sanity cap and let the harness offload it.
-        # Slicing the tail drops the head of stdout, where a build log's first
-        # error is, and that loss is permanent: the command already ran.
+        # Keep the output up to the cap, then let the loop save it to disk.
+        # Build errors near the start must stay available.
         out = (proc.stdout or "")[-SHELL_OUTPUT_HARD_CAP:]
         err = (proc.stderr or "")[-SHELL_OUTPUT_HARD_CAP:]
-        return json.dumps({"exit_code": proc.returncode, "stdout": out, "stderr": err, "cwd": str(cwd)})
+        result = {"exit_code": proc.returncode, "stdout": out, "stderr": err, "cwd": str(cwd)}
+        if proc.returncode and _GIT_LOGIN_FAILURE.search(out + err):
+            result["hint"] = "Shell git has no GitHub login. Use git_status with action push, which signs in with the connected account."
+        return json.dumps(result)
     except subprocess.TimeoutExpired:
         return json.dumps({"error": f"Timed out after {timeout}s"})
 
@@ -2539,8 +2570,7 @@ def _map_inline_line(line_no: int, line_map: list[tuple[int, int]]) -> int:
     return html_line
 
 
-# Node prints its own internals after the syntax error. They are never
-# actionable and they crowd out the one line that is.
+# Drop Node's internal stack after the useful syntax error.
 _NODE_NOISE = re.compile(
     r"^[ \t]*(?:at\s+.*|Node\.js\s+v[\d.]+.*)$", re.MULTILINE
 )
@@ -2549,12 +2579,7 @@ _NODE_NOISE = re.compile(
 def _clean_node_error(
     raw: str, target: Path, real: Path, line_map: list[tuple[int, int]]
 ) -> str:
-    """Rewrite a `node --check` failure to point at the file the model can edit.
-
-    Left alone, the message names a temp file and a line number from the
-    concatenated inline scripts, so a model correcting "line 412" edits an
-    unrelated part of the HTML and fails again.
-    """
+    """Map node --check errors in combined inline scripts back to the HTML file's lines."""
     text = raw
     if line_map:
         pattern = re.escape(str(target)) + r":(\d+)"
@@ -2616,9 +2641,7 @@ def _validate_file(args: dict, project_root: Path | None) -> str:
         opened = len(re.findall(r"<script(?:\s[^>]*)?>", source, re.IGNORECASE))
         closed = len(re.findall(r"</script\s*>", source, re.IGNORECASE))
         if opened > closed:
-            # Failing open is how a shredded file passes its own gate: with
-            # </script> destroyed the regex matches nothing, the scan reports no
-            # inline scripts, and every later edit skips the JS check.
+            # Reject broken script tags so damaged HTML cannot skip the JavaScript check.
             return json.dumps({
                 "ok": False,
                 "path": str(path),
@@ -2631,8 +2654,7 @@ def _validate_file(args: dict, project_root: Path | None) -> str:
             })
         if not blocks:
             return json.dumps({"ok": True, "path": str(path), "validator": "HTML scan", "note": "No inline scripts"})
-        # Concatenating blocks renumbers every line, so record where each one
-        # lands and translate the error back afterwards.
+        # Track each inline script's offset to map errors back to the HTML file.
         parts: list[str] = []
         cursor = 1
         for index, (body, html_start) in enumerate(blocks):
@@ -2662,7 +2684,7 @@ def _validate_file(args: dict, project_root: Path | None) -> str:
                 "w",
                 encoding="utf-8",
                 dir=str(path.parent),
-                prefix=f".{path.stem}.aether-inline-",
+                prefix=f".{path.stem}.olith-inline-",
                 suffix=".js",
                 delete=False,
             ) as handle:
@@ -2679,9 +2701,7 @@ def _validate_file(args: dict, project_root: Path | None) -> str:
                 "error": _clean_node_error(raw, target, path, line_map)[-2000:] or None,
             })
 
-        # Node --check accepts undefined identifiers that break at runtime, so
-        # use ESLint's no-undef as a second gate when it is available. Ignore
-        # unrelated ESLint failures so newer syntax still passes on Node.
+        # Use ESLint's no-undef check when available. Ignore unrelated ESLint errors.
         eslint = shutil_which("eslint")
         if eslint:
             lint_proc = subprocess.run(
@@ -2738,10 +2758,9 @@ def _conda_bin() -> str | None:
 
 
 def _toolchain_path(base: str = "") -> str:
-    """PATH the agent's shell and toolchain probe both use.
+    """Build the PATH used by shell commands and toolchain checks.
 
-    A GUI-launched Aether inherits a bare session PATH, so per-user toolchains
-    (npm -g, rustup, go, deno, bun) have to be added back explicitly.
+    Desktop launches may need common user toolchain folders added explicitly.
     """
     extra = [p for p in (_conda_bin(), "/usr/bin", "/usr/local/bin") if p]
     extra += [
@@ -2755,7 +2774,7 @@ def _toolchain_path(base: str = "") -> str:
 TOOLCHAINS = (
     ("Python", ("python3", "pip"), "Already present. pip comes from the same interpreter as python3."),
     ("Node / JavaScript", ("node", "npm", "npx"), "sudo apt install nodejs npm. Ask the user to run it."),
-    ("TypeScript", ("tsc", "tsx"), "npm i -g typescript tsx. No sudo needed, Aether points npm at ~/.npm-global. Or run one-off with npx tsx file.ts."),
+    ("TypeScript", ("tsc", "tsx"), "npm i -g typescript tsx. No sudo needed, Olith points npm at ~/.npm-global. Or run one-off with npx tsx file.ts."),
     ("C / C++", ("gcc", "g++", "make", "cmake"), "sudo apt install build-essential cmake. Ask the user to run it."),
     ("Java", ("java", "javac"), "sudo apt install default-jdk. Ask the user to run it."),
     ("Rust", ("cargo", "rustc"), "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh. Installs to ~/.cargo/bin, no sudo."),
@@ -2797,7 +2816,7 @@ def _check_toolchains() -> str:
         "ready": ready,
         "missing": missing,
         "note": (
-            "Aether cannot run sudo. For anything marked 'ask the user', use ask_user to "
+            "Olith cannot run sudo. For anything marked 'ask the user', use ask_user to "
             "request it rather than attempting the install. npm -g, pip and rustup work "
             "without sudo and may be used directly."
         ),
@@ -2813,10 +2832,21 @@ def _git_status(project_root: Path | None) -> str:
             return (p.stdout or p.stderr or "").strip()
         except Exception as e:
             return str(e)
-    return json.dumps({
-        "status": run(["git", "status", "-sb"]),
-        "log": run(["git", "log", "-5", "--oneline"]),
-    }, indent=2)
+    report = {}
+    pathspec = []
+    top = run(["git", "rev-parse", "--show-toplevel"])
+    if top.startswith("/") and Path(top).resolve() != Path(project_root).resolve():
+        # Otherwise a stray parent repo lists its whole tree as untracked here.
+        pathspec = ["--", "."]
+        report["warning"] = (
+            f"This project is a subfolder of the repository at {top}, not its own repository. "
+            f"Commits here go into {top} and GitHub actions will refuse. "
+            "To give it its own repository, run git init -b main in the project."
+        )
+    report["status"] = run(["git", "status", "-sb", *pathspec])
+    report["log"] = run(["git", "log", "-5", "--oneline"])
+    report["remotes"] = run(["git", "remote", "-v"])
+    return json.dumps(report, indent=2)
 
 
 def _remember(args: dict, project_id: str | None) -> str:
@@ -2830,10 +2860,7 @@ def _remember(args: dict, project_id: str | None) -> str:
     return json.dumps({"ok": True, "scope": scope})
 
 
-# Parse tool calls: Ollama native tool_calls, plus the shapes models emit when
-# they answer in prose instead. Measured on llama3.2:3b with the real schemas,
-# 2 of 16 replies put the call in content, both on the deeply nested schemas
-# (todo_write, ask_user). Without this the loop reads them as a final answer.
+# Parse native tool calls and calls written into the reply body.
 TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*\{(.*?)\}\s*</tool_call>",
     re.DOTALL | re.IGNORECASE,
@@ -2882,11 +2909,9 @@ def _calls_from_payload(payload: object) -> list[dict]:
 
 
 def _trailing_json(text: str) -> str | None:
-    """A JSON object or array that runs to the end of the reply.
+    """Read a JSON object or array that reaches the end of the reply.
 
-    Models often write a sentence and then the call ("Here is the plan:\n{...}").
-    Requiring it to reach the end is what keeps a call quoted mid-sentence, which
-    is followed by more prose, from being executed.
+    Ignore calls quoted inside prose that continues after the JSON.
     """
     text = (text or "").rstrip()
     if not text or text[-1] not in "}]":
@@ -2898,11 +2923,7 @@ def _trailing_json(text: str) -> str | None:
 
 
 def parse_content_tool_calls(content: str) -> list[dict]:
-    """Tool calls a model wrote into its reply instead of the tool_calls field.
-
-    An explicit marker is trusted anywhere. Bare JSON is only trusted when it
-    is the entire reply, so prose that merely quotes a call is never executed.
-    """
+    """Read tool calls from reply text. Accept explicit markers or trailing JSON."""
     text = (content or "").strip()
     if not text:
         return []
@@ -2982,22 +3003,14 @@ def extract_tool_calls(message: dict) -> list[dict]:
                 })
         except Exception:
             pass
-    # Only when the model produced nothing usable natively, so a model that does
-    # both does not run the same call twice.
+    # Use recovered calls only when no native calls were usable, avoiding duplicate execution.
     if not calls:
         calls.extend(parse_content_tool_calls(content))
     return calls
 
 
 def looks_like_broken_tool_call(content: str) -> str | None:
-    """The name of a tool this reply tried to call but wrote unparseably.
-
-    Observed on llama3.2:3b: it emitted todo_write into the message body with
-    `[` where `{` belonged, so the JSON never parsed and the run ended having
-    done nothing. The arguments are not recoverable and guessing them would
-    execute something the model did not ask for, so this only reports that a
-    call was attempted; the loop turns that into a retry.
-    """
+    """Find the tool name in a malformed call so the loop can ask for a retry. Never guess its arguments."""
     text = (content or "").strip()
     # Either the reply is the call, or the call runs to the end of it. A call
     # quoted mid-sentence has prose after it and is left alone.
@@ -3007,8 +3020,7 @@ def looks_like_broken_tool_call(content: str) -> str | None:
     if parse_content_tool_calls(text):
         return None
     text = candidate
-    # Aliases too: a mangled call is no less a call for having reached for the
-    # name the model learned in pretraining rather than ours.
+    # Recognize aliases when reporting malformed calls too.
     for name in list(_known_tool_names()) + list(TOOL_ALIASES):
         if f'"{name}"' in text:
             return canonical_tool_name(name)
@@ -3081,11 +3093,9 @@ def _file_revision(path: Path) -> str:
 def normalize_read_request(
     args: dict, project_root: Path | None
 ) -> tuple[str, int, int, str] | None:
-    """Resolve a read call to a canonical path, clamped range, and revision.
+    """Normalize a read's path, range and revision for comparison.
 
-    This mirrors ``_read_file`` closely so semantically equivalent argument
-    shapes (omitted bounds, ranges extending past EOF) compare the same way.
-    Invalid and binary reads are left to the real tool for its normal error.
+    Leave invalid or binary reads to the file tool's normal error handling.
     """
     try:
         path, err = resolve_existing(args.get("path") or "", project_root, want_dir=False)
@@ -3130,8 +3140,7 @@ _INCOMPLETE_RE = re.compile(
     r"first[,.]?\s|then i|after (that|this)|continue|todo|to[- ]do|"
     r"i('ll| will) (check|look|read|open|run|search|try)|"
     r"one (moment|sec)|hang on|give me a (sec|moment)|"
-    # Present-continuous promises: "I'm writing it now" read as a finished answer,
-    # so the loop stopped and the user was told work was happening that never was.
+    # Treat present-continuous promises such as "I'm writing it now" as unfinished work.
     r"i('m| am) (writing|creating|building|making|adding|implementing|updating|fixing|working)|"
     r"not yet\b"
     r")\b"
@@ -3141,10 +3150,7 @@ _PROMISE_START_RE = re.compile(
     r"(?i)^(writing|creating|building|making|adding|implementing|updating|fixing|"
     r"generating|drafting|starting)\b"
 )
-# looks_like_final_answer waves anything over 400 chars through as the
-# deliverable. A written-out plan defeats that: long, well formed, and closing
-# on a promise rather than a result. The loop read those as a finished turn and
-# ended runs having called no tools at all.
+# A long reply may still be a plan. Check its ending for a promised action.
 _PROMISE_TAIL_RE = re.compile(
     r"(?i)\b("
     r"let me (start|begin|now|first|go ahead|proceed|get started)|"
@@ -3198,8 +3204,7 @@ def looks_incomplete(content: str) -> bool:
     # A sign-off is a finished answer, however short.
     if _SIGNOFF_RE.search(text):
         return False
-    # Long replies are usually the deliverable. Words like "looking" or "todo" inside
-    # an analysis must not keep the agent loop alive forever.
+    # Do not retry a long answer just because it mentions planning words.
     if looks_like_final_answer(text):
         return False
     if _INCOMPLETE_RE.search(text):
@@ -3209,8 +3214,7 @@ def looks_incomplete(content: str) -> bool:
     # Trailing ellipsis / colon often means "more coming"
     if text.endswith(("...", "…", ":")):
         return True
-    # Very short non-answer after starting work. A reply that hands over a path
-    # or a run command is the deliverable, so it must not be dragged back in.
+    # Accept short replies that deliver a path or command after doing the work.
     delivers = re.search(r"(?i)(^|\s)(/|~/|\./)\S|\b(python3?|node|npx|bash|sh|cargo|go|java|make)\b", text)
     if len(text) < 80 and not text.endswith((".", "!", "?")) and not delivers:
         return True
@@ -3224,21 +3228,13 @@ _INTERNAL_CONTINUATION_PLACEHOLDERS = {
 
 
 def is_internal_continuation_placeholder(content: str) -> bool:
-    """True for loop-control text that must never become a user-facing answer.
-
-    Dashes are normalized so the several punctuation variants older transcripts
-    carry all match the one form listed above.
-    """
-    text = re.sub(r"\s*[-\u2013\u2014,]\s*", ", ", (content or "").strip().lower())
+    """Recognize internal loop instructions, including older dash variants."""
+    text = re.sub(r"\s*[-\u2013\N{EM DASH},]\s*", ", ", (content or "").strip().lower())
     return text in _INTERNAL_CONTINUATION_PLACEHOLDERS
 
 
 def to_ollama_tool_calls(calls: list[dict], *, elide_large_inputs: bool = False) -> list[dict]:
-    """Normalize stored tool calls into Ollama chat API shape.
-
-    Ollama expects function.arguments as an object, not a JSON string:
-    stringifying them causes 400: "Value looks like object, but can't find closing '}'".
-    """
+    """Normalize saved calls for Ollama. Keep function.arguments as an object."""
     out = []
     for c in calls or []:
         if not isinstance(c, dict):
@@ -3304,7 +3300,7 @@ def _elide_large_replay_input(fn: dict) -> None:
             continue
         digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
         owner[key] = (
-            f"[Aether replay elision: {len(value)} characters, sha256={digest}. "
+            f"[Olith replay elision: {len(value)} characters, sha256={digest}. "
             "The following tool result records whether the original edit succeeded; "
             "use read_file to inspect the current file.]"
         )
@@ -3336,14 +3332,19 @@ def tools_system_addon(defs: list[dict] | None = None) -> str:
         "appends each named result, and samples you again. A normal assistant message with no tool "
         "calls ends the turn, so emit one only when you are ready to hand the result to the user.\n"
         "Work as one continuous turn: inspect, change, and verify with tools, then give one concise debrief.\n"
+        "Finding code: search_files mode=hybrid accepts a natural-language concept; mode=symbols finds "
+        "definitions; mode=references finds identifier occurrences; mode=map shows dependencies. "
+        "Regex is the default. Read the current source before editing; reference results are not a safe rename operation.\n"
+        "Use read_file language_action=references/definition/hover with start_line and character for binding-aware navigation. Language servers start automatically when available.\n"
+        "For renames, read_file language_action=rename with new_name returns proposed binding-aware edits; inspect and apply them with edit_file. For new projects, record noninteractive checks in standard project configuration so verification can discover them.\n"
         "Editing existing files:\n"
         "- Prefer edit_file for an existing file, especially anything over 200 lines. Read only the "
         "relevant range. Batch independent ranges in one edits[] call when you already know them. "
         "Do not repeatedly read the whole file.\n"
-        "- write_file CREATES a file. It is rejected if the path already exists. A file is written "
-        "once, when it is created, and edited from then on. To change an existing file use "
-        "edit_file; to add to it use append_file. Only pass overwrite=true if the user explicitly "
-        "asked you to replace that file from scratch.\n"
+        "- write_file can replace an existing file, but it must contain the complete new file. "
+        "Anything you leave out is deleted.\n"
+        "- Dependency names can be case-sensitive. Inspect installed package metadata once before concluding a library is missing. Do not spend tool calls sleeping and polling an installation.\n"
+        "- A clean build or a window that exits is not a gameplay test. Check timed state updates and collisions with deterministic logic tests when changing game behavior.\n"
         "- For a large NEW artifact, never attempt one enormous write_file call. Write a compact, valid "
         "foundation first, then use append_file for coherent chunks at syntax-safe boundaries. For a "
         "standalone HTML file that already has closing tags, insert JavaScript before </script>, CSS before "
@@ -3374,7 +3375,9 @@ def tools_system_addon(defs: list[dict] | None = None) -> str:
         "- If you use it, update it at meaningful milestones and do not recreate the same plan.\n"
         "- Plan items must represent distinct tool phases. Do not split one write_file/edit_file action "
         "into several feature todos, and never batch-complete multiple milestones in one todo_write call.\n"
-        "You may call multiple tools per step. Do not claim you edited a file unless write_file, append_file, or edit_file succeeded."
+        "You may call multiple tools per step. Do not claim you edited a file unless write_file, append_file, or edit_file succeeded.\n"
+        "Only call something verified if a command you ran after your last edit shows it. Call everything else untested. "
+        "A test you wrote yourself only checks your own reading of the request, so say that, and name any behavior you changed that the user did not ask for."
     )
 
 
@@ -3446,6 +3449,9 @@ def tool_activity_line(name: str, arguments: dict | None = None, result: str | N
             if isinstance(parsed, dict) and parsed.get("error"):
                 err = True
                 line += f" ✗ {str(parsed.get('error'))[:60]}"
+            elif isinstance(parsed, dict) and name == "run_shell" and parsed.get("exit_code") not in (None, 0):
+                err = True
+                line += f" ✗ exit {parsed['exit_code']}"
         except Exception:
             pass
         if not err:

@@ -185,7 +185,7 @@ def wait_warm(deadline: float = 900) -> dict:
 
 def main() -> int:
     print("=" * 60)
-    print("AETHER UBUNTU FULL DIAGNOSTIC")
+    print("OLITH UBUNTU FULL DIAGNOSTIC")
     print("=" * 60)
 
     # --- 0. Prerequisites ---
@@ -207,7 +207,7 @@ def main() -> int:
     )
 
     if not wait_server(5):
-        log("server", False, "Aether not on :7878. Start ./aether.sh first")
+        log("server", False, "Olith not on :7878. Start ./olith.sh first")
         return 1
     log("server", True, "API reachable")
 
@@ -387,12 +387,12 @@ def main() -> int:
     cid_agent = chat_agent["id"]
     r_agent = stream_send(
         cid_agent,
-        f"Create a file hello_diag.py in the project root that prints exactly: AETHER_DIAG_OK\nThen run it with python3 and confirm the output.",
+        f"Create a file hello_diag.py in the project root that prints exactly: OLITH_DIAG_OK\nThen run it with python3 and confirm the output.",
         model_key="coder",
     )
-    wrote = test_file.exists() and "AETHER_DIAG_OK" in test_file.read_text()
+    wrote = test_file.exists() and "OLITH_DIAG_OK" in test_file.read_text()
     tool_used = len(r_agent["tool_calls"]) >= 1 or len(r_agent["tool_results"]) >= 1
-    run_ok = "AETHER_DIAG_OK" in json.dumps(r_agent["tool_results"]) or "AETHER_DIAG_OK" in (r_agent["content"] or "")
+    run_ok = "OLITH_DIAG_OK" in json.dumps(r_agent["tool_results"]) or "OLITH_DIAG_OK" in (r_agent["content"] or "")
     log("agentic.tools", tool_used, f"tools={len(r_agent['tool_calls'])} results={len(r_agent['tool_results'])}")
     log("agentic.write_run", wrote and (run_ok or wrote), f"file_exists={wrote} elapsed={r_agent['elapsed']:.1f}s")
 

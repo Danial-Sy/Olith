@@ -19,15 +19,7 @@ except ModuleNotFoundError:
 
 
 def _prompt_text(sample: dict) -> str:
-    """All text sent for one sample, whatever channel it arrived on.
-
-    Per-step directives ride along with the newest tool result (or a trailing
-    user message when there is none). They must NOT be system messages: Qwen's
-    template hoists every system message to the front of the prompt, so a
-    "trailing" directive is relocated into the prefix and invalidates the KV
-    cache, measured at 33.8s for seven tokens against 3.5s for 3,101 tokens of
-    ordinary appended turns.
-    """
+    """Combine all text sent in a sample, including instructions on tool results."""
     return "\n".join(m.get("content") or "" for m in sample["messages"])
 
 
@@ -35,19 +27,46 @@ DIRECTIVE_MARKER = "OPEN PLAN, CONTINUE AUTONOMOUSLY"
 
 
 def _directive_channel(sample: dict) -> str:
-    """Role that carried the per-step directive, for asserting it is not system.
-
-    Matches the directive body rather than the "[agent-loop]" tag, which the
-    stable system prompt also mentions when telling the model not to treat those
-    lines as user requests.
-    """
+    """Find the role carrying the directive body, ignoring the tag mentioned in the system prompt."""
     for m in reversed(sample["messages"]):
         if DIRECTIVE_MARKER in (m.get("content") or ""):
             return m.get("role") or ""
     return ""
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class AgentLoopPromptTests(unittest.TestCase):
+    def test_verification_summary_reports_failure_and_skips_without_false_success(self):
+        report = {"commands": [{"result": {"exit_code": 1}}, {"status": "needs_approval"}], "language_servers": [{"diagnostics": [{"severity": 1}]}]}
+        summary = server._verification_summary(report)
+        self.assertIn("0 command(s) passed, 1 failed", summary)
+        self.assertIn("still need approval", summary)
+        self.assertIn("error(s) remain", summary)
+        self.assertIn("no test or build command was run", server._verification_summary({"commands": []}))
+
+    def test_plan_updates_do_not_change_the_running_system_prefix(self):
+        chat = {"id": "plan-prefix", "mode": "agentic", "messages": [{"role": "user", "content": "Fix the game"}], "agent_todos": [{"id": "fix", "content": "Fix score", "status": "in_progress"}]}
+        snapshot = server.agent.todos_prompt_block(chat)
+        first = server._build_messages(chat, "agent", plan_context=snapshot)
+        chat["agent_todos"][0]["status"] = "completed"
+        chat["messages"].extend([
+            {"role": "assistant", "content": "", "tool_calls": [{"name": "todo_write", "arguments": {"merge": True, "todos": [{"id": "fix", "status": "completed"}]}}]},
+            {"role": "tool", "name": "todo_write", "content": '{"todos":[{"id":"fix","status":"completed"}]}'},
+        ])
+        current = server._build_messages(chat, "agent", plan_context=snapshot)
+        self.assertEqual(first[0], current[0])
+        self.assertIn('"status":"completed"', current[-1]["content"])
+    def test_legacy_automatic_verification_calls_are_not_replayed_as_shell_commands(self):
+        chat = {"id": "verification-replay", "messages": [
+            {"role": "user", "content": "Fix the game"},
+            {"role": "assistant", "content": "", "tool_calls": [{"name": "run_shell", "arguments": {"command": server.agent.INTERNAL_VERIFICATION_COMMAND}}]},
+            {"role": "tool", "name": "run_shell", "content": '{"exit_code":127}'},
+            {"role": "assistant", "content": "", "tool_calls": [{"name": "read_file", "arguments": {"path": "game.cpp"}}]},
+            {"role": "tool", "name": "read_file", "content": '{"content":"current source"}'},
+        ]}
+        rendered = server._build_messages(chat, "agent")
+        self.assertNotIn(server.agent.INTERNAL_VERIFICATION_COMMAND, str(rendered))
+        self.assertNotIn("127", str(rendered))
+        self.assertIn("current source", str(rendered))
     def test_only_successful_tool_results_reset_repeat_stalls(self):
         self.assertTrue(server._tool_succeeded(
             "edit_file", '{"ok": true, "path": "/tmp/app.js"}'
@@ -213,7 +232,7 @@ class AgentLoopPromptTests(unittest.TestCase):
                             "edits": [{
                                 "start_line": 1,
                                 "end_line": 1,
-                                "content": "[Aether replay elision: 9000 characters]",
+                                "content": "[Olith replay elision: 9000 characters]",
                             }],
                         },
                     }],
@@ -268,10 +287,116 @@ class AgentLoopPromptTests(unittest.TestCase):
         self.assertNotIn("cancel obsolete steps", user_text)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
 
+    async def test_shell_execution_keeps_the_server_event_loop_responsive(self):
+        samples = 0
+        async def stream(*args, **kwargs):
+            nonlocal samples
+            samples += 1
+            message = {"content": "Check finished."} if samples > 1 else {"tool_calls": [{"function": {"name": "run_shell", "arguments": {"command": "make test"}}}]}
+            yield {"message": message, "done": True}
+        def slow_check(*args, **kwargs):
+            time.sleep(0.08)
+            return '{"exit_code":0}'
+        async def compact(chat, *args, **kwargs):
+            return chat, False
+        chat = {"id": "responsive-check", "mode": "agentic", "messages": [{"role": "user", "content": "Run the tests"}]}
+        heartbeat = []
+        with (
+            patch.object(server.oc, "stream_chat", new=stream),
+            patch.object(server, "_maybe_auto_compact", new=compact),
+            patch.object(server.agent, "run_tool", side_effect=slow_check),
+            patch.object(server.st, "save_chat", side_effect=lambda value: value),
+            patch.object(server.st, "load_settings", return_value={"shell_approval_mode": "never_ask"}),
+        ):
+            async for event in server._agent_loop(chat, {"id": "m", "keep_alive": "1m"}, "agent", think=False):
+                if event["type"] == "tool_start":
+                    asyncio.get_running_loop().call_later(0.01, heartbeat.append, True)
+                if event["type"] == "tool_result":
+                    self.assertTrue(heartbeat, "Other requests must be served while a shell check runs")
+
+    async def test_checks_can_repeat_after_each_successful_source_change(self):
+        rounds = 0
+        async def stream(*args, **kwargs):
+            nonlocal rounds
+            current = rounds; rounds += 1
+            if current >= 7:
+                yield {"message": {"content": "Verified the changes."}, "done": True}
+            else:
+                name = "run_shell" if current % 2 == 0 else "edit_file"
+                arguments = {"command": "make test"} if name == "run_shell" else {"path": "game.cpp", "find": str(current), "replace": str(current + 1)}
+                yield {"message": {"tool_calls": [{"function": {"name": name, "arguments": arguments}}]}, "done": True}
+        async def compact(chat, *args, **kwargs):
+            return chat, False
+        chat = {"id": "repeat-check-after-edit", "mode": "agentic", "messages": [{"role": "user", "content": "Fix and verify the code"}]}
+        with (
+            patch.object(server.oc, "stream_chat", new=stream),
+            patch.object(server, "_maybe_auto_compact", new=compact),
+            patch.object(server.agent, "run_tool", return_value='{"changed":true,"exit_code":0}'),
+            patch.object(server.st, "save_chat", side_effect=lambda value: value),
+            patch.object(server.st, "load_settings", return_value={"shell_approval_mode": "never_ask"}),
+        ):
+            events = [event async for event in server._agent_loop(chat, {"id": "m", "keep_alive": "1m"}, "agent", think=False)]
+        self.assertEqual(sum(e["type"] == "tool_start" and e["name"] == "run_shell" for e in events), 4)
+        self.assertNotIn("interrupted", chat)
+
+    async def test_tool_commentary_is_public_prose_not_private_thinking_or_call_json(self):
+        cases = [
+            ("I will inspect the entry point before editing it.", True),
+            ("<think>Private reasoning stays private.</think>", False),
+            ('<tool_call>{"name":"read_file","arguments":{"path":"app.py"}}</tool_call>', False),
+        ]
+        for content, public in cases:
+            with self.subTest(content=content):
+                samples = 0
+                async def stream(*args, **kwargs):
+                    nonlocal samples
+                    samples += 1
+                    message = {"content": "Inspection complete."} if samples > 1 else {
+                        "content": content,
+                        "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "app.py"}}}],
+                    }
+                    yield {"message": message, "done": True}
+                async def compact(chat, *args, **kwargs):
+                    return chat, False
+                chat = {"id": "commentary-test", "project_id": None, "messages": [{"role": "user", "content": "Inspect the entry point."}]}
+                with (
+                    patch.object(server.oc, "stream_chat", new=stream),
+                    patch.object(server, "_maybe_auto_compact", new=compact),
+                    patch.object(server.agent, "run_tool", return_value='{"content":"source"}'),
+                    patch.object(server.st, "save_chat", side_effect=lambda value: value),
+                    patch.object(server.st, "load_settings", return_value={"shell_approval_mode": "never_ask", "role_context": {"agentic": 65536}}),
+                ):
+                    events = [event async for event in server._agent_loop(chat, {"id": "m", "keep_alive": "1m", "context": 32768}, "agent", think=False)]
+                commentary = [event for event in events if event["type"] == "commentary"]
+                self.assertEqual(bool(commentary), public)
+                if public:
+                    self.assertEqual(commentary[0]["content"], content)
+                    self.assertLess(events.index(commentary[0]), next(i for i, event in enumerate(events) if event["type"] == "tool_start"))
+                self.assertTrue(next(event for event in events if event["type"] == "tool_result")["ok"])
+
     async def test_resumed_open_plan_starts_with_compact_tool_replay(self):
+        sampling_calls = await self._resume_with_reads(7900)
+        replayed_tools = [
+            message
+            for message in sampling_calls[0]["messages"]
+            if message.get("role") == "tool"
+        ]
+        self.assertEqual(len(replayed_tools), 6)
+        # Recovery narrows once. The next sample retains those six results and
+        # appends the completed plan instead of evicting another source slice.
+        next_tools = [m for m in sampling_calls[1]["messages"] if m.get("role") == "tool"]
+        self.assertEqual(len(next_tools), 7)
+        self.assertEqual(replayed_tools, next_tools[:6])
+
+    async def test_resume_keeps_full_replay_when_it_fits(self):
+        sampling_calls = await self._resume_with_reads(2000)
+        replayed_tools = [m for m in sampling_calls[0]["messages"] if m.get("role") == "tool"]
+        self.assertEqual(len(replayed_tools), 8)
+
+    async def _resume_with_reads(self, body_chars: int) -> list[dict]:
         sampling_calls = []
 
         async def fake_stream_chat(*args, **kwargs):
@@ -320,7 +445,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "role": "tool",
                     "name": "read_file",
-                    "content": '{"content":"' + "x" * 5000 + '"}',
+                    "content": '{"content":"' + "x" * body_chars + '"}',
                 },
             ])
         messages.append({
@@ -353,17 +478,8 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "shell_approval_mode": "never_ask",
             }),
         ):
-            events = [
-                event
-                async for event in server._agent_loop(chat, meta, "agent", think=False)
-            ]
-
-        replayed_tools = [
-            message
-            for message in sampling_calls[0]["messages"]
-            if message.get("role") == "tool"
-        ]
-        self.assertEqual(len(replayed_tools), 6)
+            [event async for event in server._agent_loop(chat, meta, "agent", think=False)]
+        return sampling_calls
         self.assertEqual(events[-1]["message"]["content"], "Finished resumed work.")
 
     async def test_repeated_rejected_call_changes_strategy_while_plan_is_open(self):
@@ -435,9 +551,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
             return chat, False
 
         def fake_run_tool(name, arguments, project_root, project_id=None, chat=None):
-            # Rejected until the strategy change lands, then it succeeds. A
-            # milestone whose every edit failed can no longer be completed, so
-            # the recovery has to actually produce a change to close the plan.
+            # Keep rejecting until the changed approach produces a real edit.
             if name == "edit_file" and sampling_round <= 4:
                 return '{"error":"synthetic rejection"}'
             if name == "edit_file":
@@ -482,7 +596,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
             for event in events
         ))
         self.assertEqual(chat["agent_todos"][0]["status"], "completed")
-        self.assertEqual(events[-1]["message"]["content"], "Recovered without user direction.")
+        self.assertEqual(events[-1]["message"]["model_content"], "Recovered without user direction.")
 
     async def test_successful_file_mutation_emits_fresh_project_tree(self):
         sampling_round = 0
@@ -588,7 +702,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
                 }
             else:
                 yield {
-                    "message": {"content": "Built and verified the game."},
+                    "message": {"content": "Built the game."},
                     "done": True,
                     "done_reason": "stop",
                 }
@@ -643,7 +757,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
         assistant_messages = [m for m in chat["messages"] if m.get("role") == "assistant"]
         self.assertEqual(len(assistant_messages), 2)
         self.assertTrue(assistant_messages[0]["tool_calls"])
-        self.assertEqual(events[-1]["message"]["content"], "Built and verified the game.")
+        self.assertEqual(events[-1]["message"]["model_content"], "Built the game.")
 
     async def test_repeated_length_failures_escalate_through_three_action_lanes(self):
         sampling_calls = []
@@ -719,10 +833,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         self.assertEqual(len(sampling_calls), 5)
-        # The escalation shape matters, not exact token counts: the recovery
-        # budget is clamped by remaining context, so it moves whenever the token
-        # estimate changes. Pinning literals here made an accuracy fix look like
-        # a regression.
+        # Check that the recovery budget grows, without fixing context-dependent token counts.
         budgets = [call["options"]["num_predict"] for call in sampling_calls[:4]]
         self.assertEqual(budgets[0], 8192)
         self.assertEqual(budgets[1], 16384)
@@ -733,7 +844,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
             message for message in chat["messages"] if message.get("role") == "assistant"
         ]
         self.assertEqual(len(assistant_messages), 2)
-        self.assertEqual(events[-1]["message"]["content"], "Recovered and finished.")
+        self.assertEqual(events[-1]["message"]["model_content"], "Recovered and finished.")
 
     async def test_productive_loop_can_run_past_old_forty_step_limit(self):
         sampling_round = 0
@@ -765,10 +876,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
                     "done_reason": "stop",
                 }
             elif sampling_round <= 45:
-                # Land a real change every few rounds. A run that only inspects,
-                # forever, is the pathology the inspection gate exists to stop;
-                # what must stay uncapped is a long run that keeps making
-                # progress, which is what this test is about.
+                # Make real edits between checks so this tests a long run that keeps progressing.
                 if sampling_round % 5 == 0:
                     call = {
                         "index": 0,
@@ -833,22 +941,17 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sampling_round, 46)
         self.assertEqual(len(executed), 46)
         self.assertEqual(executed[:2], ["search_files", "git_status"])
-        self.assertEqual(events[-1]["message"]["content"], "Completed after sustained tool progress.")
+        self.assertEqual(events[-1]["message"]["model_content"], "Completed after sustained tool progress.")
 
 
 if __name__ == "__main__":
     unittest.main()
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class AgentLoopRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_rejection_restates_the_constraint_and_recovers(self):
-        """A rejected call must be answered with what it violated.
-
-        The old guard replaced the tool's own hint with a generic "stop
-        repeating", so an oversized edit_file lost the only information that
-        would have let the model split it, and the run was abandoned.
-        """
+        """Keep the tool's rejection details so the model knows how to fix its call."""
         sampling_calls = []
         oversized = {
             "path": "game.html",
@@ -990,7 +1093,7 @@ class AgentLoopRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loaded, [])
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class ShellApprovalTests(unittest.TestCase):
     def test_safe_auto_stops_asking_about_a_remembered_command(self):
         settings = {
@@ -1019,13 +1122,58 @@ class ShellApprovalTests(unittest.TestCase):
         }
         self.assertTrue(server._shell_gate(settings, "rm -rf build", None)[0])
 
-    def test_primary_binary_is_the_program_not_an_argument(self):
-        self.assertEqual(server.agent.shell_primary_binary("curl -sSL https://x"), "curl")
-        self.assertEqual(server.agent.shell_primary_binary("/usr/bin/docker ps"), "docker")
-        self.assertEqual(server.agent.shell_primary_binary("FOO=1 npm run build"), "npm")
-        self.assertEqual(server.agent.shell_primary_binary(""), "")
+    def test_review_binaries_name_the_risky_program_not_the_first_one(self):
+        binaries = server.agent.shell_review_binaries
+        self.assertEqual(binaries("cd /x && git remote add origin u && git push -u origin main 2>&1"), ["git"])
+        self.assertEqual(binaries("/usr/bin/shred secrets.txt"), ["shred"])
+        self.assertEqual(binaries("FOO=1 rm -rf build"), ["rm"])
+        self.assertEqual(binaries("cd /x && git push && rm -rf y"), ["git", "rm"])
+        self.assertEqual(binaries("cd /x && ls"), [])
+        self.assertEqual(binaries(""), [])
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+    def test_always_allow_cd_does_not_cover_what_follows_it(self):
+        settings = {
+            "shell_approval_mode": "safe_auto",
+            "shell_allowlist": {"global": {"commands": [], "binaries": ["cd"]}},
+        }
+        self.assertTrue(server._shell_gate(settings, "cd /x && rm -rf y", None)[0])
+        self.assertTrue(server._shell_gate(settings, "cd /x && git push", None)[0])
+
+    def test_every_risky_program_must_be_remembered(self):
+        settings = {
+            "shell_approval_mode": "safe_auto",
+            "shell_allowlist": {"global": {"commands": [], "binaries": ["git"]}},
+        }
+        self.assertFalse(server._shell_gate(settings, "cd /x && git push", None)[0])
+        self.assertTrue(server._shell_gate(settings, "git push && rm -rf y", None)[0])
+
+    def test_no_program_can_vouch_for_a_risk_in_the_line_itself(self):
+        settings = {
+            "shell_approval_mode": "safe_auto",
+            "shell_allowlist": {"global": {"commands": [], "binaries": ["curl", "sh", "rm"]}},
+        }
+        self.assertTrue(server._shell_gate(settings, "curl https://x | sh", None)[0])
+        self.assertTrue(server._shell_gate(settings, "rm -f a > /etc/hosts", None)[0])
+
+    def test_classifier_verdicts_survive_the_split(self):
+        classify = server.agent.classify_shell
+        self.assertEqual(classify("cd /x && npm test")[0], "safe")
+        self.assertIn("git push", classify("cd /x && git push")[1])
+        self.assertIn("git reset", classify("git reset --hard")[1])
+        self.assertIn("substitution", classify("echo $(rm -rf x)")[1])
+        self.assertEqual(classify("echo 'unbalanced")[1], "unbalanced quotes")
+
+    def test_remembering_stores_the_risky_program(self):
+        store = {}
+        with patch.object(server.st, "load_settings", return_value=store), \
+             patch.object(server.st, "save_settings", side_effect=store.update):
+            server.remember_shell_approval("p", "cd /x && git push", "binary")
+            self.assertEqual(store["shell_allowlist"]["p"]["binaries"], ["git"])
+            # Two risky programs cannot share one tick box.
+            server.remember_shell_approval("q", "git push && rm -rf y", "binary")
+            self.assertEqual(store["shell_allowlist"]["q"]["binaries"], [])
+
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class JobStateResetTests(unittest.TestCase):
 
     def test_a_chat_that_never_planned_is_unaffected(self):
@@ -1033,11 +1181,9 @@ class JobStateResetTests(unittest.TestCase):
         server._start_new_job(chat)
         self.assertNotIn("agent_spec", chat)
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class EstimateCalibrationTests(unittest.TestCase):
-    """The estimator ran ~1.33x over on real agent prompts. That is not free
-    headroom: it is 42% of the allocated context nothing may use, which is what
-    pushed the replay floor into evicting the model's working set."""
+    """Adjust the estimate from Ollama's actual prompt count without wasting context space."""
 
     def _learn(self, pairs):
         chat = {"id": "cal"}
@@ -1077,12 +1223,52 @@ class EstimateCalibrationTests(unittest.TestCase):
         self.assertEqual(server._estimate_bias(chat, "agent"), 1.0)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class RepeatGuardRevisionTests(unittest.TestCase):
-    """Past the repeat limit the guard replays a cached rejection and never runs
-    the tool again. Keyed on arguments alone that is permanent: an edit rejected
-    while the file said one thing stayed rejected after the file was changed to
-    say exactly what the anchor wanted."""
+    """Allow a rejected edit to retry after the file revision changes."""
+
+    def test_renaming_an_identical_temporary_probe_does_not_evade_repeat_guard(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "game.cpp"; source.write_text("int score = 0;")
+            def probe(number, body="int main() { return score; }"):
+                name = str(Path(tempfile.gettempdir()) / f"debug{number}")
+                return {"name": "run_shell", "arguments": {"command": f"cat > {name}.cpp <<'EOF'\n#include \"{source}\"\n{body}\nEOF\ng++ {name}.cpp -o {name} && {name}"}}
+            first = server._call_signature(probe(1), root)
+            self.assertEqual(first, server._call_signature(probe(2), root))
+            self.assertNotEqual(first, server._call_signature(probe(2, "int main() { return score + 1; }"), root))
+            source.write_text("int score = 1;")
+            self.assertNotEqual(first, server._call_signature(probe(3), root))
+
+    def test_a_renamed_project_probe_without_includes_is_a_repeat(self):
+        # Run 2 of the dino benchmark wrote dbg5.cpp, dbg6.cpp... 45 times with 3 bodies.
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            def probe(number, body="int main() { return 0; }"):
+                return {"name": "run_shell", "arguments": {"command": f"cd {root} && cat > dbg{number}.cpp <<'EOF'\n{body}\nEOF\ng++ -std=c++17 dbg{number}.cpp -o dbg{number} && ./dbg{number}"}}
+            first = server._call_signature(probe(5), root)
+            self.assertEqual(first, server._call_signature(probe(6), root))
+            self.assertNotEqual(first, server._call_signature(probe(7, "int main() { return 1; }"), root))
+
+    def test_a_renamed_probe_with_object_output_is_a_repeat(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "game.cpp").write_text("int score = 0;")
+            def probe(number):
+                name = str(Path(tempfile.gettempdir()) / f"probe{number}")
+                return {"name": "run_shell", "arguments": {"command": f"cat > {name}.cpp <<'EOF'\n#include \"game.cpp\"\nint main() {{ return score; }}\nEOF\ng++ -c {name}.cpp -o {name}.o -I. && objdump -d {name}.o"}}
+            self.assertEqual(server._call_signature(probe(6), root), server._call_signature(probe(7), root))
+
+    def test_overwriting_project_source_through_a_heredoc_is_not_a_probe(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "game.cpp").write_text("int score = 0;")
+            command = f"cd {root} && cat > game.cpp <<'EOF'\nint score = 1;\nEOF"
+            self.assertIsNone(server._shell_probe_identity(command, root))
 
     def test_the_same_call_against_a_changed_file_is_a_new_call(self):
         import tempfile
@@ -1106,11 +1292,9 @@ class RepeatGuardRevisionTests(unittest.TestCase):
             server._call_signature(call, None), server._call_signature(call, None)
         )
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class CompactionBoundaryTests(unittest.TestCase):
-    """Phase 2: compaction is a read-time projection over an append-only
-    transcript. Nothing is deleted, so no stored offset can go stale and the
-    full run survives for resume and audit."""
+    """Compact the rendered prompt while keeping the saved transcript intact."""
 
     @staticmethod
     def _run(n_reads: int) -> list[dict]:
@@ -1164,9 +1348,7 @@ class CompactionBoundaryTests(unittest.TestCase):
             )
 
     def test_a_long_single_request_run_can_still_compact(self):
-        # The request sits at index 0 with only tool churn after it. Clamping the
-        # split to the latest user turn pinned upto=0, so compaction could never
-        # fire and a long run could only grow.
+        # Allow compaction past the user turn. It is repeated after the summary.
         msgs = self._run(6)
         self.assertEqual(server._latest_user_index(msgs), 0)
         self.assertGreater(server._compact_split_point(msgs, 4), 0)
@@ -1203,7 +1385,7 @@ class CompactionBoundaryTests(unittest.TestCase):
         self.assertIn("LEGACY BRIEF", server._build_messages(chat, "agent")[0]["content"])
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class CompactionIsNonDestructiveTests(unittest.IsolatedAsyncioTestCase):
     async def test_compaction_inserts_a_boundary_and_deletes_nothing(self):
         msgs = CompactionBoundaryTests._run(6)
@@ -1238,11 +1420,9 @@ class CompactionIsNonDestructiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server._active_summary(chat), "BRIEF")
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class DetailHorizonTests(unittest.TestCase):
-    """The cheap reduction tier. Collapsing it into summarization alone let the
-    prompt reach ~2x the size before anything shrank it, and a measured live run
-    made 48 tool calls without finishing a job it had previously done in 27."""
+    """Drop old tool details before full summarization is needed."""
 
     @staticmethod
     def _run(n: int, body_chars: int = 7000) -> list[dict]:
@@ -1318,11 +1498,10 @@ class DetailHorizonTests(unittest.TestCase):
         # Reduction happened, but rarely, not on every step.
         self.assertLess(moves, 7)
 
-    def test_a_reread_collapses_the_older_copy(self):
-        # Deliberate trade: superseding an earlier read rewrites the prefix once,
-        # which is cheaper than carrying five near-identical copies of one file
-        # and far less likely to teach the model to keep exploring.
+    def test_a_reread_preserves_the_cached_prefix(self):
+        # Overlapping reads must not rewrite older tool results every step.
         msgs = [{"role": "user", "content": "go"}]
+        previous = []
         for _ in range(3):
             msgs.append({"role": "assistant", "content": "",
                          "tool_calls": [{"name": "read_file",
@@ -1330,10 +1509,106 @@ class DetailHorizonTests(unittest.TestCase):
             msgs.append({"role": "tool", "name": "read_file",
                          "content": json.dumps({"path": "big.py", "start": 1, "end": 400,
                                                 "content": "SAMEBODY" + "x" * 7000})})
+            current = server._build_messages({"id": "r", "messages": msgs}, "coder")
+            self.assertEqual(current[:len(previous)], previous)
+            previous = current
         rendered = server._build_messages({"id": "r", "messages": msgs}, "coder")
         bodies = [m.get("content") or "" for m in rendered if m.get("role") == "tool"]
-        self.assertEqual(sum("SAMEBODY" in b for b in bodies), 1)
-        self.assertEqual(sum("Superseded" in b for b in bodies), 2)
+        self.assertEqual(sum("SAMEBODY" in b for b in bodies), 3)
+
+    def test_recovery_boundary_preserves_new_work_and_tool_pairs(self):
+        msgs = [{"role": "user", "content": "build it"}]
+        for i in range(10):
+            msgs.append({"role": "assistant", "content": "", "tool_calls": [
+                {"name": "run_shell", "arguments": {"command": f"make {i}"}}]})
+            msgs.append({"role": "tool", "name": "run_shell", "content": f"build {i}"})
+        chat = {"id": "recovery-boundary", "messages": msgs}
+        original = list(chat["messages"])
+        server._retain_recent_tool_detail(chat, 4)
+        previous = server._build_messages(chat, "coder")
+        self.assertEqual(sum(m["role"] == "tool" for m in previous), 4)
+        for index in range(8):
+            chat["messages"].extend([
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"name": "read_file", "arguments": {"path": f"next{index}.py"}}]},
+                {"role": "tool", "name": "read_file", "content": f"source {index}"},
+            ])
+            current = server._build_messages(chat, "coder")
+            self.assertEqual(current[:len(previous)], previous)
+            previous = current
+        server._retain_recent_tool_detail(chat, 2)
+        current = server._build_messages(chat, "coder")
+        self.assertEqual([m["content"] for m in current if m["role"] == "tool"],
+                         ["source 6", "source 7"])
+        self.assertTrue(all(m in chat["messages"] for m in original))
+
+    @staticmethod
+    def _read(path, start, end, tag):
+        return [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"name": "read_file", "arguments": {"path": path, "start_line": start}}]},
+            {"role": "tool", "name": "read_file", "content": json.dumps(
+                {"path": path, "start": start, "end": end, "content": tag + "x" * 6000})},
+        ]
+
+    def _shell(self, i):
+        return [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"name": "run_shell", "arguments": {"command": f"make {i}"}}]},
+            {"role": "tool", "name": "run_shell", "content": f"build {i}" + "y" * 6000},
+        ]
+
+    def test_a_cut_keeps_the_newest_view_of_a_file(self):
+        msgs = [{"role": "user", "content": "fix the game"}]
+        msgs += self._read("/p/game.cpp", 1, 238, "OLDTOP")
+        msgs += self._read("/p/game.cpp", 1, 238, "TOP")
+        msgs += self._read("/p/game.cpp", 239, 586, "BOTTOM")
+        for i in range(8):
+            msgs += self._shell(i)
+        chat = {"id": "pin", "messages": msgs}
+        server._retain_recent_tool_detail(chat, 2)
+        bodies = "\n".join(m.get("content") or "" for m in server._build_messages(chat, "coder"))
+        self.assertIn("TOP", bodies)
+        self.assertIn("BOTTOM", bodies)
+        self.assertNotIn("OLDTOP", bodies)
+        self.assertNotIn("build 0", bodies)
+        self.assertIn("build 7", bodies)
+
+    def test_a_cut_drops_a_read_made_stale_by_an_edit(self):
+        msgs = [{"role": "user", "content": "fix the game"}]
+        msgs += self._read("/p/game.cpp", 1, 238, "STALE")
+        msgs += [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"name": "edit_file", "arguments": {"path": "game.cpp"}}]},
+            {"role": "tool", "name": "edit_file", "content": json.dumps(
+                {"ok": True, "path": "/p/game.cpp", "changed": True})},
+        ]
+        for i in range(8):
+            msgs += self._shell(i)
+        chat = {"id": "stale", "messages": msgs}
+        server._retain_recent_tool_detail(chat, 2)
+        bodies = "\n".join(m.get("content") or "" for m in server._build_messages(chat, "coder"))
+        self.assertNotIn("STALE", bodies)
+
+    def test_pinned_reads_stay_append_only(self):
+        msgs = [{"role": "user", "content": "fix the game"}]
+        msgs += self._read("/p/game.cpp", 1, 238, "TOP")
+        for i in range(8):
+            msgs += self._shell(i)
+        chat = {"id": "pin-cache", "messages": msgs}
+        server._retain_recent_tool_detail(chat, 2)
+        previous = server._build_messages(chat, "coder")
+        chat["messages"] += self._read("/p/game.cpp", 1, 238, "NEWTOP")
+        current = server._build_messages(chat, "coder")
+        self.assertEqual(current[:len(previous)], previous)
+
+    def test_narrowing_waits_until_the_prompt_is_crowded(self):
+        small = {"id": "small-narrow", "messages": self._run(6, body_chars=500)}
+        self.assertFalse(server._narrow_if_crowded(small, "coder", 2))
+        self.assertEqual(server._horizon_index(small["messages"]), -1)
+        large = {"id": "large-narrow", "messages": self._run(40)}
+        self.assertTrue(server._narrow_if_crowded(large, "coder", 2))
+        self.assertGreater(server._horizon_index(large["messages"]), 0)
 
     def test_a_write_stops_reads_collapsing_across_it(self):
         # Content genuinely differs either side of an edit.
@@ -1359,7 +1634,7 @@ class DetailHorizonTests(unittest.TestCase):
         self.assertIn("AFTER", bodies)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class GatesRemovedTests(unittest.IsolatedAsyncioTestCase):
     """Phase 3: the loop no longer counts the model's moves and then refuses them."""
 
@@ -1380,11 +1655,7 @@ class GatesRemovedTests(unittest.IsolatedAsyncioTestCase):
             return [e async for e in server._agent_loop(chat, self.META, "agent", think=False)]
 
     async def test_an_open_plan_nudges_twice_then_accepts_the_debrief(self):
-        # The old gate deleted EVERY debrief while milestones were open and then
-        # aborted the run, so a model that had finished had no legal way to say
-        # so. The nudge itself was worth keeping: without it two scenarios
-        # dropped from 21-28 rounds to 12, so the budget now expires into
-        # acceptance rather than into an error.
+        # Limit plan-continuation nudges, then accept the final reply.
         rounds = 0
 
         async def fake_stream(*a, **k):
@@ -1413,9 +1684,7 @@ class GatesRemovedTests(unittest.IsolatedAsyncioTestCase):
                          ["in_progress", "pending"])
 
     async def test_narration_is_turned_into_an_action_not_a_debrief(self):
-        # Qwen sometimes announces its next step instead of taking it. Ending the
-        # turn on that loses the run; the removed plan gate used to catch it by
-        # accident, so the loop now catches it deliberately and boundedly.
+        # Retry a promised action instead of ending the turn before it happens.
         rounds = 0
 
         async def fake_stream(*a, **k):
@@ -1489,9 +1758,7 @@ class GatesRemovedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["message"]["content"], "Read enough.")
 
     async def test_steering_never_rides_on_a_system_message(self):
-        # Qwen's template hoists system messages to the front of the prompt, so a
-        # "trailing" directive is relocated into the prefix and costs a full KV
-        # re-evaluation: measured 33.8s for 7 tokens vs 3.5s for 3,101 appended.
+        # Keep step instructions off the system prefix so Qwen can reuse the prompt cache.
         samples: list[dict] = []
         rounds = 0
 
@@ -1527,12 +1794,9 @@ class GatesRemovedTests(unittest.IsolatedAsyncioTestCase):
                 sum(1 for m in sample["messages"] if m.get("role") == "system"), 1)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class OffloadWiringTests(unittest.IsolatedAsyncioTestCase):
-    """Phase 4 wiring. The offload helper is unit-tested separately; what this
-    covers is that _agent_loop actually routes results through it. The first
-    version of Phase 4 was correct in isolation and never fired in a real run,
-    because the tools truncated below the threshold before it was reached."""
+    """Check that the agent loop saves large tool results before truncating them."""
 
     async def test_a_large_tool_result_is_stored_as_a_pointer(self):
         import shutil
@@ -1589,12 +1853,9 @@ class OffloadWiringTests(unittest.IsolatedAsyncioTestCase):
             shutil.rmtree(server.agent.TOOLOUT_DIR / "offload-wiring", ignore_errors=True)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class DelegationTests(unittest.IsolatedAsyncioTestCase):
-    """Phase 5: a sub-task runs the same loop over a fresh transcript, so its
-    reading costs the parent only the summary it returns. Same model, run
-    sequentially. The benefit is context isolation, not parallelism, and a
-    second co-resident model does not fit on a 24GB card."""
+    """Run sub-tasks sequentially on the same model with a separate transcript."""
 
     META = {"id": "test-model", "keep_alive": "1m", "temperature": 0.2, "context": 32768}
     SETTINGS = {"agent_repeat_limit": 3, "role_context": {"agentic": 65536},
@@ -1713,9 +1974,7 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
         chat = {"id": "sub2", "project_id": None, "subagent": {"task": "x"},
                 "messages": [{"role": "user", "content": "x"}]}
         events = await self._run(fake_stream, chat)
-        # ...and if it is called anyway the runtime refuses it with an actionable
-        # message rather than recursing. The execution-level allowlist catches it
-        # first, which is the more general guard.
+        # Reject nested delegation at execution time, even if the model names the tool.
         tool_msgs = [m for m in chat["messages"] if m.get("role") == "tool"]
         payload = json.loads(tool_msgs[0]["content"])
         self.assertIn("not available", payload["error"])
@@ -1724,9 +1983,8 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["message"]["content"], "did it myself")
 
     async def test_a_withheld_tool_is_refused_at_execution_not_just_hidden(self):
-        # Withholding the schema is advice: agent.run_tool dispatches on name, so
-        # a model that emits a withheld tool still gets it executed. Observed
-        # live: a read-only sub-agent successfully called todo_write.
+        # Enforce the sub-task tool list during execution too. Withholding a schema
+        # alone does not stop a model from naming it.
         rounds = 0
         executed: list[str] = []
 
@@ -1763,27 +2021,24 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
             "id": "normal", "messages": [],
             "delegate_available": True, "computer_use": True,
         }
-        self.assertEqual(
-            server._allowed_tool_names(chat),
-            {t["function"]["name"] for t in server.agent.TOOL_DEFS},
-        )
+        with patch.object(server.mcp_connections, "active", return_value=[{"id": "fixture"}]):
+            self.assertEqual(
+                server._allowed_tool_names(chat),
+                {t["function"]["name"] for t in server.agent.TOOL_DEFS},
+            )
 
     async def test_a_run_that_did_not_ask_for_the_desktop_is_not_given_it(self):
-        # The only tools a full parent run can be missing, and only because the
-        # chat did not turn computer use on. The browser is the same consent as
-        # the desktop: both act outside the project.
+        # With service connections enabled, only desktop and browser remain gated.
         chat = {"id": "normal", "messages": [], "delegate_available": True}
-        self.assertEqual(
-            {t["function"]["name"] for t in server.agent.TOOL_DEFS}
-            - server._allowed_tool_names(chat),
-            {"computer", "browser"},
-        )
+        with patch.object(server.mcp_connections, "active", return_value=[{"id": "fixture"}]):
+            self.assertEqual(
+                {t["function"]["name"] for t in server.agent.TOOL_DEFS}
+                - server._allowed_tool_names(chat),
+                {"computer", "browser"},
+            )
 
     async def test_delegation_is_gated_on_project_size(self):
-        # Measured A/B on a 113k-line repo: the model never called delegate,
-        # because peak prompt stayed at 15-24k against a 22k working set. Its
-        # schema costs 324 tokens on every request, so it is offered only where
-        # surveying is genuinely expensive.
+        # Offer delegate only on large projects to avoid unused schema overhead.
         import tempfile
         names = lambda c: {t["function"]["name"] for t in server.agent.tool_defs_for(c)}
         self.assertNotIn("delegate", names({}))
@@ -1845,15 +2100,9 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["message"]["content"], "Carried on regardless.")
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class SampleTimeoutRecoveryTests(unittest.IsolatedAsyncioTestCase):
-    """A model that ran out of clock needs MORE time, not less. Shrinking the
-    budget on every retry is right only for a model returning nothing.
-
-    Observed live: a `high`-effort turn on qwen3.8:27b died with "no assistant
-    message after four progressively smaller recovery prompts (sample timeout
-    after 60s)". Measured at 82.6 tok/s, an 8192-token reply budget needs ~99s
-    of generation alone, impossible in 90s let alone 60s."""
+    """Give timed-out samples more time. Shrink recovery budgets only for empty replies."""
 
     async def _timeouts(self, done_reason: str) -> list[int]:
         seen: list[int] = []
@@ -1894,11 +2143,9 @@ class SampleTimeoutRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(other.startswith("sample timeout"))
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class AskUserDisciplineTests(unittest.IsolatedAsyncioTestCase):
-    """Questions belong at the start of a job or not at all. A blocking question
-    the user has not seen is worse than a wrong guess: an observed run sat behind
-    an unanswered volcano-styling question having written nothing."""
+    """Ask clarifying questions before starting changes, then continue with the available information."""
 
     META = {"id": "test-model", "keep_alive": "1m", "temperature": 0.2, "context": 32768}
 
@@ -1954,7 +2201,7 @@ class AskUserDisciplineTests(unittest.IsolatedAsyncioTestCase):
         refusal = json.loads([m for m in chat["messages"]
                               if m.get("role") == "tool"][-1]["content"])
         self.assertIn("Too late to ask", refusal["error"])
-        self.assertEqual(events[-1]["message"]["content"],
+        self.assertEqual(events[-1]["message"]["model_content"],
                          "Built it; assumed a large volcano.")
 
     async def test_a_question_before_any_write_still_works(self):
@@ -1991,14 +2238,9 @@ class AskUserDisciplineTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(server.ASK_USER_TIMEOUT, 120)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class AgenticModelPersistenceTests(unittest.IsolatedAsyncioTestCase):
-    """The picked agentic model must survive chat creation.
-
-    A new agentic chat used to come back with no agent_model at all, and the UI
-    re-derived its default from that silence, so choosing the 27B and then
-    opening a new conversation quietly put the run back on the coder.
-    """
+    """Keep the chosen Agentic model when creating a new chat."""
 
     @contextlib.contextmanager
     def _storage(self, store):
@@ -2057,13 +2299,9 @@ class AgenticModelPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("agent_model", chat)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
-    """A run parked on the user must be answerable from outside the stream.
-
-    Both failures here produced the same symptom: the run waited out its whole
-    timeout and then reported an approval the user was never shown.
-    """
+    """Keep open prompts available to requests outside the response stream."""
 
     SETTINGS = {
         "agent_repeat_limit": 3,
@@ -2132,14 +2370,76 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
     async def test_nothing_is_pending_on_an_idle_chat(self):
         self.assertEqual((await server.pending_question("never-ran"))["pending"], None)
 
-    async def test_a_sub_agent_approval_reaches_the_parent_and_its_chat_id(self):
-        """The sub-run's events were filtered down to tool_start and message.
+    async def test_full_access_runs_shell_git_and_service_actions_without_prompts(self):
+        calls = [
+            ("run_shell", {"command": "rm -rf disposable-fixture"}),
+            ("git_status", {"action": "push"}),
+            ("connection_call", {"connection_id": "fixture", "tool": "delete_fixture", "arguments": {}}),
+        ]
+        for name, arguments in calls:
+            with self.subTest(tool=name):
+                count = 0
 
-        An approval raised inside a delegated sub-task was dropped on the floor:
-        no card, no way to answer, and the sub-run sat on the future until it
-        expired. It also has to be parked under the parent's id, because the
-        synthetic child id is not something the UI can post an answer to.
-        """
+                async def sampler(*args, **kwargs):
+                    nonlocal count
+                    count += 1
+                    if count == 1:
+                        message = {"tool_calls": [{"function": {"name": name, "arguments": arguments}}]}
+                    else:
+                        message = {"content": "Completed the requested fixture action."}
+                    yield {"message": message, "done": True, "done_reason": "stop"}
+
+                chat = {"id": "full-access-test", "messages": [{"role": "user", "content": "Run the fixture action"}]}
+                with self._harness(), \
+                     patch.object(server.st, "load_settings", return_value={**self.SETTINGS, "approval_mode": "full_access"}), \
+                     patch.object(server.oc, "stream_chat", new=sampler), \
+                     patch.object(server.mcp_connections, "preflight", return_value=None), \
+                     patch.object(server.mcp_connections, "approval_ticket", return_value=("revision", "fingerprint")), \
+                     patch.object(server, "_index_work", new=AsyncMock(side_effect=lambda fn, *a, **kw: fn(*a, **kw))), \
+                     patch.object(server.mcp_connections, "call", return_value={"ok": True}) as service_call:
+                    async def collect():
+                        events = []
+                        async for event in server._agent_loop(chat, self.META, "agent", think=False):
+                            events.append(event)
+                        return events
+                    events = await asyncio.wait_for(collect(), timeout=10)
+                    self.assertFalse(any(event.get("type") == "shell_approval" for event in events))
+                    self.assertTrue(any(event.get("type") == "tool_start" for event in events))
+                    if name == "connection_call":
+                        service_call.assert_called_once_with(arguments, approved=True, ticket=("revision", "fingerprint"))
+                    else:
+                        self.assertTrue(any(call.args[:2] == (name, arguments) for call in server.agent.run_tool.call_args_list))
+
+    async def test_unattended_shell_does_not_grant_service_or_github_actions(self):
+        for name, arguments in [("git_status", {"action": "push"}), ("connection_call", {"tool": "change"})]:
+            with self.subTest(tool=name):
+                count = 0
+
+                async def sampler(*args, **kwargs):
+                    nonlocal count
+                    count += 1
+                    message = {"tool_calls": [{"function": {"name": name, "arguments": arguments}}]} if count == 1 else {"content": "Done"}
+                    yield {"message": message, "done": True, "done_reason": "stop"}
+
+                chat = {"id": "legacy-shell-test", "messages": [{"role": "user", "content": "Run fixture"}]}
+                with self._harness(), \
+                     patch.object(server.st, "load_settings", return_value={**self.SETTINGS, "shell_approval_mode": "never_ask"}), \
+                     patch.object(server.oc, "stream_chat", new=sampler), \
+                     patch.object(server.mcp_connections, "preflight", return_value=None), \
+                     patch.object(server.mcp_connections, "requires_approval", return_value=True), \
+                     patch.object(server.mcp_connections, "approval_ticket", return_value=(1, 2)), \
+                     patch.object(server.mcp_connections, "call") as service_call:
+                    events = []
+                    async for event in server._agent_loop(chat, self.META, "agent", think=False):
+                        events.append(event)
+                        if event.get("type") == "shell_approval":
+                            await server.answer_question(chat["id"], server.AnswerIn(answers={"shell_approval": "Deny"}, cancelled=False))
+                    self.assertTrue(any(event.get("type") == "shell_approval" for event in events))
+                    service_call.assert_not_called()
+                    self.assertFalse(any(call.args[0] == name for call in server.agent.run_tool.call_args_list))
+
+    async def test_a_sub_agent_approval_reaches_the_parent_and_its_chat_id(self):
+        """Forward sub-task approvals to the parent chat so the UI can display and answer them."""
         parent = {"id": "parent-chat", "project_id": None, "messages": []}
         events, parked_keys = [], []
 
@@ -2166,7 +2466,7 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(e.get("type") == "subagent_result" for e in events))
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class RoleDerivationTests(unittest.TestCase):
     """Roles key the prompt, effort and window; the UI still speaks the old names."""
 
@@ -2190,13 +2490,9 @@ class RoleDerivationTests(unittest.TestCase):
         self.assertEqual(server._role({**chat, "reasoning": False}), "chat")
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class ThinkingGateTests(unittest.IsolatedAsyncioTestCase):
-    """think=true on a model without the capability is a hard 400 from Ollama.
-
-    The client retries without it, but the server must not send it in the first
-    place, or every such turn costs a wasted round trip.
-    """
+    """Send think=true only to models that report thinking support."""
 
     def _capture(self):
         seen = []
@@ -2236,14 +2532,9 @@ class ThinkingGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self._run_plain(profile, True))
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class MalformedCallGuardTests(unittest.IsolatedAsyncioTestCase):
-    """A tool call written into the reply and mangled beyond parsing.
-
-    Observed on llama3.2:3b: the run ended having done nothing, showing raw
-    JSON as the answer. The loop retries instead, on a budget of its own so a
-    model alternating good and mangled calls cannot retry without bound.
-    """
+    """Retry malformed reply-body calls with a bounded recovery budget."""
 
     async def _run(self, replies):
         samples = []
@@ -2296,7 +2587,7 @@ class MalformedCallGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(samples), 1)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class EmptyRoleTests(unittest.TestCase):
     """With nothing able to call tools, agentic mode has to say so."""
 
@@ -2325,7 +2616,7 @@ class EmptyRoleTests(unittest.TestCase):
         self.assertIn("Models", message)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class ModelApiTests(unittest.IsolatedAsyncioTestCase):
     """The endpoints the Models panel is built on."""
 
@@ -2541,13 +2832,9 @@ class ModelApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.status_code, 500)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class NoLegacyKeysTests(unittest.IsolatedAsyncioTestCase):
-    """Phase 5 removed the three translations that kept the old UI working.
-
-    Nothing should speak `general`, `reasoning`, `agent` or `coder` any more:
-    the model id is the key, end to end.
-    """
+    """Use model IDs throughout instead of the old role aliases."""
 
     async def test_health_returns_models_keyed_by_id(self):
         registry = {"m:7b": {"id": "m:7b", "label": "M", "tools": True, "think": True,
@@ -2585,14 +2872,9 @@ class NoLegacyKeysTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat["model_id"], config.DEFAULT_CODER_MODEL)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class RequestedRoleTests(unittest.TestCase):
-    """Which tab a turn came from cannot be inferred from the model.
-
-    A model assigned to both roles has one id for both, so inferring the role
-    from it turned every Chat message into an agentic run: wrong prompt, wrong
-    window, and the tool schemas attached. Caught by driving the real UI.
-    """
+    """Choose the role from the tab, since one model can serve both Chat and Agentic."""
 
     def test_the_request_decides_not_the_model(self):
         body = server.SendMessage(content="hi", model_key=config.DEFAULT_CHAT_MODEL, mode="chat")
@@ -2626,3 +2908,286 @@ class RequestedRoleTests(unittest.TestCase):
         body = server.ResubmitBody(content="hi", mode="chat")
 
         self.assertEqual(server._requested_role(body, {"mode": "agentic"}), "chat")
+
+
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
+class LoopTrustTests(unittest.IsolatedAsyncioTestCase):
+    META = {"id": "m", "keep_alive": "1m", "temperature": 0.7, "context": 32768, "think": True}
+    SETTINGS = {"agent_repeat_limit": 3, "role_context": {"agentic": 65536},
+                "shell_approval_mode": "never_ask"}
+
+    async def _run(self, fake_stream, chat, settings=None, effort="high", horizon=None, run_tool=None):
+        async def no_compact(chat_, model_key, emit=None, msgs=None):
+            return chat_, False
+
+        def read_result(name, arguments, *a, **k):
+            return json.dumps({"path": (arguments or {}).get("path"), "content": "x = 1"})
+
+        with (
+            patch.object(server.oc, "stream_chat", new=fake_stream),
+            patch.object(server, "_maybe_auto_compact", new=no_compact),
+            patch.object(server, "_advance_detail_horizon", new=horizon or (lambda *a, **k: False)),
+            patch.object(server.agent, "run_tool", side_effect=run_tool or read_result),
+            patch.object(server.st, "save_chat", side_effect=lambda v: v),
+            patch.object(server.st, "load_settings", return_value={**self.SETTINGS, **(settings or {})}),
+            patch.object(server.st, "history_index", return_value=""),
+            patch.object(server.st, "memory_as_prompt", return_value=""),
+        ):
+            return [e async for e in server._agent_loop(chat, self.META, "m", effort=effort, think=False)]
+
+    @staticmethod
+    def _read_call(path="a.py"):
+        return {"message": {"tool_calls": [{"function": {"name": "read_file", "arguments": {"path": path}}}]},
+                "done": True, "done_reason": "stop"}
+
+    async def test_a_thinking_model_thinks_on_every_step_even_with_the_chat_toggle_off(self):
+        seen = []
+
+        async def fake_stream(*a, **k):
+            seen.append(k.get("think"))
+            yield self._read_call(f"f{len(seen)}.py") if len(seen) < 3 else {
+                "message": {"content": "Done."}, "done": True, "done_reason": "stop"}
+
+        await self._run(fake_stream, {"id": "t", "project_id": None, "messages": [{"role": "user", "content": "Go."}]})
+        self.assertEqual(seen, [True, True, True])
+
+    async def test_low_effort_does_not_think(self):
+        seen = []
+
+        async def fake_stream(*a, **k):
+            seen.append(k.get("think"))
+            yield {"message": {"content": "Done."}, "done": True, "done_reason": "stop"}
+
+        await self._run(fake_stream, {"id": "t", "project_id": None, "messages": [{"role": "user", "content": "Go."}]}, effort="low")
+        self.assertEqual(seen, [False])
+
+    async def test_rereading_a_result_that_left_the_prompt_is_not_refused(self):
+        rounds = 0
+
+        async def fake_stream(*a, **k):
+            nonlocal rounds
+            rounds += 1
+            yield self._read_call() if rounds <= 3 else {
+                "message": {"content": "Done."}, "done": True, "done_reason": "stop"}
+
+        def horizon(chat, *a, **k):
+            # Before the third read, drop every earlier result from the render.
+            if rounds == 2:
+                chat["messages"].append({"role": "system", "kind": server.DETAIL_HORIZON_KIND})
+                return True
+            return False
+
+        chat = {"id": "r", "project_id": None, "messages": [{"role": "user", "content": "Go."}]}
+        await self._run(fake_stream, chat, horizon=horizon)
+        refused = [m for m in chat["messages"] if m.get("role") == "tool" and "already called" in m["content"]]
+        self.assertEqual(refused, [])
+
+    async def test_rereading_a_visible_result_is_still_refused(self):
+        rounds = 0
+
+        async def fake_stream(*a, **k):
+            nonlocal rounds
+            rounds += 1
+            yield self._read_call() if rounds <= 3 else {
+                "message": {"content": "Done."}, "done": True, "done_reason": "stop"}
+
+        chat = {"id": "r", "project_id": None, "messages": [{"role": "user", "content": "Go."}]}
+        await self._run(fake_stream, chat)
+        refused = [m for m in chat["messages"] if m.get("role") == "tool" and "already called" in m["content"]]
+        self.assertEqual(len(refused), 1)
+
+    async def test_the_tool_budget_ends_on_a_debrief_without_tools(self):
+        offered = []
+
+        async def fake_stream(*a, **k):
+            offered.append(k.get("tools") is not None)
+            if k.get("tools") and len(offered) < 10:
+                yield self._read_call(f"f{len(offered)}.py")
+            else:
+                yield {"message": {"content": "Fixed score; collision still open."}, "done": True, "done_reason": "stop"}
+
+        chat = {"id": "b", "project_id": None, "messages": [{"role": "user", "content": "Go."}]}
+        events = await self._run(fake_stream, chat, settings={"agent_tool_budget": 3})
+        self.assertEqual(offered, [True, True, True, False])
+        self.assertEqual(events[-1]["message"]["content"], "Fixed score; collision still open.")
+
+    async def test_calls_after_the_budget_are_not_run(self):
+        rounds = 0
+
+        async def fake_stream(*a, **k):
+            nonlocal rounds
+            rounds += 1
+            yield self._read_call(f"f{rounds}.py") if rounds < 10 else {
+                "message": {"content": "Done."}, "done": True, "done_reason": "stop"}
+
+        chat = {"id": "b", "project_id": None, "messages": [{"role": "user", "content": "Go."}]}
+        events = await self._run(fake_stream, chat, settings={"agent_tool_budget": 2})
+        self.assertEqual(sum(e["type"] == "tool_start" for e in events), 2)
+        self.assertIn("tool budget", events[-1]["message"]["content"])
+
+    def test_replay_keeps_the_real_file_body(self):
+        body = "int main() { return 0; }\n" * 200
+        chat = {"id": "w", "messages": [
+            {"role": "user", "content": "Write it."},
+            {"role": "assistant", "content": "", "tool_calls": [{"name": "write_file", "arguments": {"path": "a.cpp", "content": body}}]},
+            {"role": "tool", "name": "write_file", "content": '{"ok": true}'},
+        ]}
+        rendered = server._build_messages(chat, "agent")
+        call = next(m for m in rendered if m.get("tool_calls"))["tool_calls"][0]["function"]
+        self.assertEqual(call["arguments"]["content"], body)
+
+    async def test_failing_checks_bounce_the_debrief_at_most_three_times(self):
+        import tempfile
+        rounds = 0
+
+        async def fake_stream(*a, **k):
+            nonlocal rounds
+            rounds += 1
+            if rounds > 8:
+                raise AssertionError("verification kept bouncing the debrief")
+            yield {"message": {"content": "Done, fixed it."}, "done": True, "done_reason": "stop"}
+
+        class Review:
+            calls = 0
+
+            def finish(self, *a):
+                Review.calls += 1
+                return {"files": [{"file": "a.py", "after_hash": str(Review.calls)}]}
+
+        async def no_compact(chat_, model_key, emit=None, msgs=None):
+            return chat_, False
+
+        with tempfile.TemporaryDirectory() as folder:
+            chat = {"id": "v", "project_id": "p", "messages": [{"role": "user", "content": "Fix it."}]}
+            settings = {**self.SETTINGS, "language_servers": False, "repo_map_enabled": False}
+            with (
+                patch.object(server.oc, "stream_chat", new=fake_stream),
+                patch.object(server, "_maybe_auto_compact", new=no_compact),
+                patch.object(server.st, "get_project", return_value={"id": "p", "name": "p", "root": folder}),
+                patch.object(server.st, "save_chat", side_effect=lambda v: v),
+                patch.object(server.st, "load_settings", return_value=settings),
+                patch.object(server.project_commands, "discover", return_value=[]),
+                patch.object(server.project_commands, "applicable", return_value=[{"kind": "test", "timeout_sec": 5}]),
+                patch.object(server.project_commands, "shell_command", return_value="pytest"),
+                patch.object(server.agent, "run_tool", return_value='{"exit_code": 1}'),
+            ):
+                events = [e async for e in server._agent_loop_body(chat, self.META, "m", "high", review=Review())]
+        self.assertEqual(rounds, 4)
+        self.assertTrue(events[-1]["message"]["content"].startswith("This task is incomplete"))
+
+    async def test_a_thinking_step_gets_the_configured_reply_limit(self):
+        seen = []
+
+        async def fake_stream(model, msgs, **k):
+            seen.append((k.get("think"), k["options"], server.oc.estimate_messages_tokens(msgs)))
+            yield {"message": {"content": "Done."}, "done": True, "done_reason": "stop"}
+
+        await self._run(fake_stream, {"id": "t", "project_id": None, "messages": [{"role": "user", "content": "Go."}]},
+                        settings={"agent_thinking_reply_tokens": 12000})
+        think, options, prompt = seen[0]
+        self.assertTrue(think)
+        self.assertEqual(options["num_predict"], 12000)
+        self.assertLessEqual(prompt + options["num_predict"], options["num_ctx"])
+
+    async def test_a_small_window_caps_the_thinking_reply_inside_it(self):
+        seen = []
+
+        async def fake_stream(model, msgs, **k):
+            seen.append(k["options"])
+            yield {"message": {"content": "Done."}, "done": True, "done_reason": "stop"}
+
+        await self._run(fake_stream, {"id": "t", "mode": "agentic", "project_id": None, "messages": [{"role": "user", "content": "Go."}]},
+                        settings={"role_context": {"agentic": 16384}})
+        self.assertLess(seen[0]["num_predict"], seen[0]["num_ctx"])
+        self.assertLessEqual(seen[0]["num_ctx"], 16384)
+
+    async def test_a_cut_off_thought_is_carried_into_the_retry(self):
+        samples = []
+
+        async def fake_stream(model, msgs, **k):
+            samples.append({"think": k.get("think"), "prompt": "\n".join(m.get("content") or "" for m in msgs)})
+            if len(samples) == 1:
+                yield {"message": {"thinking": "The collision box uses the wrong y offset, so fix kDinoY in step()."},
+                       "done": True, "done_reason": "length", "eval_count": 24576}
+            else:
+                yield {"message": {"content": "Fixed the collision offset."}, "done": True, "done_reason": "stop"}
+
+        events = await self._run(fake_stream, {"id": "s", "project_id": None, "messages": [{"role": "user", "content": "Fix it."}]})
+        self.assertEqual(len(samples), 2)
+        self.assertFalse(samples[1]["think"])
+        self.assertIn("wrong y offset, so fix kDinoY", samples[1]["prompt"])
+        self.assertIn("Do not start over", samples[1]["prompt"])
+        self.assertEqual(events[-1]["message"]["content"], "Fixed the collision offset.")
+
+    def test_salvage_keeps_the_end_of_a_long_thought(self):
+        text = server._salvage_directive("OPENING-THOUGHT " + "x" * 50000 + " conclusion: edit step()")
+        self.assertIn("conclusion: edit step()", text)
+        self.assertNotIn("OPENING-THOUGHT", text)
+        self.assertLess(len(text), server.SALVAGE_CHARS + 1000)
+
+    async def _run_tools(self, script, results):
+        """Run the loop with scripted model replies and per-tool results."""
+        samples = []
+
+        async def fake_stream(model, msgs, **k):
+            samples.append("\n".join(m.get("content") or "" for m in msgs))
+            yield script[min(len(samples), len(script)) - 1]
+
+        def run_tool(name, arguments, *a, **k):
+            return json.dumps(results[name])
+
+        chat = {"id": "e", "project_id": None, "messages": [{"role": "user", "content": "Fix the cart."}]}
+        events = await self._run(fake_stream, chat, run_tool=run_tool)
+        return samples, events
+
+    @staticmethod
+    def _call(name, **arguments):
+        return {"message": {"tool_calls": [{"function": {"name": name, "arguments": arguments}}]}, "done": True, "done_reason": "stop"}
+
+    @staticmethod
+    def _say(text):
+        return {"message": {"content": text}, "done": True, "done_reason": "stop"}
+
+    async def test_an_unbacked_verified_claim_is_sent_back_once(self):
+        samples, events = await self._run_tools(
+            [self._call("edit_file", path="cart.js", find="a", replace="b"),
+             self._say("Fixed the cart and verified it."),
+             self._say("Fixed the cart. I did not run anything, so it is untested.")],
+            {"edit_file": {"ok": True, "changed": True}})
+        self.assertEqual(len(samples), 3)
+        self.assertIn("nothing has run since your last edit", samples[2])
+        final = events[-1]["message"]
+        self.assertEqual(final["model_content"], "Fixed the cart. I did not run anything, so it is untested.")
+        self.assertTrue(final["content"].startswith("**Olith's record of this run**\nNothing ran after the last change"))
+
+    async def test_a_second_unbacked_claim_is_labelled_not_looped(self):
+        samples, events = await self._run_tools(
+            [self._call("edit_file", path="cart.js", find="a", replace="b"), self._say("Verified, all tests pass.")],
+            {"edit_file": {"ok": True, "changed": True}})
+        self.assertEqual(len(samples), 3)
+        self.assertIn("Nothing ran after the last change", events[-1]["message"]["content"])
+
+    async def test_self_written_tests_are_labelled_as_such(self):
+        command = "cat > test_cart.py << 'EOF'\nassert True\nEOF\npython3 test_cart.py"
+        samples, events = await self._run_tools(
+            [self._call("edit_file", path="cart.js", find="a", replace="b"),
+             self._call("run_shell", command=command),
+             self._say("Fixed the cart; my new test_cart.py passes.")],
+            {"edit_file": {"ok": True, "changed": True}, "run_shell": {"exit_code": 0, "stdout": "", "stderr": ""}})
+        self.assertEqual(len(samples), 3)
+        self.assertIn("Only checked with tests Olith wrote during this run", events[-1]["message"]["content"])
+        self.assertIn("(written this run)", events[-1]["message"]["content"])
+
+    async def test_a_run_that_changed_nothing_gets_no_record(self):
+        samples, events = await self._run_tools([self._say("The cart already works; nothing to change.")], {})
+        self.assertEqual(events[-1]["message"]["content"], "The cart already works; nothing to change.")
+
+    def test_replay_uses_the_models_words_not_the_record(self):
+        chat = {"id": "r", "messages": [
+            {"role": "user", "content": "Fix it."},
+            {"role": "assistant", "content": "**Olith's record of this run**\nNothing ran.\n\nFixed it.", "model_content": "Fixed it."},
+            {"role": "user", "content": "Thanks."},
+        ]}
+        rendered = server._build_messages(chat, "agent")
+        self.assertNotIn("Olith's record", str(rendered))
+        self.assertIn("Fixed it.", str(rendered))

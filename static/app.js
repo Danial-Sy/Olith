@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Danial Syed
-// Prompt dock. Everything that parks a run on the user, shell approvals and
-// ask_user questions alike, lands in one bar above the composer.
-// One render path, and pollPendingPrompt() re-reads the open prompt from the
-// server so a dropped SSE frame self-heals instead of stranding the run.
+// Show questions and shell approvals above the composer.
+// Poll for open prompts so a missed stream event can be recovered.
 
 const promptQueue = [];        // [{ id, kind, chatId, event, answers, page }]
 let promptActive = 0;          // which queued prompt is on screen
@@ -58,12 +56,12 @@ function renderPromptDock() {
   if (!promptQueue.length) {
     host.hidden = true;
     host.innerHTML = "";
-    document.title = "Aether";
+    document.title = "Olith";
     return;
   }
   const prompt = promptQueue[Math.min(promptActive, promptQueue.length - 1)];
   host.hidden = false;
-  document.title = "● Needs you · Aether";
+  document.title = "● Needs you · Olith";
   host.innerHTML = "";
   host.appendChild(
     prompt.kind === "shell_approval" ? shellApprovalBody(prompt) : askUserBody(prompt)
@@ -92,9 +90,20 @@ function promptPager(prompt) {
   return bar;
 }
 
+function syncApprovalModeUI() {
+  $("#fullAccessWarning").hidden = $("#setShellApproval").value !== "full_access";
+  $("#fullAccessIndicator").hidden = state.settings.approval_mode !== "full_access";
+}
+
 function shellApprovalBody(prompt) {
   const ev = prompt.event;
   const binary = ev.binary || "";
+  // Repository changes ask every time, so there is nothing to remember.
+  const remember = ev.rememberable === false ? "" : `
+      <label class="approval-remember">
+        <input type="checkbox" class="approval-always" />
+        <span>Always allow${binary ? ` <code>${escapeHtml(binary)}</code>` : " this command"}</span>
+      </label>`;
   const wrap = document.createElement("div");
   wrap.className = "prompt-body";
   wrap.innerHTML = `
@@ -102,11 +111,7 @@ function shellApprovalBody(prompt) {
     <pre class="approval-cmd"></pre>
     <div class="approval-actions">
       <button type="button" class="approval-run">Run</button>
-      <button type="button" class="approval-deny">Deny</button>
-      <label class="approval-remember">
-        <input type="checkbox" class="approval-always" />
-        <span>Always allow${binary ? ` <code>${escapeHtml(binary)}</code>` : " this command"}</span>
-      </label>
+      <button type="button" class="approval-deny">Deny</button>${remember}
     </div>`;
   wrap.querySelector(".approval-cmd").textContent = ev.command || "";
   const send = (approved) => {
@@ -131,8 +136,7 @@ function askUserBody(prompt) {
     return Array.isArray(v) ? v.length > 0 : !!(v && String(v).trim());
   };
 
-  // One question at a time with a tab strip, so a four-part ask stays readable
-  // in a bar this size instead of pushing the composer off screen.
+  // Show multi-part questions in tabs to keep the composer visible.
   const tabs = document.createElement("div");
   tabs.className = "ask-tabs";
   if (qs.length > 1) {
@@ -149,7 +153,7 @@ function askUserBody(prompt) {
   const q = qs[Math.min(prompt.page, Math.max(0, qs.length - 1))] || {};
   const block = document.createElement("div");
   block.className = "ask-q";
-  block.innerHTML = `<div class="ask-qtext">${escapeHtml(q.question || "Aether needs a decision")}</div>`;
+  block.innerHTML = `<div class="ask-qtext">${escapeHtml(q.question || "Olith needs a decision")}</div>`;
 
   const opts = document.createElement("div");
   opts.className = "ask-opts";
@@ -251,12 +255,10 @@ const state = {
   reasoning: false, // the chat model with thinking forced on
   warmedKey: null, // last model id confirmed resident in VRAM
   think: false, // off by default for snappy chat; toggle in model menu
-  // Reasoning effort. null = follow the model's own default (see /api/health),
-  // so the reasoning model lands on "medium" instead of over-thinking on high.
+  // Reasoning effort: null follows the model's default from /api/health.
   effort: null,
   effortLevels: ["low", "medium", "high"],
-  // Whether a tier thinks depends on the model, so the slider's descriptions
-  // are per model rather than global.
+  // Use per-model effort descriptions to show whether thinking is available.
   effortByModel: {},
   thinkingByModel: {},
   effortMeta: {},
@@ -306,7 +308,7 @@ const CTX_LABELS = {
   131072: "128K", 262144: "256K",
 };
 
-/** One window control per role, since the window belongs to the job. */
+/** Show a context limit for each role. */
 function renderRoleContextSelects() {
   const roleCtx = state.settings.role_context || {};
   $$("select[data-role]").forEach((sel) => {
@@ -599,7 +601,7 @@ async function compactNow() {
               role: "assistant",
               content:
                 "Conversation compacted to free context. Earlier details stay available for this chat.",
-              model: "aether",
+              model: "olith",
               compact_notice: true,
             },
             ...ev.messages,
@@ -686,16 +688,8 @@ function daypart() {
 }
 
 
-const STATUS_WORDS = {
-  morning: ["Brewing", "Rising", "Warming", "Gathering", "Focusing"],
-  afternoon: ["Composing", "Charting", "Weaving", "Shaping", "Aligning"],
-  evening: ["Softening", "Tuning", "Glowing", "Settling", "Crafting"],
-  late: ["Orbiting", "Humming", "Drifting", "Sparking", "Crystallizing"],
-};
-
 function pickStatusWord() {
-  const bucket = STATUS_WORDS[daypart()] || STATUS_WORDS.afternoon;
-  return `${bucket[Math.floor(Math.random() * bucket.length)]}...`;
+  return isAgenticMode() ? "Working…" : "Thinking…";
 }
 
 function pickTagline() {
@@ -779,9 +773,7 @@ function syncThinkToggle() {
     chip.hidden = !showChip;
   }
 
-  // Effort is a slider three menus deep, and it changes how long every reply
-  // takes. Naming the tier beside the model means the composer says what the
-  // next message will cost before it is sent.
+  // Show the effort tier beside the model so it is visible before sending.
   const eChip = $("#effortChip");
   if (eChip) {
     const active = currentEffort();
@@ -792,7 +784,7 @@ function syncThinkToggle() {
 }
 
 
-/** A model's display record, or a usable stand-in for one we have not met. */
+/** Return model details, with a fallback for unknown models. */
 function modelMeta(id) {
   return state.modelsById[id] || (id ? { id, label: id, roles: [], can: {} } : null);
 }
@@ -847,17 +839,38 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-/** Vector Aether ring built from a conic gradient. Scales cleanly at any size. */
-function ringMarkup() {
-  return `<span class="ring-spin" aria-hidden="true"><span class="ring-disc"></span></span>`;
+/** Use the transparent logo and animate only the glow behind it. */
+function markMarkup() {
+  return `<span class="mark-glow" aria-hidden="true"></span><span class="mark-artwork" aria-hidden="true">
+    <img class="mark-glyph" src="/static/assets/olith-mark.svg" alt="" draggable="false" />
+  </span>`;
 }
 
-function fillRings(root) {
-  (root || document).querySelectorAll(".aether-ring:not([data-svg]), .brand-mark:not([data-svg])").forEach((el) => {
-    el.innerHTML = ringMarkup();
+function fillMarks(root) {
+  (root || document).querySelectorAll(".olith-mark:not([data-svg]), .brand-mark:not([data-svg])").forEach((el) => {
+    el.innerHTML = markMarkup();
     el.dataset.svg = "1";
   });
 }
+
+function setMarkWorking(mark, working) {
+  if (!mark || mark.classList.contains("is-working") === working) return;
+  const glow = mark.querySelector(".mark-glow");
+  const restingFrom = !working && glow ? getComputedStyle(glow).opacity : "0";
+  if (glow) glow.getAnimations().forEach((animation) => animation.cancel());
+  mark.classList.toggle("is-working", working);
+  mark.classList.toggle("idle", !working);
+  if (!working && glow && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    glow.animate([{ opacity: restingFrom }, { opacity: 0 }], {
+      duration: 500,
+      easing: "cubic-bezier(0.2, 0.7, 0.25, 1)",
+    });
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  document.body.classList.toggle("motion-paused", document.hidden);
+});
 
 function renderMath(el) {
   if (!el || typeof window.renderMathInElement !== "function") return;
@@ -1011,10 +1024,8 @@ function showCompact(show) {
 
 function currentModelKey(mode = state.mode) {
   if (isAgenticMode(mode)) {
-    // Computer use needs eyes. The chat's own pick keeps the job whenever it
-    // has them; only a blind pick is routed elsewhere. Always taking
-    // state.visionModel is what pinned the feature to one model no matter what
-    // the picker said.
+    // Keep the selected model for computer use if it supports vision.
+    // Otherwise choose an available vision model.
     if (state.computerUse && !modelMeta(state.agentModel)?.vision) {
       return state.visionModel || state.agentModel;
     }
@@ -1023,7 +1034,7 @@ function currentModelKey(mode = state.mode) {
   return state.chatModel;
 }
 
-/** Every installed model that can drive the desktop: eyes plus tool calling. */
+/** List models with vision and tool calling for computer use. */
 function visionModels() {
   return (state.registry?.roles?.vision) || (state.visionModel ? [state.visionModel] : []);
 }
@@ -1098,8 +1109,7 @@ function renderModelOptions(role, host, selected) {
   return models;
 }
 
-// A long model list buries the Cancel button, so the dialog opens on the few
-// most likely picks and keeps the rest behind Show more.
+// Show likely model choices first and keep the full list behind Show more.
 const PICK_VISIBLE = 4;
 
 /** Why the loaded model cannot follow you into this tab. */
@@ -1108,15 +1118,15 @@ function pickNote(role, blocked) {
   const label = meta ? meta.label || blocked : "";
   if (!label) {
     return role === "agentic"
-      ? "Pick the model to run Agentic on. Aether loads it and leaves it warm."
-      : "Pick the model to chat with. Aether loads it and leaves it warm.";
+      ? "Pick the model to run Agentic on. Olith loads it and leaves it warm."
+      : "Pick the model to chat with. Olith loads it and leaves it warm.";
   }
   if (role === "agentic") {
     return meta.can?.agentic
-      ? `${label} is loaded but is not assigned to Agentic. Pick one that is and Aether will warm it for you.`
-      : `${label} is loaded, but it has no tool calling, so it cannot run Agentic. Pick a model that does and Aether will warm it for you.`;
+      ? `${label} is loaded but is not assigned to Agentic. Pick one that is and Olith will warm it for you.`
+      : `${label} is loaded, but it has no tool calling, so it cannot run Agentic. Pick a model that does and Olith will warm it for you.`;
   }
-  return `${label} is loaded but is not assigned to Chat. Pick a model that is and Aether will warm it for you.`;
+  return `${label} is loaded but is not assigned to Chat. Pick a model that is and Olith will warm it for you.`;
 }
 
 /** Choose the model a tab switch should warm. Resolves to an id, or null when
@@ -1214,8 +1224,8 @@ function syncModelPicker() {
           : !grounded
             ? `Runs on ${runsOnLabel}. Install Qwen3-VL from Models for accurate aiming.`
             : modelMeta(state.agentModel)?.vision
-              ? "Aether clicks and types on your screen"
-              : `Aether clicks and types on your screen (runs on ${runsOnLabel})`;
+              ? "Olith clicks and types on your screen"
+              : `Olith clicks and types on your screen (runs on ${runsOnLabel})`;
     }
   }
   const cuChip = $("#computerChip");
@@ -1229,7 +1239,7 @@ function showModelWarm(show, label) {
   el.hidden = !show;
   const t = $("#modelWarmTitle");
   if (t) t.textContent = label ? `Warming ${label}…` : "Warming model…";
-  if (show) fillRings(el);
+  if (show) fillMarks(el);
 }
 
 // Ollama may already hold a model from an earlier run, so ask the server what
@@ -1295,9 +1305,7 @@ function servesRole(id, role) {
   return !!id && (modelMeta(id)?.roles || []).includes(role);
 }
 
-/** Reconcile the model we think is warm with what Ollama actually holds, and
- *  report that list. Ollama unloads on its own, and another window may have
- *  loaded something else since. */
+/** Refresh the list of models Ollama currently has loaded. */
 async function syncWarmedKey() {
   const loaded = await residentModels();
   if (state.warmedKey && !loaded.includes(state.warmedKey)) state.warmedKey = null;
@@ -1305,13 +1313,8 @@ async function syncWarmedKey() {
   return loaded;
 }
 
-/** The model a tab switch should end up on, or null when the user backs out.
- *
- * Switching tabs is not a reason to change models: whatever is already in VRAM
- * carries over when it can serve the tab, so the switch costs nothing. Only a
- * model that cannot serve it, with no tool calling for Agentic or unassigned
- * to the tab, forces a load, and then what to load is the user's choice.
- */
+/** Choose a model for the tab, keeping a loaded compatible model when possible.
+ * Return null if the user cancels. */
 async function modelForTab(role) {
   const loaded = await syncWarmedKey();
   // Both models can be resident at once, so prefer the one that fits the tab.
@@ -1370,9 +1373,8 @@ async function selectModel(key) {
   // asking again; the overlay already says what is loading.
   const ok = await ensureModelWarm(key, { confirm: false });
   if (!ok) return;
-  // Chat and Agentic are separate transcripts, so crossing that line starts a
-  // new one. Swapping models within a tab must not: being forced into a fresh
-  // conversation is how a pick got reverted to the default on the way out.
+  // Start a new chat when switching between Chat and Agentic.
+  // Keep the current chat when changing models within the same tab.
   const crossesTab = false;
   if (isAgenticMode()) {
     state.mode = "agentic";
@@ -1542,9 +1544,9 @@ function renderAttachChips() {
 }
 
 try {
-  const savedEffort = localStorage.getItem("aether.effort");
+  const savedEffort = localStorage.getItem("olith.effort");
   if (savedEffort) state.effort = savedEffort;
-  state.think = localStorage.getItem("aether.think") === "1";
+  state.think = localStorage.getItem("olith.think") === "1";
 } catch (_) {}
 
 async function loadHealth() {
@@ -1569,10 +1571,15 @@ async function loadHealth() {
   if ($("#setUnrestrictedFs")) $("#setUnrestrictedFs").checked = !!state.settings.unrestricted_fs;
   if ($("#setShellApproval")) {
     $("#setShellApproval").value =
-      state.settings.shell_approval_mode ||
+      (state.settings.approval_mode === "full_access" ? "full_access" : state.settings.shell_approval_mode) ||
       (state.settings.confirm_shell_commands === false ? "never_ask" : "always_ask");
+    syncApprovalModeUI();
   }
   $("#setAgentRepeatLimit").value = state.settings.agent_repeat_limit || 3;
+  $("#setRepoMap").checked = state.settings.repo_map_enabled !== false;
+  $("#setSemantic").checked = !!state.settings.semantic_search;
+  $("#setEmbeddingModel").value = state.settings.embedding_model || "nomic-embed-text";
+  $("#setEmbeddingDevice").value = state.settings.embedding_device || "cpu";
   renderRoleContextSelects();
   state.webSearch = !!state.settings.web_search_default;
   syncWebSearchUI();
@@ -1652,9 +1659,8 @@ async function openChat(id) {
   const chat = await api(`/api/chats/${id}`);
   const nextMode = normalizeMode(chat.mode || "chat");
   const nextComputer = !!(chat.computer_use || chat.mode === "computer");
-  // Chats saved before hybrid was removed fall back to the executor. A chat with
-  // no agent_model at all carries no opinion, so the picker's current selection
-  // stands. Overwriting it here is what reverted an explicit pick on a new chat.
+  // Migrate older hybrid chats to the executor. For new chats with no saved
+  // agent model, keep the picker's selection.
   if (chat.model_id && state.modelsById[chat.model_id]) {
     state.agentModel = chat.model_id;
   }
@@ -1716,9 +1722,7 @@ function renderAgentTodos(todos) {
   const finished =
     items.length > 0 &&
     items.every((t) => t.status === "completed" || t.status === "cancelled");
-  // Keep a finished plan up while the run is still going so the last item is
-  // visibly ticked off, then clear it. A completed plan from an old job is
-  // stale UI, and it used to reappear on every reopen.
+  // Keep the completed plan visible until the run ends, then clear it.
   if (!items.length || state.mode !== "agentic" || state.computerUse ||
       (finished && !state.streaming)) {
     panel.hidden = true;
@@ -1872,18 +1876,18 @@ function appendMessage(m, { streaming } = {}) {
   } else if (role === "tool") {
     if ((m.name || "") === "todo_write") return null;
     el.classList.add("is-done");
-    el.innerHTML = `<div class="asst-head"><div class="aether-ring idle" aria-hidden="true"></div></div>
+    el.innerHTML = `<div class="asst-head"><div class="olith-mark idle" aria-hidden="true"></div></div>
       <div class="bubble"><div class="tool-card"><div class="name">${escapeHtml(m.name || "tool")}</div><pre>${escapeHtml(String(m.content || "").slice(0, 4000))}</pre></div></div>`;
   } else {
     const status = streaming ? pickStatusWord() : "";
-    const ringClass = streaming ? "aether-ring spin" : "aether-ring idle";
+    const markClass = streaming ? "olith-mark is-working" : "olith-mark idle";
     if (!streaming) el.classList.add("is-done");
     const copyBar = (!streaming && !m.compact_notice)
       ? `<div class="asst-copy-bar"><button type="button" class="asst-copy-btn" title="Copy response">Copy</button></div>`
       : "";
     el.innerHTML = `
       <div class="asst-head">
-        <div class="${ringClass}" aria-hidden="true"></div>
+        <div class="${markClass}" aria-hidden="true"></div>
         <span class="status-word"${streaming ? "" : " hidden"}>${escapeHtml(status)}</span>
       </div>
       <div class="bubble">
@@ -1898,7 +1902,7 @@ function appendMessage(m, { streaming } = {}) {
     if (tb && m.thinking) tb.textContent = m.thinking;
   }
 
-  fillRings(el);
+  fillMarks(el);
   wireMsgActions(el, m, role);
   el.querySelectorAll("img.att-thumb").forEach((img) => {
     img.onclick = () => openLightbox(img.dataset.full || img.src);
@@ -1910,10 +1914,12 @@ function appendMessage(m, { streaming } = {}) {
 
 function updateStreamingEl(el, { content, thinking }) {
   if (!el) return;
+  const chatArea = $("#chatArea");
+  const followStream = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 80;
   const bubble = el.querySelector(".bubble");
   const contentEl = el.querySelector(".content");
   const status = el.querySelector(".status-word");
-  const ring = el.querySelector(".aether-ring");
+  const mark = el.querySelector(".olith-mark");
   const hasContent = !!(content && String(content).trim());
 
   // Surgical DOM updates. Rebuilding the whole bubble flickers.
@@ -1937,14 +1943,9 @@ function updateStreamingEl(el, { content, thinking }) {
   }
 
   if (hasContent) {
-    el.classList.add("is-done"); // Claude layout as soon as text appears
+    el.classList.add("is-done"); // Keep the response in its final reading column.
     if (status) status.hidden = true;
-    if (ring) {
-      ring.classList.remove("spin");
-      ring.classList.add("idle");
-      const spinEl = ring.querySelector(".ring-spin");
-      if (spinEl) spinEl.style.transform = "";
-    }
+    setMarkWorking(mark, true);
     if (contentEl) {
       el.dataset.raw = content || "";
       fillContent(contentEl, content, { streaming: true });
@@ -1962,12 +1963,9 @@ function updateStreamingEl(el, { content, thinking }) {
   } else {
     el.classList.remove("is-done");
     if (status) status.hidden = false;
-    if (ring) {
-      ring.classList.add("spin");
-      ring.classList.remove("idle");
-    }
+    setMarkWorking(mark, true);
   }
-  $("#chatArea").scrollTop = $("#chatArea").scrollHeight;
+  if (followStream) chatArea.scrollTop = chatArea.scrollHeight;
 }
 
 function newChatBody() {
@@ -2015,6 +2013,11 @@ function finishStreamingUI() {
   showCompact(false);
   document.querySelectorAll(".content.streaming").forEach((n) => n.classList.remove("streaming"));
   document.querySelectorAll(".thinking[data-live]").forEach((n) => n.removeAttribute("data-live"));
+  document.querySelectorAll(".msg[data-streaming]").forEach((el) => {
+    el.removeAttribute("data-streaming");
+    const mark = el.querySelector(".olith-mark");
+    setMarkWorking(mark, false);
+  });
 }
 
 async function stopMessage() {
@@ -2210,7 +2213,7 @@ function handleSSE(ev, streamEl) {
       const notice = {
         role: "assistant",
         content: "Conversation compacted to free context. Earlier details stay available for this chat.",
-        model: "aether",
+        model: "olith",
         compact_notice: true,
       };
       renderMessages([notice, ...ev.messages]);
@@ -2251,11 +2254,8 @@ function handleSSE(ev, streamEl) {
         status.hidden = false;
         status.textContent = "Working…";
       }
-      const ring = streamEl.querySelector(".aether-ring");
-      if (ring) {
-        ring.classList.add("spin");
-        ring.classList.remove("idle");
-      }
+      const mark = streamEl.querySelector(".olith-mark");
+      setMarkWorking(mark, true);
     }
   } else if (ev.type === "message") {
     const msg = ev.message || {};
@@ -2279,20 +2279,28 @@ function handleSSE(ev, streamEl) {
     if (streamEl && streamEl.isConnected) {
       streamEl.removeAttribute("data-streaming");
       streamEl.classList.add("is-done");
-      const ring = streamEl.querySelector(".aether-ring");
+      const mark = streamEl.querySelector(".olith-mark");
       const status = streamEl.querySelector(".status-word");
-      if (ring) {
-        ring.classList.remove("spin");
-        ring.classList.add("idle");
-        const spinEl = ring.querySelector(".ring-spin");
-        if (spinEl) spinEl.style.transform = "";
-      }
+      setMarkWorking(mark, false);
       if (status) status.hidden = true;
       streamEl.querySelector(".content")?.classList.remove("streaming");
       const liveThink = streamEl.querySelector("details.thinking");
       if (liveThink) liveThink.removeAttribute("data-live");
-      streamEl.remove();
-      appendMessage(msg);
+      // Settle the existing response in place: no second entrance animation,
+      // lost thought disclosure state, or scroll jump at completion.
+      streamEl.dataset.mid = msg.id || "";
+      streamEl.dataset.raw = msg.content || "";
+      fillContent(streamEl.querySelector(".content"), msg.content || "");
+      const bubble = streamEl.querySelector(".bubble");
+      if (!bubble.querySelector(".thinking") && msg.thinking) {
+        bubble.insertAdjacentHTML("afterbegin", thinkingHtml(msg.thinking));
+      }
+      const thoughtBody = bubble.querySelector(".think-body");
+      if (thoughtBody && msg.thinking) thoughtBody.textContent = msg.thinking;
+      if (!msg.compact_notice && !bubble.querySelector(".asst-copy-bar")) {
+        bubble.insertAdjacentHTML("beforeend", '<div class="asst-copy-bar"><button type="button" class="asst-copy-btn" title="Copy response">Copy</button></div>');
+      }
+      wireMsgActions(streamEl, msg, "assistant");
     } else {
       appendMessage(msg);
     }
@@ -2319,6 +2327,10 @@ function handleSSE(ev, streamEl) {
     const done = Number(ev.done || 0);
     const total = Number(ev.total || 0);
     if (total) setStatus(open ? `Plan ${done}/${total}` : `Plan complete (${total})`);
+  } else if (ev.type === "change_review") {
+    $("#btnTaskChanges").textContent = ev.error ? "Task review needs attention" : `Review task changes (${ev.files || 0})`;
+  } else if (ev.type === "verification") {
+    setStatus(`Project checks · ${ev.passed || 0} passed · ${ev.failed || 0} failed · ${ev.skipped || 0} awaiting approval`);
   } else if (ev.type === "project_tree") {
     if (ev.project_id && $("#projectSelect").value === ev.project_id) {
       loadProjectTree(ev.project_id);
@@ -2366,11 +2378,8 @@ function handleSSE(ev, streamEl) {
         status.hidden = false;
         status.textContent = "Stopped";
       }
-      const ring = streamEl.querySelector(".aether-ring");
-      if (ring) {
-        ring.classList.remove("spin");
-        ring.classList.add("idle");
-      }
+      const mark = streamEl.querySelector(".olith-mark");
+      setMarkWorking(mark, false);
     }
     return null;
   } else if (ev.type === "error") {
@@ -2394,60 +2403,299 @@ async function newChat() {
   $("#input").focus();
 }
 
+async function selectProject(pid) {
+  const select = $("#projectSelect"), previous = state.selectedProject || "";
+  if (state.streaming) { select.value = previous; setStatus("Finish or stop the current task before switching projects."); return; }
+  try {
+    if (state.chatId) await api(`/api/chats/${state.chatId}`, {method: "PATCH", body: JSON.stringify({project_id: pid || null})});
+    select.value = pid || "";
+    await loadProjectTree(pid);
+  } catch (error) { select.value = previous; setStatus(error.message); }
+}
+
 async function loadProjects() {
   state.projects = await api("/api/projects");
-  const list = $("#projectList");
-  const sel = $("#projectSelect");
-  list.innerHTML = "";
-  sel.innerHTML = `<option value="">No project</option>`;
-  state.projects.forEach((p) => {
-    const b = document.createElement("div");
-    b.className = "project-item";
-    b.tabIndex = 0;
-    b.dataset.id = p.id;
-    if ($("#projectSelect").value === p.id) b.classList.add("active");
-    b.innerHTML = `<div class="row"><div class="t"><span class="folder-ico" aria-hidden="true">📁</span><span class="name">${escapeHtml(p.name)}</span></div>
-      <div class="item-actions">
-        <button type="button" class="ren" title="Rename">✎</button>
-        <button type="button" class="del" title="Delete">✕</button>
-      </div></div>
-      <div class="p">${escapeHtml(p.root)}</div>`;
-    b.onclick = async (e) => {
-      if (e.target.closest(".item-actions")) return;
-      sel.value = p.id;
-      $$(".project-item").forEach((el) => el.classList.toggle("active", el.dataset.id === p.id));
-      await loadProjectTree(p.id);
-      if (state.chatId) {
-        await api(`/api/chats/${state.chatId}`, { method: "PATCH", body: JSON.stringify({ project_id: p.id }) });
-      }
-    };
-    b.querySelector(".ren").onclick = async (e) => {
-      e.stopPropagation();
-      const name = await promptEdit({ title: "Rename project", label: "Name", value: p.name, multiline: false });
+  renderProjects();
+  if (typeof refreshWorkspaceStatus === "function") refreshWorkspaceStatus().catch(error => setStatus(error.message));
+}
+
+let projectHome = "";
+function syncProjectSetup() {
+  const creating = $("#projectSetup").value === "create";
+  $("#projectDialogTitle").textContent = creating ? "Create project" : "Add existing folder";
+  $("#btnProjectOk").textContent = creating ? "Create project" : "Add project";
+  $("#projectExistingFolder").hidden = creating;
+  $("#projectRootInput").disabled = creating;
+  $("#projectRootInput").required = !creating;
+  $("#btnBrowseProject").disabled = creating;
+  const name = document.querySelector('#projectDialogForm input[name="name"]').value.trim();
+  $("#projectLocation").textContent = creating
+    ? (projectHome ? `New folder: ${projectHome}${projectHome.includes("\\") ? "\\" : "/"}${name || "My Project"}` : "Loading Olith folder…")
+    : "Choose a folder already on this computer.";
+  $("#projectError").hidden = true;
+}
+
+async function openProjectDialog() {
+  $("#projectDialogForm").reset();
+  projectHome = "";
+  syncProjectSetup();
+  $("#btnProjectOk").disabled = false;
+  $("#projectDialog").showModal();
+  try {
+    projectHome = (await api("/api/project-location")).root;
+    syncProjectSetup();
+  } catch (error) {
+    $("#projectLocation").textContent = "New projects are saved in your Olith folder.";
+  }
+}
+
+function renderProjects() {
+  const list = $("#projectList"), sel = $("#projectSelect"), selected = sel.value;
+  const query = ($("#projectSearch")?.value || "").trim().toLowerCase();
+  list.replaceChildren();
+  sel.replaceChildren(new Option("Choose a project", ""), ...state.projects.map(project => new Option(project.name, project.id)));
+  sel.value = state.projects.some(project => project.id === selected) ? selected : "";
+  $("#projectCount").textContent = state.projects.length;
+  state.projects.filter(project => `${project.name} ${project.root}`.toLowerCase().includes(query)).forEach(p => {
+    const card = document.createElement("article"); card.className = "project-item"; card.dataset.id = p.id;
+    card.classList.toggle("active", sel.value === p.id);
+    card.innerHTML = `<div class="project-card-top"><button class="project-open" type="button" aria-pressed="${sel.value === p.id}"><svg class="project-folder" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 7V5h7l2 2h9v12H3z"/></svg><span class="name">${escapeHtml(p.name)}</span></button><details class="project-tools"><summary aria-label="Actions for ${escapeHtml(p.name)}">···</summary><div class="item-actions"><button type="button" class="index" aria-label="Code index">Code index</button><button type="button" class="checks" aria-label="Checks">Checks</button><button type="button" class="git" aria-label="Git">Git</button><button type="button" class="ren" aria-label="Rename">Rename</button><button type="button" class="del" aria-label="Remove">Remove</button></div></details></div><div class="p">${escapeHtml(p.root)}</div><div class="project-link-badges"><span class="project-repo">Checking repository…</span><span class="project-editor">Checking editor…</span></div>`;
+    card.querySelector(".p").title = p.root;
+    card.querySelector(".project-open").onclick = () => selectProject(p.id);
+    card.querySelector(".index").onclick = () => openProjectIndex(p);
+    card.querySelector(".checks").onclick = () => openProjectCommands(p);
+    card.querySelector(".git").onclick = () => openProjectGit(p);
+    card.querySelector(".ren").onclick = async () => {
+      const name = await promptEdit({title: "Rename project", label: "Name", value: p.name, multiline: false});
       if (!name) return;
-      await api(`/api/projects/${p.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
-      await loadProjects();
+      await api(`/api/projects/${p.id}`, {method: "PATCH", body: JSON.stringify({name})}); await loadProjects();
     };
-    b.querySelector(".del").onclick = async (e) => {
-      e.stopPropagation();
-      const ok = await confirmAction({
-        title: "Delete project?",
-        body: `Remove project “${p.name}”? Chats stay; only the project link is deleted.`,
-        ok: "Delete project",
-      });
-      if (!ok) return;
-      await api(`/api/projects/${p.id}`, { method: "DELETE" });
-      await loadProjects();
+    card.querySelector(".del").onclick = async () => {
+      if (!await confirmAction({title: "Remove project?", body: `Remove “${p.name}” from Olith? Its files and chats stay on this computer.`, ok: "Remove project"})) return;
+      await api(`/api/projects/${p.id}`, {method: "DELETE"}); await loadProjects();
+      if (state.selectedProject === p.id) await loadProjectTree(null);
     };
-    list.appendChild(b);
-    const opt = document.createElement("option");
-    opt.value = p.id;
-    opt.textContent = p.name;
-    sel.appendChild(opt);
+    list.append(card);
   });
+  if (!list.children.length) { const empty = document.createElement("p"); empty.className = "workspace-empty"; empty.textContent = query ? "No matching projects." : "Add a local folder to get started."; list.append(empty); }
+  if (typeof renderWorkspaceLinks === "function") renderWorkspaceLinks();
+}
+
+async function openProjectCommands(project) {
+  const dialog = $("#commandsDialog");
+  $("#commandsTitle").textContent = `${project.name} · Checks`;
+  $("#commandStatus").textContent = "Discovering project commands…";
+  $("#commandRows").replaceChildren();
+  dialog.showModal();
+  $("#btnCloseCommands").onclick = () => dialog.close();
+  let rows = [];
+  const render = () => {
+    const container = $("#commandRows");
+    container.replaceChildren();
+    if (!rows.length) $("#commandStatus").textContent = "No test, build, or type-check commands found yet. Olith checks again when project files change.";
+    rows.forEach((entry) => {
+      const row = document.createElement("div");
+      row.className = "command-row";
+      row.innerHTML = `<label class="field"><span>Check</span><select class="command-kind"><option value="test">Tests</option><option value="build">Build</option><option value="typecheck">Type check</option></select></label>
+        <label class="field"><span>Command</span><input class="command-text" spellcheck="false" /></label>
+        <label class="field"><span>Folder relative to project</span><input class="command-cwd" spellcheck="false" /></label>
+        <label class="field check"><span>Run automatically</span><input class="command-enabled" type="checkbox" /></label><p class="ctx-hint command-evidence"></p>`;
+      const bind = (selector, key, value) => {
+        const element = row.querySelector(selector);
+        if (key === "enabled") element.checked = value !== false;
+        else element.value = value || "";
+        element.oninput = element.onchange = () => { entry[key] = key === "enabled" ? element.checked : element.value; entry.source = "manual"; };
+      };
+      bind(".command-kind", "kind", entry.kind);
+      bind(".command-text", "command", entry.command);
+      bind(".command-cwd", "cwd", entry.cwd || ".");
+      bind(".command-enabled", "enabled", entry.enabled);
+      row.querySelector(".command-evidence").textContent = `${entry.source} · ${entry.evidence || "New override"}`;
+      container.appendChild(row);
+    });
+  };
+  const save = async (commands) => {
+    try {
+      const result = await api(`/api/projects/${project.id}/commands`, { method: "PUT", body: JSON.stringify({ commands }) });
+      rows = result.commands || [];
+      $("#commandStatus").textContent = "Saved. Olith will use these checks on the next task.";
+      render();
+    } catch (error) { $("#commandStatus").textContent = error.message; }
+  };
+  $("#btnAddCommand").onclick = () => { rows.push({ kind: "test", command: "", cwd: ".", source: "manual", enabled: true }); render(); };
+  $("#btnSaveCommands").onclick = () => save(rows.filter((entry) => entry.source === "manual"));
+  $("#btnResetCommands").onclick = () => save([]);
+  try {
+    rows = (await api(`/api/projects/${project.id}/commands`)).commands || [];
+    $("#commandStatus").textContent = "Discovered commands are saved automatically.";
+    render();
+  } catch (error) { $("#commandStatus").textContent = error.message; }
+}
+
+async function openTaskChanges() {
+  if (!state.chatId) { setStatus("Open a project chat to review its task changes."); return; }
+  const cid = state.chatId;
+  const dialog = $("#changesDialog");
+  $("#changeRows").replaceChildren();
+  $("#changesStatus").textContent = "Loading task review…";
+  dialog.showModal();
+  $("#btnCloseChanges").onclick = () => dialog.close();
+  let review = null;
+  const render = (result) => {
+    review = result;
+    const container = $("#changeRows");
+    container.replaceChildren();
+    $("#changesStatus").textContent = `${result.files.length} changed ${result.files.length === 1 ? "file" : "files"}${result.partial ? " · Snapshot coverage is partial" : ""}`;
+    if (result.verification) {
+      const checks = document.createElement("div");
+      for (const check of result.verification.commands || []) {
+        const line = document.createElement("p");
+        line.className = "ctx-hint";
+        line.textContent = `${check.status === "needs_approval" ? "Awaiting approval" : check.result?.exit_code === 0 ? "Passed" : "Failed"}: ${check.command}`;
+        checks.appendChild(line);
+      }
+      for (const report of result.verification.language_servers || []) {
+        const line = document.createElement("p");
+        line.className = "ctx-hint";
+        line.textContent = `${report.file}: ${!report.available ? "language server unavailable" : !report.complete ? "analysis incomplete" : `${(report.diagnostics || []).filter((d) => d.severity === 1).length} errors reported`}`;
+        checks.appendChild(line);
+      }
+      container.appendChild(checks);
+    }
+    (result.files || []).forEach((file) => {
+      const heading = document.createElement("h3");
+      heading.textContent = `${file.file} · ${file.status}`;
+      container.appendChild(heading);
+      file.hunks.forEach((hunk) => {
+        const label = document.createElement("label");
+        label.className = "change-block";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.dataset.file = file.file;
+        checkbox.dataset.hunk = hunk.id;
+        checkbox.setAttribute("aria-label", `Undo ${file.file} edit ${hunk.id}`);
+        const pre = document.createElement("pre");
+        pre.textContent = `Lines ${hunk.after_start + 1}–${hunk.after_end}\n${hunk.diff}`;
+        label.append(checkbox, pre);
+        container.appendChild(label);
+      });
+    });
+    $("#btnUndoChanges").disabled = !result.files.length;
+  };
+  $("#btnUndoChanges").onclick = async () => {
+    const grouped = new Map();
+    $$("#changeRows input:checked").forEach((element) => {
+      if (!grouped.has(element.dataset.file)) grouped.set(element.dataset.file, []);
+      grouped.get(element.dataset.file).push(element.dataset.hunk);
+    });
+    if (!grouped.size || !review) { $("#changesStatus").textContent = "Select one or more edit blocks."; return; }
+    $("#btnUndoChanges").disabled = true;
+    try {
+      const result = await api(`/api/chats/${cid}/changes/undo`, { method: "POST", body: JSON.stringify({ change_set_id: review.id,
+        selections: Array.from(grouped, ([file, hunks]) => ({ file, hunks })) }) });
+      render(result);
+      $("#btnTaskChanges").textContent = `Review task changes (${result.files.length})`;
+      const pid = $("#projectSelect").value;
+      if (pid) await loadProjectTree(pid);
+    } catch (error) { $("#changesStatus").textContent = error.message; $("#btnUndoChanges").disabled = false; }
+  };
+  try { render(await api(`/api/chats/${cid}/changes`)); }
+  catch (error) { $("#changesStatus").textContent = error.message; }
+}
+
+let indexProject = null;
+let indexPollTimer = null;
+let indexPanelEpoch = 0;
+
+async function openProjectIndex(project) {
+  const dialog = $("#indexDialog");
+  indexProject = project;
+  const epoch = ++indexPanelEpoch;
+  clearTimeout(indexPollTimer);
+  $("#indexTitle").textContent = `${project.name} · Code index`;
+  $("#indexResults").textContent = "";
+  $("#indexSearchNote").textContent = "";
+  $("#indexStatus").textContent = "Reading index status…";
+  $("#btnSearchIndex").disabled = false;
+  if (!dialog.open) dialog.showModal();
+  dialog.onclose = () => { ++indexPanelEpoch; clearTimeout(indexPollTimer); };
+  $("#btnCloseIndex").onclick = () => dialog.close();
+
+  const poll = async () => {
+    if (!dialog.open || epoch !== indexPanelEpoch) return;
+    clearTimeout(indexPollTimer);
+    try {
+      const info = await api(`/api/projects/${project.id}/index`);
+      if (epoch !== indexPanelEpoch) return;
+      const job = info.job || {};
+      const busy = ["indexing", "waiting", "embedding"].includes(job.phase);
+      const phase = { indexing: "Reading source", waiting: "Waiting for the model",
+        embedding: "Embedding code", ready: "Ready", stopped: "Stopped", error: "Needs attention" }[job.phase] || "Ready";
+      $("#indexStatus").textContent = `${phase} · ${info.files || 0} files · ${info.chunks || 0} snippets · ${info.vectors || 0} embeddings` +
+        (info.updated ? ` · Updated ${new Date(info.updated * 1000).toLocaleString()}` : " · Not indexed yet") +
+        (job.error ? `\n${job.error}` : "") +
+        (info.truncated ? "\nFile limit reached; index coverage is partial." : "");
+      $("#btnRefreshIndex").disabled = busy;
+      $("#btnEmbedIndex").disabled = busy || !info.semantic_enabled;
+      $("#btnEmbedIndex").title = info.semantic_enabled ? `Using ${info.embedding_model}` : "Enable semantic code search in Settings first";
+      $("#btnStopIndex").hidden = !busy;
+      if (busy) indexPollTimer = setTimeout(poll, 1500);
+    } catch (error) {
+      if (epoch === indexPanelEpoch) $("#indexStatus").textContent = error.message;
+    }
+  };
+  const build = async (semantic) => {
+    $("#btnRefreshIndex").disabled = true;
+    $("#btnEmbedIndex").disabled = true;
+    try {
+      await api(`/api/projects/${project.id}/index`, { method: "POST", body: JSON.stringify({ semantic }) });
+      clearTimeout(indexPollTimer);
+      await poll();
+    } catch (error) {
+      if (epoch === indexPanelEpoch) $("#indexStatus").textContent = error.message;
+      $("#btnRefreshIndex").disabled = false;
+    }
+  };
+  $("#btnRefreshIndex").onclick = () => build(false);
+  $("#btnEmbedIndex").onclick = () => build(true);
+  $("#btnStopIndex").onclick = async () => {
+    try {
+      await api(`/api/projects/${project.id}/index/stop`, { method: "POST", body: "{}" });
+      $("#indexStatus").textContent = "Stopping after the current batch…";
+    } catch (error) { $("#indexStatus").textContent = error.message; }
+  };
+  $("#btnSearchIndex").onclick = async () => {
+    const query = $("#indexQuery").value.trim();
+    if (!query) { $("#indexQuery").focus(); return; }
+    $("#btnSearchIndex").disabled = true;
+    $("#indexSearchNote").textContent = "Searching…";
+    try {
+      const result = await api(`/api/projects/${project.id}/index/search`, { method: "POST",
+        body: JSON.stringify({ query, mode: $("#indexSearchMode").value }) });
+      if (epoch !== indexPanelEpoch) return;
+      $("#indexResults").textContent = result.map || (result.hits || []).map((hit) =>
+        `${hit.file}:${hit.line}${hit.end_line ? `–${hit.end_line}` : ""}${hit.symbol || hit.name ? ` · ${hit.symbol || hit.name}` : ""}\n${hit.text || hit.signature || ""}`
+      ).join("\n\n") || "No matches. Try a different phrase or identifier.";
+      $("#indexSearchNote").textContent = result.hint || (result.semantic?.available ?
+        `Text, symbols, and semantic search · ${result.semantic.indexed_chunks}/${result.semantic.total_chunks} snippets embedded` :
+        result.semantic?.reason || "Source locations are checked against current files.");
+      await poll();
+    } catch (error) {
+      if (epoch === indexPanelEpoch) $("#indexSearchNote").textContent = error.message;
+    } finally {
+      if (epoch === indexPanelEpoch) $("#btnSearchIndex").disabled = false;
+    }
+  };
+  $("#indexQuery").onkeydown = (event) => {
+    if (event.key === "Enter") { event.preventDefault(); $("#btnSearchIndex").click(); }
+  };
+  await poll();
+  $("#indexQuery").focus();
 }
 
 async function loadProjectTree(pid) {
+  state.selectedProject = pid || null;
+  if (typeof renderWorkspaceLinks === "function") renderWorkspaceLinks();
   if (!pid) {
     $("#projectTree").innerHTML = `<div class="entry">Select a project</div>`;
     return;
@@ -2500,136 +2748,7 @@ function autosizeInput() {
   ta.style.height = Math.min(180, ta.scrollHeight) + "px";
 }
 
-/** Reflect computer use in the app. The desktop marker is raised by the server
- *  when a run starts and dropped when it ends, so arming the switch no longer
- *  paints a border around an idle screen; turning it off still clears one a
- *  stopped run left behind. */
-/** Accounts Aether is allowed to act in.
- *
- *  A sign-in happens in Aether's browser window, performed by the user: no
- *  password is typed here, and none is stored. What persists afterwards is the
- *  session in that browser's own profile, which is the only thing Google and
- *  the rest actually accept. Keys for services that use them go to the
- *  operating system's keyring and are never shown again.
- */
-async function refreshConnections() {
-  const list = $("#connList");
-  const available = $("#connAvailable");
-  const foot = $("#connFoot");
-  if (!list) return;
-  let data;
-  try {
-    data = await api("/api/connections");
-  } catch (e) {
-    list.innerHTML = `<p class="conn-empty">${e.message || "Could not load connections"}</p>`;
-    return;
-  }
-  state.connections = data;
-  list.innerHTML = "";
-  if (!data.connections.length) {
-    list.innerHTML = '<p class="conn-empty">Nothing connected yet.</p>';
-  }
-  data.connections.forEach((c) => list.appendChild(connectionRow(c)));
-  available.innerHTML = "";
-  data.available.forEach((c) => available.appendChild(offerRow(c)));
-  if (foot) {
-    foot.textContent = data.keyring.ok
-      ? "Sign-ins are kept as sessions in Aether's browser. Keys go to your system keyring."
-      : `Keys cannot be stored here: ${data.keyring.backend}. Browser sign-ins still work.`;
-  }
-}
-
-function connectionRow(c) {
-  const row = document.createElement("div");
-  row.className = `conn-row ${c.status === "connected" ? "live" : ""}`;
-  const dot = c.status === "connected" ? "●" : "○";
-  row.innerHTML = `
-    <div class="conn-main">
-      <span class="conn-dot">${dot}</span>
-      <span class="conn-name">${escapeHtml(c.label)}</span>
-      <span class="conn-status">${escapeHtml(c.status)}</span>
-    </div>
-    <div class="conn-note">${escapeHtml(c.note || "")}</div>`;
-  const actions = document.createElement("div");
-  actions.className = "conn-actions";
-  if (c.kind === "session") {
-    actions.appendChild(connButton("Sign in", async () => {
-      const r = await api(`/api/connections/${c.id}/sign-in`, { method: "POST", body: "{}" });
-      setStatus(r.next || "Browser opened");
-      await refreshConnections();
-    }));
-    actions.appendChild(connButton("Check", async () => {
-      const r = await api(`/api/connections/${c.id}/check`, { method: "POST", body: "{}" });
-      setStatus(r.status === "connected" ? `${c.label} is connected` : `${c.label} is not signed in yet`);
-      await refreshConnections();
-    }));
-  } else {
-    actions.appendChild(connButton(c.has_secret ? "Replace key" : "Add key", () => askForKey(c.id, c.label)));
-  }
-  actions.appendChild(connButton("Forget", async () => {
-    await api(`/api/connections/${c.id}`, { method: "DELETE" });
-    await refreshConnections();
-  }, "danger"));
-  row.appendChild(actions);
-  return row;
-}
-
-function offerRow(c) {
-  const row = document.createElement("div");
-  row.className = "conn-row offer";
-  row.innerHTML = `
-    <div class="conn-main"><span class="conn-name">${escapeHtml(c.label)}</span></div>
-    <div class="conn-note">${escapeHtml(c.note || "")}</div>`;
-  const actions = document.createElement("div");
-  actions.className = "conn-actions";
-  actions.appendChild(connButton("Connect", async () => {
-    await api("/api/connections", { method: "POST", body: JSON.stringify({ id: c.id }) });
-    if (c.kind === "session") {
-      const r = await api(`/api/connections/${c.id}/sign-in`, { method: "POST", body: "{}" });
-      setStatus(r.next || "Browser opened");
-    } else {
-      askForKey(c.id, c.label);
-    }
-    await refreshConnections();
-  }));
-  row.appendChild(actions);
-  return row;
-}
-
-function connButton(label, onClick, extra = "") {
-  const b = document.createElement("button");
-  b.type = "button";
-  b.className = `conn-btn ${extra}`;
-  b.textContent = label;
-  b.onclick = async () => {
-    b.disabled = true;
-    try {
-      await onClick();
-    } catch (e) {
-      setStatus(e.message || "That did not work");
-    } finally {
-      b.disabled = false;
-    }
-  };
-  return b;
-}
-
-async function askForKey(id, label) {
-  // Typed once, sent straight to the keyring, never read back into the app.
-  const value = prompt(`Key or token for ${label}. It goes to your system keyring, not to a file here.`);
-  if (!value) return;
-  try {
-    await api(`/api/connections/${id}/secret`, {
-      method: "POST",
-      body: JSON.stringify({ value }),
-    });
-    setStatus(`${label} key stored`);
-  } catch (e) {
-    setStatus(e.message || "Could not store that key");
-  }
-  await refreshConnections();
-}
-
+/** Update computer-use controls. The server shows the desktop overlay only during a run. */
 function openConnections() {
   const tab = document.querySelector('.side-tab[data-panel="connections"]');
   if (tab) tab.click();
@@ -2689,6 +2808,8 @@ function closeModelMenus() {
 }
 
 function wireUI() {
+  $("#connectionSearch").oninput = renderConnectionCatalog;
+  $("#connectionCategory").onchange = renderConnectionCatalog;
   const todoToggle = $("#agentTodoToggle");
   if (todoToggle) {
     todoToggle.onclick = () => {
@@ -2742,6 +2863,7 @@ function wireUI() {
       $(`#panel-${tab.dataset.panel}`).classList.add("active");
       if (tab.dataset.panel === "models") refreshModelsPanel();
       if (tab.dataset.panel === "connections") refreshConnections();
+      if (["projects", "connections"].includes(tab.dataset.panel) && typeof refreshWorkspaceStatus === "function") refreshWorkspaceStatus({github: true});
     };
   });
   wireLibrary();
@@ -2795,7 +2917,7 @@ function wireUI() {
       const idx = Number(e.target.value);
       state.effort = state.effortLevels[idx] || null;
       try {
-        localStorage.setItem("aether.effort", state.effort || "");
+        localStorage.setItem("olith.effort", state.effort || "");
       } catch (_) {}
       syncThinkToggle();
     });
@@ -2807,7 +2929,7 @@ function wireUI() {
       e.stopPropagation();
       state.think = !state.think;
       try {
-        localStorage.setItem("aether.think", state.think ? "1" : "0");
+        localStorage.setItem("olith.think", state.think ? "1" : "0");
       } catch (_) {}
       syncThinkToggle();
     };
@@ -2827,11 +2949,8 @@ function wireUI() {
   $("#btnComputerUse").onclick = async (e) => {
     e.stopPropagation();
     const next = !state.computerUse;
-    // Turning it on keeps the model already selected whenever that model can
-    // see; only a blind selection is moved. Switching unconditionally to the
-    // one vision model is what made this feature look like it belonged to a
-    // single model. currentModelKey() still reads the old flag here, so the
-    // target is worked out from the selection rather than from it.
+    // Keep the selected vision model when enabling computer use. Read the
+    // selection directly because currentModelKey still uses the old toggle value.
     const key = next
       ? (modelMeta(state.agentModel)?.vision ? state.agentModel : state.visionModel)
       : state.agentModel;
@@ -2952,9 +3071,7 @@ function wireUI() {
       }
     }
     if (action === "folder") {
-      const form = $("#projectDialogForm");
-      if (form) form.reset();
-      $("#projectDialog").showModal();
+      await openProjectDialog();
     }
     if (action === "websearch") {
       state.webSearch = !state.webSearch;
@@ -2990,12 +3107,12 @@ function wireUI() {
     loadMemory();
   };
 
-  $("#btnNewProject").onclick = () => {
-    const form = $("#projectDialogForm");
-    if (form) form.reset();
+  $("#btnNewProject").onclick = async () => {
     $("#btnNewProject").blur();
-    $("#projectDialog").showModal();
+    await openProjectDialog();
   };
+  $("#projectSetup").onchange = syncProjectSetup;
+  document.querySelector('#projectDialogForm input[name="name"]').oninput = syncProjectSetup;
   const browseBtn = $("#btnBrowseProject");
   if (browseBtn) {
     browseBtn.onclick = async (e) => {
@@ -3030,35 +3147,40 @@ function wireUI() {
       if (dlg) dlg.close();
     };
   }
-  $("#btnProjectOk").onclick = async (e) => {
+  $("#projectDialogForm").onsubmit = async (e) => {
     e.preventDefault();
     const form = $("#projectDialogForm");
     if (!form.reportValidity()) return;
+    if (state.streaming) { setStatus("Finish or stop the current task before creating a project."); return; }
     const fd = new FormData(form);
+    const button = $("#btnProjectOk");
+    if (button.disabled) return;
+    button.disabled = true;
     try {
-      await api("/api/projects", {
+      const project = await api("/api/projects", {
         method: "POST",
         body: JSON.stringify({
           name: fd.get("name"),
-          root: fd.get("root"),
+          root: fd.get("root") || "",
+          create_folder: $("#projectSetup").value === "create",
           description: fd.get("description") || "",
         }),
       });
       $("#projectDialog").close();
       form.reset();
       await loadProjects();
+      await selectProject(project.id);
+      setStatus(`Project ready: ${project.name}`);
     } catch (err) {
-      alert(err.message);
+      $("#projectError").textContent = err.message;
+      $("#projectError").hidden = false;
+    } finally {
+      button.disabled = false;
     }
   };
 
-  $("#projectSelect").onchange = async (e) => {
-    const pid = e.target.value || null;
-    await loadProjectTree(pid);
-    if (state.chatId) {
-      await api(`/api/chats/${state.chatId}`, { method: "PATCH", body: JSON.stringify({ project_id: pid }) });
-    }
-  };
+  $("#projectSelect").onchange = event => selectProject(event.target.value);
+  $("#projectSearch").oninput = renderProjects;
 
   const ctxMeter = $("#contextMeter");
   if (ctxMeter) {
@@ -3069,10 +3191,8 @@ function wireUI() {
       else openCtxDropdown();
     };
   }
-  // A mouse click leaves focus on the button and :focus-within then holds the
-  // hover bar open indefinitely. Keyboard activation reports detail 0 and keeps
-  // its focus, since that rule exists so the bar is reachable without a mouse.
-  // Capture phase, because the handlers call stopPropagation.
+  // Remove mouse focus so the hover bar closes. Keep keyboard focus for
+  // accessibility. Use capture because action handlers stop propagation.
   document.addEventListener(
     "click",
     (e) => {
@@ -3107,8 +3227,11 @@ function wireUI() {
   $("#setCompact").oninput = (e) => {
     $("#setCompactVal").textContent = `${e.target.value}%`;
   };
+  $("#btnTaskChanges").onclick = openTaskChanges;
+  $("#setShellApproval").onchange = syncApprovalModeUI;
   $("#btnSaveSettings").onclick = async () => {
-    await api("/api/settings", {
+    const fullAccess = $("#setShellApproval").value === "full_access";
+    const saved = await api("/api/settings", {
       method: "PATCH",
       body: JSON.stringify({
         data: {
@@ -3116,8 +3239,13 @@ function wireUI() {
           show_thinking: $("#setShowThinking").checked,
           clarify_first_turn: !!($("#setClarifyFirst") || {}).checked,
           unrestricted_fs: !!($("#setUnrestrictedFs") || {}).checked,
-          shell_approval_mode: ($("#setShellApproval") || {}).value || "safe_auto",
+          shell_approval_mode: fullAccess ? "never_ask" : $("#setShellApproval").value || "safe_auto",
+          approval_mode: fullAccess ? "full_access" : null,
           agent_repeat_limit: Number($("#setAgentRepeatLimit").value),
+          repo_map_enabled: $("#setRepoMap").checked,
+          semantic_search: $("#setSemantic").checked,
+          embedding_model: $("#setEmbeddingModel").value.trim() || "nomic-embed-text",
+          embedding_device: $("#setEmbeddingDevice").value,
           role_context: Object.fromEntries(
             $$("select[data-role]").map((sel) => [sel.dataset.role, Number(sel.value)])
           ),
@@ -3125,6 +3253,8 @@ function wireUI() {
         },
       }),
     });
+    state.settings = saved;
+    syncApprovalModeUI();
     setStatus("Saved");
   };
 
@@ -3265,9 +3395,7 @@ async function waitForWarmup() {
   }
 }
 
-/** Point the tab at the model that is actually loaded. A reload against a
- *  server that is already running can find a different one in VRAM, and a
- *  picker that names a cold model is a warm-up waiting to happen. */
+/** Select the model already loaded when reconnecting to a running server. */
 async function adoptWarmModel() {
   await syncWarmedKey();
   const key = state.warmedKey;
@@ -3280,7 +3408,7 @@ async function adoptWarmModel() {
 }
 
 async function boot() {
-  fillRings(document);
+  fillMarks(document);
   wireUI();
   syncModeUI();
   refreshTagline();
@@ -3470,11 +3598,8 @@ async function refreshModelsPanel() {
   renderModelsPanel();
 }
 
-// ── Model library ──────────────────────────────────────────────────────────
-//
-// A screen rather than a pane. Two sources scroll the same way behind one
-// cursor the server hands back, so nothing here knows that Ollama pages by
-// offset and Hugging Face by an opaque token.
+// Model library
+// Use the server's next cursor for both Ollama and Hugging Face pages.
 
 const _lib = {
   source: "ollama",
@@ -3498,8 +3623,7 @@ function fmtCount(n) {
   return `${v}`;
 }
 
-/** One library row. Shares the install hooks with the sidebar's catalog card
- *  so a pull drives either one without a second copy of the streaming code. */
+/** Render a library row using the shared install progress handlers. */
 function libraryCard(entry) {
   const card = document.createElement("article");
   card.className = "lib-card" + (entry.installed ? " is-installed" : "");
@@ -3571,8 +3695,7 @@ function libraryCard(entry) {
   return card;
 }
 
-/** Ollama tags and Hugging Face quantizations are the same question asked
- *  twice, so one dialog asks it: which version of this, and does it fit. */
+/** Choose a version and check its fit for either model source. */
 async function pickVariant(entry, card) {
   const dlg = $("#variantDialog");
   const list = $("#variantList");
@@ -3689,9 +3812,7 @@ function openLibrary() {
   $("#librarySearch").focus();
   libraryLoad({ reset: true });
   if (!_libObserver) {
-    // Watched against the scroller, not the window. The sentinel sits inside
-    // the scrolling box, so it leaves the view once a page has rendered and
-    // comes back when the reader reaches the end of it.
+    // Watch the sentinel inside the scrolling container to load the next page.
     _libObserver = new IntersectionObserver((entries) => {
       if (entries.some((e) => e.isIntersecting)) libraryLoad();
     }, { root: $("#libraryScroll"), rootMargin: "400px" });

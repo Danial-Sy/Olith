@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class VersionTests(unittest.TestCase):
     def test_tag_spellings_all_parse_to_the_same_release(self):
-        for text in ("v1.3.0", "1.3.0", "Aether v1.3.0"):
+        for text in ("v1.3.0", "1.3.0", "Olith v1.3.0"):
             self.assertEqual(update.parse_version(text)[0], (1, 3, 0), text)
 
     def test_ordering_is_numeric_not_lexical(self):
@@ -48,18 +48,18 @@ class ReadVersionTests(unittest.TestCase):
 
     def test_config_is_the_source_of_truth(self):
         (self.tmp / "config.py").write_text('VERSION = "9.9.9"\n', encoding="utf-8")
-        (self.tmp / "aether.json").write_text('{"version": "0.0.1"}', encoding="utf-8")
+        (self.tmp / "olith.json").write_text('{"version": "0.0.1"}', encoding="utf-8")
         self.assertEqual(update.read_version(self.tmp), "9.9.9")
 
-    def test_aether_json_is_the_fallback(self):
-        (self.tmp / "aether.json").write_text('{"version": "1.2.3"}', encoding="utf-8")
+    def test_olith_json_is_the_fallback(self):
+        (self.tmp / "olith.json").write_text('{"version": "1.2.3"}', encoding="utf-8")
         self.assertEqual(update.read_version(self.tmp), "1.2.3")
 
-    def test_config_and_aether_json_agree_on_the_version(self):
+    def test_config_and_olith_json_agree_on_the_version(self):
         # They must be bumped together: config.py decides whether an installed
-        # copy is current, and a stale aether.json would report a different
+        # copy is current, and a stale olith.json would report a different
         # version to anything reading it.
-        declared = json.loads((ROOT / "aether.json").read_text(encoding="utf-8"))
+        declared = json.loads((ROOT / "olith.json").read_text(encoding="utf-8"))
         self.assertEqual(update.read_version(ROOT), declared["version"])
 
     def test_the_shipped_tree_reports_a_real_version(self):
@@ -73,18 +73,18 @@ class ReleaseTests(unittest.TestCase):
     def test_a_published_zip_asset_is_preferred_over_the_zipball(self):
         release = {
             "tag_name": "v1.4.0",
-            "assets": [{"name": "aether-v1.4.0.zip",
-                        "browser_download_url": "https://example/aether-v1.4.0.zip"}],
+            "assets": [{"name": "olith-v1.4.0.zip",
+                        "browser_download_url": "https://example/olith-v1.4.0.zip"}],
             "zipball_url": "https://example/zipball",
         }
         self.assertEqual(update.pick_download(release),
-                         ("https://example/aether-v1.4.0.zip", "aether-v1.4.0.zip"))
+                         ("https://example/olith-v1.4.0.zip", "olith-v1.4.0.zip"))
 
     def test_the_zipball_is_used_when_a_release_has_no_assets(self):
         url, name = update.pick_download({"tag_name": "v1.4.0", "assets": [],
                                           "zipball_url": "https://example/zipball"})
         self.assertEqual(url, "https://example/zipball")
-        self.assertEqual(name, "aether-v1.4.0.zip")
+        self.assertEqual(name, "olith-v1.4.0.zip")
 
     @patch.object(update, "fetch_json")
     def test_a_repo_with_no_releases_stops_instead_of_installing_nothing(self, fetch):
@@ -103,7 +103,7 @@ class ReleaseTests(unittest.TestCase):
 class ProtectedPathTests(unittest.TestCase):
     def test_user_data_and_the_venv_are_never_installable(self):
         for name in ("data/chats/a.json", "data/settings/settings.json",
-                     ".venv/bin/python", ".git/config", "aether.local.json",
+                     ".venv/bin/python", ".git/config", "olith.local.json",
                      "__pycache__/config.cpython-312.pyc"):
             self.assertTrue(update.is_protected(Path(name)), name)
 
@@ -116,7 +116,7 @@ class ApplyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.root = self.tmp / "aether"
+        self.root = self.tmp / "olith"
         self.source = self.tmp / "new"
         for path in (self.root, self.source):
             path.mkdir(parents=True)
@@ -237,27 +237,27 @@ class ArchiveTests(unittest.TestCase):
 
     def test_a_release_archive_unwraps_to_its_single_top_level_folder(self):
         archive = self._zip({
-            "aether-v1.4.0/config.py": 'VERSION = "1.4.0"\n',
-            "aether-v1.4.0/server.py": "",
-            "aether-v1.4.0/aether.json": "{}",
+            "olith-v1.4.0/config.py": 'VERSION = "1.4.0"\n',
+            "olith-v1.4.0/server.py": "",
+            "olith-v1.4.0/olith.json": "{}",
         })
         root = update.extract(archive, self.tmp / "out")
-        self.assertEqual(root.name, "aether-v1.4.0")
+        self.assertEqual(root.name, "olith-v1.4.0")
         self.assertEqual(update.read_version(root), "1.4.0")
 
-    def test_an_archive_that_is_not_aether_is_refused(self):
+    def test_an_archive_that_is_not_olith_is_refused(self):
         archive = self._zip({"something-else/readme.txt": "hello"})
         with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
             update.extract(archive, self.tmp / "out")
 
     def test_a_path_traversing_archive_is_refused_by_name(self):
         # Otherwise valid, so the refusal has to come from the path check
-        # rather than from the "this is not Aether" check behind it.
+        # rather than from the "this is not Olith" check behind it.
         archive = self._zip({
-            "aether-v1.4.0/config.py": 'VERSION = "1.4.0"\n',
-            "aether-v1.4.0/server.py": "",
-            "aether-v1.4.0/aether.json": "{}",
-            "aether-v1.4.0/../../escaped.py": "malicious",
+            "olith-v1.4.0/config.py": 'VERSION = "1.4.0"\n',
+            "olith-v1.4.0/server.py": "",
+            "olith-v1.4.0/olith.json": "{}",
+            "olith-v1.4.0/../../escaped.py": "malicious",
         })
         err = io.StringIO()
         with self.assertRaises(SystemExit), patch("sys.stderr", err):
@@ -271,18 +271,18 @@ class EntryPointTests(unittest.TestCase):
     installers reach setup.py."""
 
     def test_windows_wrapper_runs_the_updater_and_waits_for_the_user(self):
-        text = (ROOT / "Update-Aether.bat").read_text(encoding="utf-8")
+        text = (ROOT / "Update-Olith.bat").read_text(encoding="utf-8")
         self.assertIn('cd /d "%~dp0"', text)
         self.assertIn("py -3 update.py %*", text)
         self.assertIn("python update.py %*", text)
         self.assertIn("pause", text)
 
     def test_windows_wrapper_reports_the_updaters_exit_code(self):
-        text = (ROOT / "Update-Aether.bat").read_text(encoding="utf-8")
+        text = (ROOT / "Update-Olith.bat").read_text(encoding="utf-8")
         # %ERRORLEVEL% has to be captured on its own line: read inside a
         # parenthesised block it expands before the updater has even run.
-        self.assertIn('set "AETHER_UPDATE_EXIT=%ERRORLEVEL%"', text)
-        self.assertIn("exit /b %AETHER_UPDATE_EXIT%", text)
+        self.assertIn('set "OLITH_UPDATE_EXIT=%ERRORLEVEL%"', text)
+        self.assertIn("exit /b %OLITH_UPDATE_EXIT%", text)
 
     def test_linux_wrapper_prefers_the_distro_python_like_setup_does(self):
         text = (ROOT / "update.sh").read_text(encoding="utf-8")
@@ -305,9 +305,9 @@ class EndToEndTests(unittest.TestCase):
         self.root = self.tmp / "installed"
         self.root.mkdir()
 
-        # An Aether 1.3.0 that has been used: it has chats and settings.
+        # An Olith 1.3.0 that has been used: it has chats and settings.
         self._write(self.root / "config.py", 'VERSION = "1.3.0"\n')
-        self._write(self.root / "aether.json", '{"version": "1.3.0"}')
+        self._write(self.root / "olith.json", '{"version": "1.3.0"}')
         self._write(self.root / "server.py", "old server")
         self._write(self.root / "requirements.txt", "fastapi\n")
         self._write(self.root / "retired.py", "dropped in 1.4.0")
@@ -327,7 +327,7 @@ class EndToEndTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         # 1.3.0 was itself installed by the updater, so a manifest exists.
         update.save_manifest("1.3.0", "v1.3.0", [
-            Path("config.py"), Path("aether.json"), Path("server.py"),
+            Path("config.py"), Path("olith.json"), Path("server.py"),
             Path("requirements.txt"), Path("retired.py"),
         ])
 
@@ -339,11 +339,11 @@ class EndToEndTests(unittest.TestCase):
     def _release_zip(self, version: str) -> str:
         import zipfile
 
-        path = self.tmp / f"aether-v{version}.zip"
-        prefix = f"aether-v{version}/"
+        path = self.tmp / f"olith-v{version}.zip"
+        prefix = f"olith-v{version}/"
         with zipfile.ZipFile(path, "w") as zf:
             zf.writestr(prefix + "config.py", f'VERSION = "{version}"\n')
-            zf.writestr(prefix + "aether.json", json.dumps({"version": version}))
+            zf.writestr(prefix + "olith.json", json.dumps({"version": version}))
             zf.writestr(prefix + "server.py", "new server")
             zf.writestr(prefix + "requirements.txt", "fastapi\n")
             zf.writestr(prefix + "brand_new.py", "arrived in " + version)
@@ -361,7 +361,7 @@ class EndToEndTests(unittest.TestCase):
         with (
             patch.object(update, "fetch_json", return_value=release),
             patch.object(update.sys, "argv", ["update.py"] + argv),
-            patch.object(update, "aether_is_running", return_value=False),
+            patch.object(update, "olith_is_running", return_value=False),
             patch.object(update, "refresh_dependencies") as deps,
             patch("builtins.input", answer),
             contextlib.redirect_stdout(io.StringIO()) as out,
@@ -372,7 +372,7 @@ class EndToEndTests(unittest.TestCase):
 
     def test_an_update_replaces_the_program_and_keeps_the_users_data(self):
         release = {"tag_name": "v1.4.0", "assets": [
-            {"name": "aether-v1.4.0.zip", "browser_download_url": self._release_zip("1.4.0")}]}
+            {"name": "olith-v1.4.0.zip", "browser_download_url": self._release_zip("1.4.0")}]}
 
         text, deps = self._run(["--yes"], release)
 
@@ -391,7 +391,7 @@ class EndToEndTests(unittest.TestCase):
 
     def test_being_on_the_latest_release_downloads_nothing(self):
         release = {"tag_name": "v1.3.0", "assets": [
-            {"name": "aether-v1.3.0.zip", "browser_download_url": "https://unreachable/x.zip"}]}
+            {"name": "olith-v1.3.0.zip", "browser_download_url": "https://unreachable/x.zip"}]}
 
         with patch.object(update, "download") as download:
             text, _ = self._run([], release)
@@ -402,7 +402,7 @@ class EndToEndTests(unittest.TestCase):
 
     def test_check_reports_an_update_without_installing_it(self):
         release = {"tag_name": "v1.4.0", "body": "Faster agent loop",
-                   "assets": [{"name": "aether-v1.4.0.zip",
+                   "assets": [{"name": "olith-v1.4.0.zip",
                                "browser_download_url": self._release_zip("1.4.0")}]}
 
         text, _ = self._run(["--check"], release)
@@ -415,7 +415,7 @@ class EndToEndTests(unittest.TestCase):
 
     def test_declining_the_prompt_changes_nothing(self):
         release = {"tag_name": "v1.4.0", "assets": [
-            {"name": "aether-v1.4.0.zip", "browser_download_url": self._release_zip("1.4.0")}]}
+            {"name": "olith-v1.4.0.zip", "browser_download_url": self._release_zip("1.4.0")}]}
 
         with patch.object(update, "download") as download:
             text, _ = self._run([], release, answers=["n"])
@@ -426,7 +426,7 @@ class EndToEndTests(unittest.TestCase):
 
     def test_accepting_the_prompt_installs_the_release(self):
         release = {"tag_name": "v1.4.0", "assets": [
-            {"name": "aether-v1.4.0.zip", "browser_download_url": self._release_zip("1.4.0")}]}
+            {"name": "olith-v1.4.0.zip", "browser_download_url": self._release_zip("1.4.0")}]}
 
         text, _ = self._run([], release, answers=["y"])
 
@@ -443,15 +443,15 @@ class EndToEndTests(unittest.TestCase):
     def test_moved_requirements_trigger_a_package_refresh(self):
         import zipfile
 
-        path = self.tmp / "aether-v1.4.0.zip"
-        prefix = "aether-v1.4.0/"
+        path = self.tmp / "olith-v1.4.0.zip"
+        prefix = "olith-v1.4.0/"
         with zipfile.ZipFile(path, "w") as zf:
             zf.writestr(prefix + "config.py", 'VERSION = "1.4.0"\n')
-            zf.writestr(prefix + "aether.json", '{"version": "1.4.0"}')
+            zf.writestr(prefix + "olith.json", '{"version": "1.4.0"}')
             zf.writestr(prefix + "server.py", "new server")
             zf.writestr(prefix + "requirements.txt", "fastapi\nhttpx\n")
         release = {"tag_name": "v1.4.0", "assets": [
-            {"name": "aether-v1.4.0.zip", "browser_download_url": path.as_uri()}]}
+            {"name": "olith-v1.4.0.zip", "browser_download_url": path.as_uri()}]}
 
         _, deps = self._run(["--yes"], release)
 

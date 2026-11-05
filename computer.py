@@ -1,19 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Computer use: one tool that sees the screen and drives the mouse and keyboard.
+"""Read the screen and control the mouse and keyboard.
 
-The loop is observe, act, observe, and every action returns the screen it
-produced. A model that cannot re-observe after acting is guessing.
-
-So the loop here is observe -> act -> observe, and every action returns the
-screen it produced. The frame goes back into the conversation as an image (see
-`pop_frame`), which is what lets the model notice that the search already ran
-and move on to the next step.
-
-Input goes through XTest on X11 and SendInput on Windows, both over ctypes.
-Neither needs a package Aether does not already ship: the X11 path is the same
-one xdotool compiles against, and requiring a binary the user has to install
-first is how the feature failed the first time.
+Each action returns a screenshot through pop_frame so the model can see the
+result. Input uses XTest on X11 and SendInput on Windows through ctypes.
 """
 from __future__ import annotations
 
@@ -30,13 +20,11 @@ from typing import Any
 
 import guards
 
-# The long edge of the frame the model is shown. Every pixel taken off it is
-# legibility: at 1600 an ultrawide scales to 47%, which turns 11pt body text
-# into five pixels. 2000 costs ~1.9k tokens a frame.
+# Limit screenshots to a 2000 px long edge to keep text readable.
+# A frame at this size costs about 1.9k tokens.
 MAX_EDGE = 2000
 
-# Below this scale the frame is too small to read body text in, and the result
-# says so rather than letting the model believe it can see the page.
+# Warn when scaling makes body text too small to read.
 LEGIBLE_SCALE = 0.6
 
 # The editing guards live in `guards`, shared with the browser tool along with
@@ -99,11 +87,7 @@ def _atspi():
 
 
 def _inside(box: tuple, bounds: tuple | None) -> bool:
-    """Whether a widget's box sits inside its window's.
-
-    Toolkits lie about screen extents, and a ref aiming at the corner of the
-    display is worse than no ref at all.
-    """
+    """Check that a widget's reported box is inside its window."""
     if not bounds:
         return True
     x, y, w, h = box
@@ -157,11 +141,7 @@ def _active_frames(atspi) -> list:
 
 
 def elements(everything: bool = False) -> dict:
-    """Named widgets of the active window, with a ref to aim at each.
-
-    A model that can see a button in an image still has to guess its pixel. A
-    name and a box need no guessing.
-    """
+    """List named widgets in the active window with refs for clicking."""
     atspi = _atspi()
     if atspi is None:
         return {
@@ -189,8 +169,7 @@ def elements(everything: bool = False) -> dict:
         x, y, w, h = box
         items.append({
             "ref": ref, "role": role, "name": name,
-            # Reported in the same coordinates as the screenshot, so the two
-            # ways of looking at the screen agree with each other.
+            # Use the same coordinate space as the screenshot.
             "at": [int((x + w / 2) * scale), int((y + h / 2) * scale)],
         })
     if not items:
@@ -230,9 +209,7 @@ def screen_size() -> tuple[int, int]:
 
 
 def _encode(img, quality: int = 72) -> tuple[str, bytes]:
-    """WEBP, not PNG. A desktop screenshot is ~1.8 MB as PNG and ~120 KB here,
-    and the base64 of the PNG is what has to survive being held in the chat log
-    and re-sent to Ollama."""
+    """Encode screenshots as WebP to keep stored and resent images small."""
     buf = io.BytesIO()
     try:
         img.save(buf, format="WEBP", quality=quality, method=4)
@@ -243,9 +220,8 @@ def _encode(img, quality: int = 72) -> tuple[str, bytes]:
         return "png", buf.getvalue()
 
 
-# Grid the change detector compares, and how far one cell may move in grey
-# levels before the screen counts as having responded. Coarse cells ignore a
-# blinking cursor, and a local threshold still catches a button changing shade.
+# Compare coarse brightness cells to ignore cursor blinks while catching
+# changes such as a button changing color.
 _GRID = (48, 27)
 _CHANGE_LEVELS = 3
 
@@ -258,11 +234,7 @@ def _signature(img) -> bytes:
 
 
 def _changed(before: bytes | None, after: bytes) -> bool:
-    """Whether the screen responded, erring towards yes.
-
-    A change reported wrongly costs nothing, since the model reads the
-    screenshot anyway. Missing one tells a working click that it failed.
-    """
+    """Check whether the screen changed. Treat uncertain differences as a change."""
     if before is None or len(before) != len(after):
         return True
     return any(abs(a - b) > _CHANGE_LEVELS for a, b in zip(after, before))
@@ -279,14 +251,12 @@ def _capture(region: list | None = None) -> dict:
     zoom = 1.0
 
     if region:
-        # The region arrives in the model's coordinate space, which is the
-        # downscaled frame, so it has to come back to screen pixels first.
+        # Convert the requested region from frame coordinates to screen pixels.
         scale = _frame_scale(sw, sh)
         rx, ry, rw, rh = (int(round(float(v) / scale)) for v in region[:4])
         rw = max(16, min(sw, rw))
         rh = max(16, min(sh, rh))
-        # Slide the box back inside the screen rather than letting the crop run
-        # past the edge, which PIL pads with black.
+        # Keep the crop inside the screen to avoid black padding.
         rx = max(0, min(sw - rw, rx))
         ry = max(0, min(sh - rh, ry))
         native = native.crop((rx, ry, rx + rw, ry + rh))
@@ -307,8 +277,7 @@ def _capture(region: list | None = None) -> dict:
     fmt, raw = _encode(img)
     signature = _signature(img)
     with _lock:
-        # A zoomed crop is a different picture of the same screen, so it is
-        # never compared against the last full frame.
+        # Compare full frames only; a crop has different dimensions.
         if not region and _changed(_last_signature, signature):
             _frame_id += 1
             _last_signature = signature
@@ -342,20 +311,12 @@ def to_screen(x: float, y: float, sw: int, sh: int) -> tuple[int, int]:
 
 
 def frame_id() -> int:
-    """Counter that advances only when the screen actually changed.
-
-    Folded into the loop's repeat signature, so clicking the same button twice
-    is ordinary work and clicking it twice with nothing happening is a repeat.
-    """
+    """Advance only when the screen changes, so a repeat click can be checked against its result."""
     return _frame_id
 
 
 def pop_frame() -> dict | None:
-    """Hand the last captured frame to the caller, once.
-
-    The agent loop appends it to the transcript as an image; leaving it here
-    after that would re-send the same screenshot on the next step.
-    """
+    """Return the latest frame once, then clear it to avoid resending an old screenshot."""
     global _frame
     with _lock:
         out, _frame = _frame, None
@@ -487,9 +448,8 @@ class _X11:
                 return kc, bool(level)
         return kc, False
 
-    # A toolkit refreshes its keymap when it processes the MappingNotify, so
-    # both the press and the clear have to wait for it. Measured against GTK:
-    # 10ms either side lost every accented character, 40ms lands them.
+    # Wait for the toolkit to process each keymap change. GTK lost accented
+    # characters at 10 ms; 40 ms worked in the check.
     REMAP_SETTLE = 0.04
 
     def _remap(self, keysym: int) -> int:
@@ -683,9 +643,7 @@ class _Windows:
 
 
 def backend():
-    """The input driver for this desktop, or None with a reason in
-    `_backend_error`. Built once; a missing X display is not going to appear
-    later in the same process."""
+    """Create and cache the input driver. If unavailable, store the reason in _backend_error."""
     global _backend, _backend_error
     if _backend is not None or _backend_error:
         return _backend
@@ -744,11 +702,7 @@ def _guard(action: str, args: dict) -> str | None:
 
 
 def status_line(args: dict) -> str:
-    """What the overlay pill says while this action runs.
-
-    Names the act rather than the tool, since it is there for whoever is
-    watching their own computer being driven.
-    """
+    """Describe the current action in the desktop overlay."""
     args = args or {}
     steps = _steps(args)
     if steps:
@@ -757,34 +711,34 @@ def status_line(args: dict) -> str:
         typed = next((a for a in steps if str(a.get("action")).lower() == "type"), None)
         if typed or len(steps) == 1:
             return status_line(typed or steps[0])
-        return f"Aether is running {len(steps)} steps on your computer"
+        return f"Olith is running {len(steps)} steps on your computer"
     action = str(args.get("action") or "").lower()
     where = ""
     if args.get("x") is not None and args.get("y") is not None:
         where = f" at {int(float(args['x']))}, {int(float(args['y']))}"
     text = str(args.get("text") or "")
     if action == "screenshot":
-        return "Aether is looking at your screen"
+        return "Olith is looking at your screen"
     if action == "type":
         snippet = text[:24] + ("…" if len(text) > 24 else "")
-        return f'Aether is typing "{snippet}"'
+        return f'Olith is typing "{snippet}"'
     if action == "key":
-        return f"Aether is pressing {text}"
+        return f"Olith is pressing {text}"
     if action == "scroll":
-        return f"Aether is scrolling {args.get('direction') or 'down'}"
+        return f"Olith is scrolling {args.get('direction') or 'down'}"
     if action == "wait":
-        return "Aether is waiting for the screen"
+        return "Olith is waiting for the screen"
     if action in ("click", "double_click", "right_click", "middle_click"):
-        return f"Aether is clicking{where}"
+        return f"Olith is clicking{where}"
     if action == "move":
-        return f"Aether is moving the pointer{where}"
+        return f"Olith is moving the pointer{where}"
     if action == "drag":
-        return "Aether is dragging"
-    return "Aether is using your computer"
+        return "Olith is dragging"
+    return "Olith is using your computer"
 
 
-# A batch runs several actions on one model turn. The measured loop spent 15.5s
-# per step and 0.7s of it acting, so turns are what a desktop job costs.
+# Batch actions to reduce model round trips. A measured step took 15.5s,
+# with 0.7s spent on the action.
 MAX_BATCH = 20
 # Between actions inside a batch. Long enough for a menu to open under the
 # click that follows it, short enough that a batch is still one turn.
@@ -918,16 +872,11 @@ def _steps(args: dict) -> list[dict] | None:
 
 
 def run(args: dict) -> str:
-    """Execute an action, or a batch of them, and leave the frame in `pop_frame`.
-
-    One frame comes back however many actions ran, since only the last screen
-    is a decision point.
-    """
+    """Run one action or a batch, then leave the final screenshot in pop_frame."""
     global _frame
 
     args = args or {}
-    # Before the desktop is probed: an action that does not exist is wrong on
-    # any machine, and saying so needs no screen.
+    # Validate the action before checking for a display.
     for step in _steps(args) or [args]:
         action = _canonical(step)
         if action != "batch" and action not in ACTIONS:
@@ -979,8 +928,7 @@ def run(args: dict) -> str:
             time.sleep(STEP_PAUSE)
 
     if stopped is not None and not performed:
-        # Nothing reached the desktop, so the model already has this screen.
-        # Another copy of it costs ~1.6k tokens to say nothing.
+        # Do not resend a screenshot when no action reached the desktop.
         return json.dumps(stopped if not batched else {**stopped, "actions_run": f"0 of {len(steps)}"})
 
     if settle:

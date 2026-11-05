@@ -8,6 +8,12 @@
       "roles": [
         "title"
       ]
+    },
+    {
+      "tag": "nomic-embed-text:latest",
+      "roles": [
+        "embedding"
+      ]
     }
   ],
   "tiers": [
@@ -72,7 +78,7 @@
       "min_gb": 20,
       "max_gb": 32,
       "label": "20 to 32 GB",
-      "note": "What Aether was built and tuned on.",
+      "note": "What Olith was built and tuned on.",
       "models": [
         {
           "tag": "qwen3.8:27b",
@@ -141,9 +147,17 @@
     }
   ],
   "models": {
+    "nomic-embed-text:latest": {
+      "label": "Nomic Embed Text",
+      "description": "Local semantic code search. Installed with Olith and run on CPU by default.",
+      "size_gb": 0.26,
+      "rank": 0,
+      "tags": ["utility", "embedding"],
+      "hints": {"tools": false, "vision": false, "think": false}
+    },
     "qwen3.8:27b": {
       "label": "Qwen3.8 27B",
-      "description": "Aether's default. Sees images, thinks, and calls tools, so it covers chat, agentic work and computer use on its own.",
+      "description": "Olith's default. Sees images, thinks, and calls tools, so it covers chat, agentic work and computer use on its own.",
       "size_gb": 15.7,
       "rank": 100,
       "tags": [

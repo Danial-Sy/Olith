@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Measure where an agentic step's wall clock actually goes.
+"""Measure prompt-processing and token-generation time for each agent step.
 
-Splits each step into time-to-first-token (dominated by prompt processing) and
-generation. A slow run caused by reprocessed context and one caused by slow
-token generation look identical from outside and need opposite fixes.
-
-Usage: AETHER_TIMING_LOG=/tmp/t.jsonl .venv/bin/python scripts/bench_agent_step.py [model_key]
+Usage: OLITH_TIMING_LOG=/tmp/t.jsonl .venv/bin/python scripts/bench_agent_step.py [model_key]
 """
 from __future__ import annotations
 
@@ -34,7 +30,7 @@ GAME_HTML = "<!doctype html>\n<html><body><canvas id=c></canvas>\n<script>\n" + 
 async def main() -> int:
     model_key = sys.argv[1] if len(sys.argv) > 1 else "coder"
     meta = MODELS[model_key]
-    root = Path("/tmp/aether-bench")
+    root = Path("/tmp/olith-bench")
     root.mkdir(exist_ok=True)
     (root / "game.html").write_text(GAME_HTML, encoding="utf-8")
 

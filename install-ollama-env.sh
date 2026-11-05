@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Install systemd drop-in so Ollama on Ubuntu matches Windows VRAM behavior:
-# q8 KV, flash-attn, single slot, CUDA unified memory (overflow → system RAM).
+# Set Ollama's systemd environment: q8 KV, flash attention, one slot
+# and unified memory for VRAM spillover.
 set -euo pipefail
 DEST=/etc/systemd/system/ollama.service.d
 mkdir -p "$DEST"
-cat > "$DEST/aether.conf" <<'EOF'
+cat > "$DEST/olith.conf" <<'EOF'
 [Service]
 Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
 Environment="OLLAMA_FLASH_ATTENTION=1"

@@ -1,14 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Browser control that does not go through pixels.
+"""Control Chrome through DevTools using named elements and text.
 
-Chrome over the DevTools protocol. Elements come back as refs with roles and
-names, text comes back as text, and typing is one atomic insert, so nothing
-inside a page has to be aimed at. The desktop tool stays for everything that is
-not a browser.
-
-Aether drives its own Chrome profile in data/browser rather than the window the
-user has open. Sign in there once and it stays signed in.
+Use Olith's own profile in data/browser. Sign in there once to keep the session.
 """
 from __future__ import annotations
 
@@ -33,8 +27,7 @@ CHROME_BINARIES = (
     "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
     "brave-browser", "microsoft-edge",
 )
-# A snapshot is meant to be read by a model, so it is capped like any other
-# tool result rather than handing back the whole DOM of a web application.
+# Cap snapshots so a large DOM does not fill the model's context.
 MAX_ELEMENTS = 120
 MAX_TEXT = 6000
 NAV_TIMEOUT = 20.0
@@ -42,10 +35,9 @@ NAV_TIMEOUT = 20.0
 _lock = threading.RLock()
 _ws: Any = None
 _proc: subprocess.Popen | None = None
-# The tab Aether drives. Pinned so it cannot wander onto one of the user's.
+# The tab Olith drives. Pinned so it cannot wander onto one of the user's.
 _target_id: str | None = None
-# Advances whenever an action changes the page. The loop's duplicate-call guard
-# folds it in, so a click that worked makes the next identical click a new call.
+# Advance after page changes so valid repeat actions get a new signature.
 _state_id = 0
 
 
@@ -118,7 +110,7 @@ def _launch() -> None:
             # is not: it pulls in sync, profile prompts and restored tabs.
             "--disable-sync",
             "--disable-features=SigninInterceptBubble,SyncPromoOnSignin,ChromeSigninInterceptBubble",
-            # Aether's window, not a hijack of the user's session.
+            # Olith's window, not a hijack of the user's session.
             "--new-window",
             "about:blank",
         ],
@@ -136,7 +128,7 @@ def _launch() -> None:
 
 
 def _page() -> dict:
-    """The tab Aether drives, created if it does not have one yet.
+    """The tab Olith drives, created if it does not have one yet.
 
     Its own tab, not whichever page is first, so a run cannot navigate one of
     the user's.
@@ -221,7 +213,7 @@ def evaluate(expression: str, await_promise: bool = False) -> Any:
 
 
 def close() -> dict:
-    """Shut the browser Aether opened. One it merely attached to is left alone."""
+    """Shut the browser Olith opened. One it merely attached to is left alone."""
     global _proc, _target_id
     _drop()
     _target_id = None
@@ -248,6 +240,7 @@ def status() -> dict:
             page = _page()
             out["url"] = page.get("url")
             out["title"] = page.get("title")
+            out.update(evaluate("({url: location.href, title: document.title, ready_state: document.readyState})") or {})
         except Exception:
             pass
     return out
@@ -257,8 +250,7 @@ def status() -> dict:
 # Looking at the page
 # --------------------------------------------------------------------------
 
-# Everything a person could act on. Roles carry the rest: a div with
-# role="button" is a button however it was built.
+# Find interactive elements, including custom roles such as role="button".
 _SNAPSHOT_JS = """
 (() => {
   const MAX = %d;
@@ -286,7 +278,7 @@ _SNAPSHOT_JS = """
     const role = el.getAttribute('role') || el.tagName.toLowerCase();
     if (!name && !['input', 'textarea', 'select'].includes(el.tagName.toLowerCase())) continue;
     const ref = 'e' + (++n);
-    el.setAttribute('data-aether-ref', ref);
+    el.setAttribute('data-olith-ref', ref);
     const item = {ref, role, name};
     if (el.type === 'password') { item.secret = true; item.name = name || 'password'; }
     if (el.value !== undefined && el.value !== '') item.value = clean(String(el.value));
@@ -299,7 +291,7 @@ _SNAPSHOT_JS = """
   }
   const signIn = !!document.querySelector('input[type="password"]');
   return {url: location.href, title: document.title, elements: out, signIn,
-          focused: document.activeElement ? (document.activeElement.getAttribute('data-aether-ref') ||
+          focused: document.activeElement ? (document.activeElement.getAttribute('data-olith-ref') ||
                    document.activeElement.tagName.toLowerCase()) : null};
 })()
 """ % MAX_ELEMENTS
@@ -317,7 +309,7 @@ _TEXT_JS = """
 # the box is read back and what is actually on top of it is checked first.
 _LOCATE_JS = """
 (() => {
-  const el = document.querySelector('[data-aether-ref="%s"]');
+  const el = document.querySelector('[data-olith-ref="%s"]');
   if (!el) return {missing: true};
   el.scrollIntoView({block: 'center', inline: 'center'});
   const r = el.getBoundingClientRect();
@@ -346,12 +338,11 @@ _LOCATE_JS = """
 })()
 """
 
-# Clearing and notifying are separate steps, with the text going in between
-# through the browser's own input path. A framework watching for real input
-# events ignores a value assigned to the element.
+# Clear the field, insert through Chrome's input API, then notify the page.
+# Assigning its value directly would miss framework input handlers.
 _CLEAR_JS = """
 (() => {
-  const el = document.querySelector('[data-aether-ref="%s"]');
+  const el = document.querySelector('[data-olith-ref="%s"]');
   if (!el) return false;
   el.focus();
   if (el.value !== undefined) el.value = '';
@@ -362,7 +353,7 @@ _CLEAR_JS = """
 
 _NOTIFY_JS = """
 (() => {
-  const el = document.querySelector('[data-aether-ref="%s"]');
+  const el = document.querySelector('[data-olith-ref="%s"]');
   if (!el) return false;
   el.dispatchEvent(new Event('input', {bubbles: true}));
   el.dispatchEvent(new Event('change', {bubbles: true}));
@@ -372,7 +363,7 @@ _NOTIFY_JS = """
 
 _IS_SECRET_JS = """
 (() => {
-  const el = document.querySelector('[data-aether-ref="%s"]');
+  const el = document.querySelector('[data-olith-ref="%s"]');
   return !!el && (el.type === 'password' || el.autocomplete === 'current-password');
 })()
 """
@@ -447,8 +438,7 @@ def _send_key(combo: str) -> None:
     key, code, vk = _key_spec(final)
     base = {"modifiers": mask, "key": key, "code": code,
             "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
-    # A plain printable key needs the char event too, or the page sees the
-    # keydown and never receives the character.
+    # Send the char event for printable keys as well as keydown.
     kind = "keyDown" if (not mask and len(key) == 1) else "rawKeyDown"
     cmd("Input.dispatchKeyEvent", type=kind, text=key if kind == "keyDown" else "", **base)
     cmd("Input.dispatchKeyEvent", type="keyUp", **base)
@@ -483,13 +473,19 @@ def run(args: dict) -> str:
                 return json.dumps({"error": "open needs a url"})
             if not url.startswith(("http://", "https://", "about:", "file://")):
                 url = "https://" + url
-            cmd("Page.navigate", url=url)
+            if args.get("focus"):
+                cmd("Page.bringToFront")
+            navigation = cmd("Page.navigate", url=url)
+            if navigation.get("errorText"):
+                return json.dumps({"error": f"{url} did not load: {navigation['errorText']}"})
             _moved()
+            # Start login navigation without waiting for every page resource.
+            if args.get("wait") is False:
+                return json.dumps({"ok": True, "action": "open", "state": "loading", "url": url})
             state = _wait_loaded()
             page = evaluate("({url: location.href, title: document.title})") or {}
             if str(page.get("url", "")).startswith("chrome-error://"):
-                # Chrome serves its own error page and reports it as loaded,
-                # so "ok" here would let the model believe it reached the site.
+                # Treat Chrome's own error pages as navigation failures.
                 return json.dumps({
                     "error": f"{url} did not load.",
                     "hint": "Check the address, or whether the machine is online.",
@@ -508,21 +504,19 @@ def run(args: dict) -> str:
                 ),
             }
             if snap.get("signIn"):
-                # This profile is signed in to nothing until the user signs it
-                # in, and saying so beats a run trying to get past the wall.
+                # Report missing sign-in instead of trying to bypass the login page.
                 out["sign_in_required"] = (
-                    "This page is asking for a password. Aether's browser has its own "
+                    "This page is asking for a password. Olith's browser has its own "
                     "profile and does not share the session in the browser the user "
                     "already has open. Stop here and tell them to sign in once in the "
-                    "Aether browser window; it is remembered after that. Never type "
+                    "Olith browser window; it is remembered after that. Never type "
                     "someone's password yourself."
                 )
             return json.dumps(out)
         if action == "read":
             page = evaluate(_TEXT_JS) or {}
             if page.get("canvas") and len((page.get("text") or "").strip()) < 200:
-                # Google Docs and its like draw the document rather than
-                # writing it into the page, so there is nothing here to read.
+                # Canvas-based documents need a screenshot; the DOM has no document text.
                 page["cannot_read"] = (
                     "This page draws its content on a canvas, so its text is not in the "
                     "page and cannot be read here. The toolbar and menus still are: use "
@@ -576,8 +570,7 @@ def run(args: dict) -> str:
                 "hint": "The page changed, so the refs did. Take a new snapshot.",
             })
         if found.get("covered"):
-            # A ref means the click lands on the thing it names, so a covered
-            # element is refused rather than clicked through.
+            # Refuse a covered target instead of clicking through to another element.
             return json.dumps({
                 "error": f"{ref} is behind something else ({found.get('over')}).",
                 "hint": "Deal with what is on top of it first, then snapshot again.",
@@ -595,7 +588,7 @@ def run(args: dict) -> str:
                     "error": "Refused: that is a password field.",
                     "hint": (
                         "Credentials are the user's to type. Tell them to sign in "
-                        "themselves in the Aether browser window."
+                        "themselves in the Olith browser window."
                     ),
                 })
             _mouse(found["x"], found["y"])

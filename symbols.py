@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Find one function or class in a file without reading the whole thing.
+"""Read a function, class or file outline by name.
 
-A symbol has a name the model already knows from the request, so it does not
-have to guess line numbers. Python is parsed with `ast` and is exact.
-JavaScript and TypeScript are brace-counted, and say so with `exact: false`.
+Use Python's AST or bundled Tree-sitter grammars. The JS/TS brace-counting
+fallback is marked exact: false.
 """
 from __future__ import annotations
 
 import ast
 import re
+from functools import lru_cache
+from pathlib import Path
+
+import code_structure
 
 PY_SUFFIXES = {".py", ".pyi"}
 JS_SUFFIXES = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
@@ -25,7 +28,7 @@ def language_for(path: str) -> str | None:
         return "python"
     if suffix in JS_SUFFIXES:
         return "javascript"
-    return None
+    return code_structure.LANGUAGES.get(suffix)
 
 
 def _signature(lines: list[str], start: int) -> str:
@@ -95,12 +98,9 @@ _JS_PATTERNS = (
 
 
 def _js_end(lines: list[str], start_idx: int) -> int:
-    """Brace-match forward from the declaration. Best effort by construction.
+    """Find the closing brace as a fallback.
 
-    Braces inside strings, template literals, regex literals and comments are
-    not excluded. Getting that right needs a real parser, which is the
-    dependency this module exists to avoid, so the result is flagged inexact
-    rather than pretended to be reliable.
+    Braces in strings and comments can confuse this check, so mark it inexact.
     """
     depth = 0
     seen = False
@@ -141,15 +141,21 @@ def _js_entries(text: str) -> list[dict]:
 # ── public ────────────────────────────────────────────────────────────────
 
 def outline(text: str, path: str) -> list[dict] | None:
-    """Every top-level definition, cheapest possible orientation for a file.
+    # Cache by content to catch external edits. Return copies to protect cached entries.
+    entries = _outline_cached(text, Path(path).suffix.lower())
+    return [dict(e) for e in entries] if entries is not None else None
 
-    None when the language is unsupported or the source does not parse, which
-    the caller turns into a line-range fallback rather than an error.
-    """
-    lang = language_for(path)
+
+@lru_cache(maxsize=32)
+def _outline_cached(text: str, suffix: str) -> list[dict] | None:
+    """List top-level definitions. Return None for a line read if the language or parser is unavailable."""
+    lang = language_for(suffix)
     try:
         if lang == "python":
             return _py_entries(text)
+        parsed = code_structure.tree_outline(text, "source" + suffix)
+        if parsed is not None:
+            return parsed
         if lang == "javascript":
             return _js_entries(text)
     except (SyntaxError, ValueError, RecursionError):
@@ -158,11 +164,7 @@ def outline(text: str, path: str) -> list[dict] | None:
 
 
 def find(text: str, path: str, name: str) -> dict | None:
-    """One definition by name, with its source.
-
-    Accepts `method` as well as `Class.method`: a model that has read a
-    traceback knows the bare name and should not have to work out the class.
-    """
+    """Read one definition by name. Accept method as well as Class.method."""
     entries = outline(text, path)
     if not entries:
         return None

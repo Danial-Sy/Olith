@@ -24,7 +24,24 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
       - name: Check JavaScript syntax
-        run: node --check static/app.js
+        run: |
+          node --check static/app.js
+          node --check static/connection_logos.js
+          node --check static/browser_connections.js
+          node --check static/integrations.js
+          node --check static/tool_connections.js
+          node --check extensions/olith-vscode/extension.js
+          node --check extensions/olith-vscode/client.js
+          node --check extensions/olith-vscode/webview.js
+          node --check extensions/olith-vscode/media/chat.js
+      - name: Test VS Code extension client
+        run: |
+          node extensions/olith-vscode/test/client.test.js
+          node extensions/olith-vscode/test/webview.test.js
+          node tests/test_integrations_ui.js
+          node tests/test_tool_connections_ui.js
+          node tests/test_connection_logos.js
+          node tests/test_browser_connections_ui.js
 
   validate-windows-installer:
     runs-on: windows-latest
@@ -62,9 +79,11 @@ jobs:
       - name: Build source archive
         env:
           TAG: ${{ github.ref_name }}
-        run: git archive --format=zip --prefix="aether-${TAG}/" --output="aether-${TAG}.zip" HEAD
+        run: git archive --format=zip --prefix="olith-${TAG}/" --output="olith-${TAG}.zip" HEAD
+      - name: Build VS Code extension
+        run: python scripts/package_vscode.py
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" "aether-${TAG}.zip" --verify-tag --generate-notes --title "Aether $TAG"
+        run: gh release create "$TAG" "olith-${TAG}.zip" "dist/olith-vscode.vsix" --verify-tag --generate-notes --title "Olith $TAG"

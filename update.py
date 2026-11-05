@@ -1,22 +1,18 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Update Aether in place from the latest GitHub release.
+"""Update Olith from a GitHub release.
 
-Reads the version this copy is running, asks GitHub for the latest release,
-and stops there if the two match. Otherwise it downloads that release, backs
-up every file it is about to touch, replaces the program files, removes files
-the new release dropped, and reinstalls Python packages if requirements moved.
-
-Nothing under `data/` or `.venv/` is ever read as program code or overwritten,
-so chats, settings, projects and the virtualenv survive an update.
+Check the version, download the release, back up changed files and apply it.
+Remove files from the previous install manifest and reinstall dependencies
+when requirements change. Preserve data/ and .venv/.
 
 Usage:
   python update.py            # check, ask, then update
-  python update.py --check    # report only, change nothing
+  python update.py --check    # check only
   python update.py --yes      # update without asking
-  python update.py --force    # reinstall even if already on the latest
-  python update.py --pre      # consider pre-releases too
+  python update.py --force    # reinstall the current version
+  python update.py --pre      # include pre-releases
 """
 from __future__ import annotations
 
@@ -40,11 +36,10 @@ STATE = ROOT / "data" / "updates"
 MANIFEST = STATE / "installed.json"
 BACKUPS = STATE / "backups"
 
-REPO = (os.environ.get("AETHER_UPDATE_REPO") or "Danial-Sy/Aether").strip()
+REPO = (os.environ.get("OLITH_UPDATE_REPO") or "Danial-Sy/Olith").strip()
 API = f"https://api.github.com/repos/{REPO}/releases"
 
-# Never touched by an update: user data, the virtualenv, local overrides, and
-# the git metadata of a development checkout.
+# Preserve user data, the virtualenv, local overrides and Git metadata.
 PROTECTED = (
     "data",
     ".venv",
@@ -52,13 +47,13 @@ PROTECTED = (
     ".git",
     "__pycache__",
     ".pytest_cache",
-    "aether.local.json",
+    "olith.local.json",
     ".env",
 )
 
-# A downloaded tree that is missing any of these is not Aether, and is refused
+# A downloaded tree that is missing any of these is not Olith, and is refused
 # before a single file is replaced.
-REQUIRED = ("config.py", "server.py", "aether.json")
+REQUIRED = ("config.py", "server.py", "olith.json")
 
 
 def log(msg: str) -> None:
@@ -75,10 +70,9 @@ def die(msg: str, code: int = 1) -> None:
 
 
 def parse_version(text: str) -> tuple[tuple[int, ...], int]:
-    """Sort key for a release name: numbers first, then final-beats-prerelease.
+    """Sort release versions, accepting an optional app name or v prefix.
 
-    Accepts "v1.3.0", "1.3.0", "Aether v1.4.0" and "1.4.0-rc1". A prerelease
-    suffix sorts below the same numbers without one, so 1.4.0-rc1 < 1.4.0.
+    A prerelease sorts before the same version's final release.
     """
     raw = (text or "").strip()
     match = re.search(r"\d+(?:\.\d+)*", raw)
@@ -101,18 +95,14 @@ def compare_versions(left: str, right: str) -> int:
 
 
 def read_version(root: Path) -> str:
-    """The version an Aether tree reports, without importing it.
-
-    config.py is the source of truth the app itself uses; aether.json is the
-    fallback so a release whose config moved still reports something sane.
-    """
+    """Read the version from config.py without importing it, with olith.json as a fallback."""
     config = root / "config.py"
     if config.exists():
         text = config.read_text(encoding="utf-8", errors="replace")
         match = re.search(r"""^VERSION\s*=\s*["']([^"']+)["']""", text, re.M)
         if match:
             return match.group(1)
-    meta = root / "aether.json"
+    meta = root / "olith.json"
     if meta.exists():
         try:
             value = json.loads(meta.read_text(encoding="utf-8")).get("version")
@@ -130,7 +120,7 @@ def read_version(root: Path) -> str:
 def _request(url: str) -> urllib.request.Request:
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": f"Aether-Updater/{read_version(ROOT)}",
+        "User-Agent": f"Olith-Updater/{read_version(ROOT)}",
     }
     token = (os.environ.get("GITHUB_TOKEN") or "").strip()
     if token:
@@ -185,7 +175,7 @@ def pick_download(release: dict) -> tuple[str, str]:
     url = release.get("zipball_url")
     if not url:
         die("That release has no downloadable source archive.")
-    return url, f"aether-{release_version(release) or 'latest'}.zip"
+    return url, f"olith-{release_version(release) or 'latest'}.zip"
 
 
 def download(url: str, dest: Path) -> Path:
@@ -214,7 +204,7 @@ def download(url: str, dest: Path) -> Path:
 
 
 def extract(archive: Path, dest: Path) -> Path:
-    """Unpack the archive and return the Aether tree inside it."""
+    """Unpack the archive and return the Olith tree inside it."""
     try:
         with zipfile.ZipFile(archive) as zf:
             for member in zf.namelist():
@@ -277,10 +267,9 @@ def save_manifest(version: str, tag: str, files: list[Path]) -> None:
 
 
 def stale_files(new_files: list[Path]) -> list[Path]:
-    """Files the previous release installed that this one no longer ships.
+    """List old files to remove using the previous install manifest.
 
-    Only files this updater put there are ever removed. Without a manifest,
-    meaning the first update or a copy installed by hand, nothing is deleted.
+    If no manifest exists, delete nothing.
     """
     previous = load_manifest().get("files")
     if not isinstance(previous, list):
@@ -337,8 +326,7 @@ def install_files(source_root: Path, files: list[Path]) -> list[Path]:
             created.append(rel)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_root / rel, target)
-        # git archive does not carry the executable bit into a zip, so restore
-        # it for the launchers that need to be clickable on Linux.
+        # Restore executable permissions on Linux launchers after extracting the ZIP.
         if os.name != "nt" and rel.suffix in (".sh", ".desktop"):
             target.chmod(0o755)
     return created
@@ -379,10 +367,10 @@ def refresh_dependencies() -> None:
             f"{'setup.bat' if sys.platform == 'win32' else './setup.sh'} --skip-models")
 
 
-def aether_is_running() -> bool:
+def olith_is_running() -> bool:
     import socket
 
-    host, _, port = (os.environ.get("AETHER_URL") or "127.0.0.1:7878").rpartition(":")
+    host, _, port = (os.environ.get("OLITH_URL") or "127.0.0.1:7878").rpartition(":")
     try:
         with socket.create_connection((host or "127.0.0.1", int(port or 7878)), 0.4):
             return True
@@ -402,7 +390,7 @@ def prune_backups(keep: int = 3) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Update Aether from its latest GitHub release.")
+    p = argparse.ArgumentParser(description="Update Olith from its latest GitHub release.")
     p.add_argument("--check", action="store_true", help="Report only, change nothing")
     p.add_argument("--yes", "-y", action="store_true", help="Do not ask before updating")
     p.add_argument("--force", action="store_true",
@@ -410,7 +398,7 @@ def main() -> None:
     p.add_argument("--pre", action="store_true", help="Consider pre-releases too")
     args = p.parse_args()
 
-    print("Aether update")
+    print("Olith update")
     print("=============")
     current = read_version(ROOT)
     log(f"Installed: {current}")
@@ -457,8 +445,8 @@ def main() -> None:
                 print("Cancelled.")
                 return
 
-    if aether_is_running():
-        log("Aether looks like it is still running. Close it, then run this again.")
+    if olith_is_running():
+        log("Olith looks like it is still running. Close it, then run this again.")
         if not args.yes:
             answer = input("Update anyway? [y/N]: ").strip().lower()
             if not answer.startswith("y"):
@@ -466,7 +454,7 @@ def main() -> None:
                 return
 
     url, name = pick_download(release)
-    with tempfile.TemporaryDirectory(prefix="aether-update-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="olith-update-") as tmp:
         work = Path(tmp)
         archive = download(url, work / name)
         source = extract(archive, work / "unpacked")
@@ -503,7 +491,7 @@ def main() -> None:
     prune_backups()
 
     print()
-    print(f"Updated to {new_version}. Restart Aether to run it.")
+    print(f"Updated to {new_version}. Restart Olith to run it.")
     print()
 
 

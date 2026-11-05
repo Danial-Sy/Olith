@@ -1,18 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""What a run is not allowed to do to a document, whichever tool it uses.
+"""Share document editing rules between the browser and desktop tools.
 
-The desktop and browser tools have the same reach into the same document, so
-they share both the rules and the state: a selection made with one is still a
-selection when the other one types. See ARCHITECTURE.md for what each refusal
-is there to stop.
+Both tools use the same selection state, including selections made by the other.
 """
 from __future__ import annotations
 
 # Keys that select the whole document.
 SELECT_ALL_KEYS = frozenset({"ctrl+a", "control+a", "cmd+a", "super+a", "meta+a"})
-# Keys that overwrite a selection whatever is held with them. Tab is not one:
-# it indents, which also keeps alt+Tab out of the way.
+# Keys that replace a selection with any modifier. Exclude Tab so
+# indentation and alt+Tab still work.
 REPLACING_KEYS = frozenset({"return", "enter", "delete", "backspace", "space"})
 # Keys that move the caret, which drops any selection with it.
 CARET_KEYS = frozenset({
@@ -43,10 +40,9 @@ def combo_of(args: dict) -> str:
 
 
 def is_replacing_key(combo: str) -> bool:
-    """A keypress that would overwrite a selection rather than act on it.
+    """Check whether the final key would replace a selection.
 
-    Only the key at the end decides: ctrl+b keeps the selection, ctrl+End moves
-    off it, shift+Delete destroys it.
+    Formatting keys preserve it; movement keys leave it; Delete replaces it.
     """
     return combo.split("+")[-1] in REPLACING_KEYS
 

@@ -10,14 +10,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class WindowsLauncherContractTests(unittest.TestCase):
     def test_shortcut_launcher_uses_repo_venv_and_desktop_entrypoint(self):
-        source = (ROOT / "Aether.vbs").read_text(encoding="utf-8")
+        source = (ROOT / "Olith.vbs").read_text(encoding="utf-8")
         self.assertIn(r"\.venv\Scripts\pythonw.exe", source)
         self.assertIn(r"\desktop.py", source)
         self.assertIn("fso.FileExists(pyw)", source)
         self.assertIn("fso.FileExists(desk)", source)
 
     def test_shortcut_preserves_existing_ollama_host(self):
-        source = (ROOT / "Aether.vbs").read_text(encoding="utf-8")
+        source = (ROOT / "Olith.vbs").read_text(encoding="utf-8")
         self.assertIn(
             'If Len(env("OLLAMA_HOST")) = 0 Then env("OLLAMA_HOST") = '
             '"127.0.0.1:11434"',
@@ -29,7 +29,7 @@ class WindowsLauncherContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(r'System32\wscript.exe"', source)
-        self.assertIn("Aether.vbs", source)
+        self.assertIn("Olith.vbs", source)
         self.assertIn("$shortcut.WorkingDirectory = $Root", source)
 
 
@@ -38,11 +38,7 @@ if __name__ == "__main__":
 
 
 class WindowsInstallerWizardTests(unittest.TestCase):
-    """The installer offers Default, Recommended, or a tag you type.
-
-    PowerShell is parsed properly by CI on Windows. These are the structural
-    checks that can run anywhere, so a broken edit is caught before the push.
-    """
+    """Check installer structure on any platform. CI parses the PowerShell on Windows."""
 
     def setUp(self):
         self.text = (ROOT / "scripts" / "install-windows.ps1").read_text(encoding="utf-8")

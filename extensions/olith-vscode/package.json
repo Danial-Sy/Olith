@@ -1,0 +1,40 @@
+{
+  "name": "olith-vscode",
+  "displayName": "Olith",
+  "description": "Local Olith agent chat, task review, selection context, and diagnostic fixes.",
+  "version": "0.1.6",
+  "icon": "media/olith.png",
+  "publisher": "olith",
+  "license": "AGPL-3.0-or-later",
+  "repository": {"type": "git", "url": "https://github.com/Danial-Sy/Olith"},
+  "engines": {"vscode": "^1.85.0"},
+  "categories": ["Machine Learning", "Other"],
+  "main": "./extension.js",
+  "activationEvents": ["onView:olith.chat", "onLanguage"],
+  "capabilities": {"untrustedWorkspaces": {"supported": false}, "virtualWorkspaces": {"supported": false}},
+  "contributes": {
+    "commands": [
+      {"command": "olith.connect", "title": "Olith: Connect to Olith"},
+      {"command": "olith.open", "title": "Olith: Open Chat"},
+      {"command": "olith.newChat", "title": "Olith: New Chat"},
+      {"command": "olith.addFiles", "title": "Olith: Add Files to Chat"},
+      {"command": "olith.chooseWorkspace", "title": "Olith: Choose Workspace Folder"},
+      {"command": "olith.sendSelection", "title": "Olith: Send Selection"},
+      {"command": "olith.fixDiagnostic", "title": "Fix with Olith"},
+      {"command": "olith.review", "title": "Olith: Review Task Changes"},
+      {"command": "olith.stop", "title": "Olith: Stop Task"},
+      {"command": "olith.disconnect", "title": "Olith: Disconnect"}
+    ],
+    "menus": {
+      "editor/context": [{"command": "olith.sendSelection", "when": "editorHasSelection && isWorkspaceTrusted && resourceScheme == file", "group": "navigation@20"}],
+      "view/title": [{"command": "olith.newChat", "when": "view == olith.chat", "group": "navigation"}]
+    },
+    "viewsContainers": {"activitybar": [{"id": "olith-agent", "title": "Olith", "icon": "media/olith-activity.svg"}]},
+    "views": {"olith-agent": [{"id": "olith.chat", "name": "Olith", "type": "webview"}]},
+    "configuration": {
+      "title": "Olith",
+      "properties": {"olith.serverUrl": {"type": "string", "default": "http://127.0.0.1:7878", "description": "Local Olith backend. Only HTTP loopback addresses are accepted.", "scope": "machine"}}
+    }
+  },
+  "scripts": {"test": "node test/client.test.js && node test/webview.test.js"}
+}

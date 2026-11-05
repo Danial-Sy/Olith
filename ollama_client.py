@@ -20,9 +20,8 @@ from models import CTX_BUCKETS as buckets
 _loaded_model: str | None = None
 
 
-# Applied to `ollama serve` (and the systemd unit on Linux).
-# Windows WDDM overcommits VRAM→RAM by default; Linux CUDA does not unless
-# llama.cpp unified memory is on. KV q8_0 is what makes 64k–256k viable on 24 GB.
+# Settings for ollama serve and its Linux systemd unit.
+# Enable unified memory for Linux VRAM spillover and q8_0 for smaller KV caches.
 OLLAMA_SERVE_ENV = {
     "OLLAMA_KV_CACHE_TYPE": "q8_0",
     "OLLAMA_FLASH_ATTENTION": "1",
@@ -281,17 +280,12 @@ async def force_load_model(model_id: str, *, meta: dict | None = None, num_ctx: 
     return meta
 
 
-# Chars per token. Prose sits near 4.0, but code and tool-result JSON tokenize
-# far denser because punctuation and indentation each tend to cost a token. A
-# flat 4.0 underestimated real transcripts by 2.3-2.8x, and underestimating is
-# what makes compaction fire late and num_ctx come out too small. The prompt
-# then overflows and Ollama truncates it from the front, dropping the system
-# prompt and the plan, which is what made long runs forget and restart.
+# Estimate tokens by content type. Code and JSON need more tokens per
+# character than prose; underestimating can make Ollama drop older context.
 _CPT_PROSE = 4.0
 _CPT_DENSE = 1.7
 _DENSITY_SATURATION = 0.25
-# Scanning a whole 100k-char prompt every step is wasted work; the symbol
-# density of a large body is stable well before that.
+# Sample large prompts; symbol density stabilizes before 100k characters.
 _DENSITY_SAMPLE = 20_000
 
 
@@ -341,9 +335,7 @@ def estimate_messages_tokens(messages: list[dict]) -> int:
             total += estimate_tokens(att.get("text") or "") + 20
             if att.get("kind") in ("image", "screenshot") or att.get("has_image"):
                 total += estimate_image_tokens(att.get("image_b64"))
-        # tool_calls are part of the prompt too. write_file carries an entire file
-        # in its arguments, so skipping these under-sized num_ctx badly enough that
-        # Ollama truncated the user message away and failed with a 500.
+        # Count tool arguments too; write_file can carry an entire source file.
         total += estimate_tokens(m.get("tool_name") or m.get("name") or "")
         for tc in m.get("tool_calls") or []:
             fn = tc.get("function") if isinstance(tc, dict) else None
@@ -368,9 +360,7 @@ def effective_num_ctx(
 ) -> int:
     """Use only as much KV as needed. Full 128K/256K alloc is what makes short chats feel slow."""
     floor = max(2048, int(floor))
-    # The prompt size is an estimate (chars/4), so size against a padded figure.
-    # Undersizing makes Ollama truncate the front of the conversation and fail
-    # with "no user query found in messages"; overshooting only costs some KV.
+    # Pad the token estimate so Ollama does not truncate the front of the prompt.
     padded = int(int(estimated_prompt_tokens) * 1.15) + 256
     need = max(floor, padded + int(reply_headroom))
     limit = max(floor, int(ctx_limit))
@@ -417,9 +407,7 @@ def normalize_chat_messages(messages: list[dict]) -> list[dict[str, Any]]:
         if m.get("tool_calls"):
             entry["tool_calls"] = m["tool_calls"]
         if m.get("role") == "tool":
-            # The /api/chat schema calls this field ``tool_name``.  ``name`` is
-            # an OpenAI-chat convention and is ignored by Ollama, so previous
-            # Aether runs returned anonymous tool results to the model.
+            # Ollama expects tool_name here. It ignores the OpenAI-style name field.
             tool_name = m.get("tool_name") or m.get("name")
             if tool_name:
                 entry["tool_name"] = tool_name
@@ -448,17 +436,15 @@ async def stream_chat(
         payload["tools"] = tools
     if think is not None:
         payload["think"] = bool(think)
-    # If the KV window was still sized too small, Ollama truncates the prompt and
-    # 500s. Nothing has been yielded at that point, so growing num_ctx and
-    # retrying once is safe and turns a dead run into a slower but working one.
+    # If an undersized window causes a 500 before output starts, grow it
+    # and retry once.
     for attempt in range(3):
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("POST", f"{OLLAMA_HOST}/api/chat", json=payload) as resp:
                 if resp.status_code >= 400:
                     detail = (await resp.aread()).decode("utf-8", "replace")[:400]
-                    # A stale profile can still ask a model to think. Ollama says
-                    # so explicitly, and the request is fine without it. Popping
-                    # the key is what stops this retrying twice.
+                    # Retry without think if Ollama rejects a stale capability profile.
+                    # Remove the key so this retry happens only once.
                     if "does not support thinking" in detail and "think" in payload:
                         payload.pop("think", None)
                         continue

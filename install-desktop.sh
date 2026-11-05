@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Install the Aether launcher into the app menu AND onto the Desktop, so it can be
-# started by clicking an icon instead of running a script by hand.
+# Install clickable Olith launchers in the app menu and on the desktop.
 set -euo pipefail
 cd "$(dirname "$0")"
 APP_DIR="$(pwd)"
@@ -11,26 +10,25 @@ mkdir -p "$APPS" "$DESKTOP_DIR"
 
 # Rewrite the absolute paths for wherever this checkout actually lives.
 gen() {
-  sed -e "s|^Exec=.*|Exec=${APP_DIR}/aether.sh|" \
+  sed -e "s|^Exec=.*|Exec=${APP_DIR}/olith.sh|" \
       -e "s|^Path=.*|Path=${APP_DIR}|" \
-      -e "s|^Icon=.*|Icon=${APP_DIR}/static/assets/aether.png|" \
-      Aether.desktop > "$1"
+      -e "s|^Icon=.*|Icon=${APP_DIR}/static/assets/olith.png|" \
+      Olith.desktop > "$1"
 }
 
-chmod +x aether.sh
+chmod +x olith.sh
 
-gen "$APPS/aether.desktop"
-chmod 644 "$APPS/aether.desktop"
+gen "$APPS/olith.desktop"
+chmod 644 "$APPS/olith.desktop"
 
-gen "$DESKTOP_DIR/Aether.desktop"
-chmod 755 "$DESKTOP_DIR/Aether.desktop"
+gen "$DESKTOP_DIR/Olith.desktop"
+chmod 755 "$DESKTOP_DIR/Olith.desktop"
 
-# GNOME/Nautilus refuse to launch a .desktop file that is not marked trusted.
-# Prefer the system gio: a conda/homebrew gio earlier on PATH is often built
-# without GVFS metadata support and silently fails to set this.
+# Mark the launcher trusted for GNOME. Prefer system gio because other
+# installs may lack GVFS metadata support.
 for GIO in /usr/bin/gio "$(command -v gio 2>/dev/null || true)"; do
   [ -x "$GIO" ] || continue
-  if "$GIO" set "$DESKTOP_DIR/Aether.desktop" metadata::trusted true 2>/dev/null; then
+  if "$GIO" set "$DESKTOP_DIR/Olith.desktop" metadata::trusted true 2>/dev/null; then
     break
   fi
 done
@@ -39,5 +37,5 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 echo "Installed:"
-echo "  app menu : $APPS/aether.desktop"
-echo "  desktop  : $DESKTOP_DIR/Aether.desktop"
+echo "  app menu : $APPS/olith.desktop"
+echo "  desktop  : $DESKTOP_DIR/Olith.desktop"

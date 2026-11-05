@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Tool-selection accuracy, per size-based mechanism, against real models.
+"""Compare tool-choice options against real models. All ship disabled in policy.py.
 
-Correctness tests prove the mechanisms do what they say. They cannot prove one
-helps. This asks that question, and its answer so far is that none of them do:
-every dial is off in policy.py because each measured worse than leaving the
-tool list alone.
+Compare each option with baseline. shipped should match baseline.
 
-`shipped` is what a model actually receives today and should track `baseline`.
-The rest are the rejected mechanisms, kept runnable so a future change has to
-beat a measurement rather than an argument.
+    python3 scripts/bench_tool_choice.py
+    python3 scripts/bench_tool_choice.py llama3.2:3b
 
-    python3 scripts/bench_tool_choice.py                  # every model found
-    python3 scripts/bench_tool_choice.py llama3.2:3b      # just one
-
-Needs Ollama running. Nothing here writes to the repo.
+Requires Ollama. Does not write to the repo.
 """
 from __future__ import annotations
 
@@ -35,13 +28,9 @@ import policy  # noqa: E402
 HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 NUM_CTX = 8192
 
-# One unambiguous right answer each: the tool a person would reach for. Written
-# the way users actually phrase things, not the way the schemas are worded, so
-# a model cannot pass by string-matching the description.
+# Use clear requests with one expected tool. Avoid copying schema wording.
 PROMPTS = [
-    # Weighted the way real agentic work is: reading, searching and editing
-    # dominate, and the rare tools appear a couple of times each. A set that
-    # gave every tool equal billing would overstate what the budget costs.
+    # Include more reading, searching and editing requests to match normal usage.
     ("what's in the src folder?", "list_dir"),
     ("show me the files in this directory", "list_dir"),
     ("list everything under tests/", "list_dir"),
@@ -122,11 +111,7 @@ def profile_for(model: str) -> dict:
 
 
 def ask(model: str, prompt: str, tools: list[dict]) -> tuple[str | None, bool]:
-    """The tool this model picks. Returns (canonical name, came_via_alias).
-
-    Temperature 0 and a fixed seed, so a difference between two runs is the
-    payload and never the sampler.
-    """
+    """Return the chosen tool and whether its name was an alias. Use temperature 0 and a fixed seed."""
     system = config.SYSTEM_PROMPTS["agentic"] + agent.tools_system_addon(tools)
     body = post("/api/chat", {
         "model": model,
@@ -148,21 +133,12 @@ def ask(model: str, prompt: str, tools: list[dict]) -> tuple[str | None, bool]:
     return name, bool(raw and name and raw != name)
 
 
-# The dials the ablation tries, by tier. These are NOT what ships: every tier
-# in policy.py has all three off, because measured against these settings they
-# made every model worse. They live here so the question can be re-asked on a
-# model we have not seen, and so re-enabling one means beating a measurement.
+# Benchmark variants only. Every size-based option stays off in policy.py.
 REFERENCE_BUDGET = {"tiny": 7, "small": 9, "mid": 11, "full": None}
 
 
 def variants(prof: dict) -> list[tuple[str, list[dict]]]:
-    """Each mechanism alone, then together.
-
-    Measuring only the combined policy cannot say which mechanism earned its
-    place, and they pull in different directions: ordering keeps every tool and
-    moves it, budget removes tools outright. An ablation is the only way to
-    tell a win from two effects cancelling.
-    """
+    """Compare each option alone, then together, to show which change affects the result."""
     tier = policy.tier_for(prof)
     base = agent.TOOL_DEFS
     only = lambda **kw: {"tool_budget": None, "order_tools": False,  # noqa: E731
@@ -171,8 +147,7 @@ def variants(prof: dict) -> list[tuple[str, list[dict]]]:
     combined = {"tool_budget": budget, "order_tools": False, "lean_schemas": tier != "full"}
     out = [
         ("baseline", base),
-        # No ctx limit, so this isolates the policy from the separate
-        # small-window trim. It should equal baseline, and that is the point.
+        # Disable context trimming to measure the model-size policy separately.
         ("shipped", agent.tool_defs_for({"delegate_available": True}, None, prof)),
         ("order", agent.apply_policy(base, only(order_tools=True))),
         ("budget", agent.apply_policy(base, only(tool_budget=budget))),
@@ -180,10 +155,7 @@ def variants(prof: dict) -> list[tuple[str, list[dict]]]:
         ("budget+lean", agent.apply_policy(base, combined)),
         ("all", agent.apply_policy(base, {**combined, "order_tools": True})),
     ]
-    # On a full-tier model every variant is the same bytes, and sampling is
-    # deterministic, so running all six would be five redundant passes. Keep
-    # `baseline` and `all` regardless: their agreement IS the regression check,
-    # and it should be measured rather than argued from byte-equality.
+    # Skip duplicate full-tier variants. Keep baseline and all as a repeatability check.
     seen: dict[str, str] = {}
     kept = []
     for name, tools in out:
@@ -214,18 +186,9 @@ def run(model: str) -> dict:
     nocall = {name: 0 for name, _ in vs}
     aliased = 0
 
-    # One variant at a time, all 44 prompts, before moving to the next.
-    #
-    # Interleaving variants per prompt looked tidier and was wrong: Ollama
-    # reuses context slots between requests, so a request under one tool
-    # payload perturbs the next under a different one. Measured on
-    # qwen3-coder:30b, which is deterministic across 3 identical blocked
-    # passes (27/44, 0/44 unstable) but scored 27 then 26 on two
-    # byte-identical payloads when they were interleaved.
-    # One throwaway call before scoring anything. Without it the first variant
-    # is measured against a cold model and the rest are not, which showed up as
-    # qwen3.8:27b scoring 26 and then 27 on two byte-identical payloads in the
-    # same run. Every A/B here that warmed up first repeats exactly.
+    # Run all 44 prompts for one variant before switching. Interleaving changed
+    # results even for identical payloads. Warm up first so every variant starts
+    # with a loaded model.
     try:
         ask(model, "hello", agent.TOOL_DEFS)
     except Exception:

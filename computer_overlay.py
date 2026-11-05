@@ -1,22 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""The on-screen sign that Aether is driving the computer.
+"""Show when Olith is using the computer.
 
-A border in the brand colours around the whole display and a pill that says so
-in words, both click-through, so the desktop is unmistakably marked while the
-agent has the mouse and nothing the user clicks lands on the overlay.
-
-It used to be Tk only, and drew a full-screen black canvas that it punched a
-hole in with `-transparentcolor`. That attribute is Windows-only, so on Linux
-the hole never appeared. It never got that far in practice: Aether's virtualenv
-has no `_tkinter` (python3-tk is not a dependency and is not installed on a
-default Ubuntu), so the import failed and `set_overlay` returned success having
-drawn nothing at all. Both bugs were invisible because the failure path was a
-bare `except: return`.
-
-So: GTK first, since PyGObject is present wherever the desktop shell is, Tk
-second, and a real reason back to the caller when neither is there, rather than
-a silent no-op that reports ok.
+A click-through border and action label mark the display. Try GTK first,
+then Tk. Report an error if neither can draw the overlay.
 """
 from __future__ import annotations
 
@@ -26,7 +13,7 @@ from typing import Any
 _lock = threading.Lock()
 _thread: threading.Thread | None = None
 _enabled = False
-_label = "Aether is using your computer"
+_label = "Olith is using your computer"
 _backend = ""
 _reason = ""
 _ui: Any = None
@@ -62,7 +49,7 @@ def set_overlay(enabled: bool, label: str | None = None) -> dict:
 def set_label(text: str) -> None:
     """Say what the agent is doing right now, under the title on the pill."""
     global _label
-    _label = str(text or "")[:80] or "Aether is using your computer"
+    _label = str(text or "")[:80] or "Olith is using your computer"
     ui = _ui
     if ui is not None:
         ui.relabel(_label)
@@ -72,10 +59,9 @@ def _ensure_thread() -> None:
     global _thread
     if _thread and _thread.is_alive():
         return
-    _thread = threading.Thread(target=_run, name="aether-cu-overlay", daemon=True)
+    _thread = threading.Thread(target=_run, name="olith-cu-overlay", daemon=True)
     _thread.start()
-    # The caller wants to report whether the marker is up, and the toolkit needs
-    # a moment to say. Bounded so a wedged toolkit cannot hold the request.
+    # Wait briefly for the toolkit to report whether the overlay opened.
     _thread.join(timeout=1.5)
 
 
@@ -98,8 +84,7 @@ def _run() -> None:
         try:
             ui.run()
         except Exception as e:
-            # A toolkit that imports but cannot draw falls through to the next
-            # one, rather than reporting a marker that is not on screen.
+            # Try the next toolkit if this one imports but cannot draw.
             errors.append(f"{name}: {e}")
             _ui, _backend = None, ""
             continue
@@ -123,12 +108,9 @@ def _geometry() -> tuple[int, int, int, int]:
 
 
 class _GtkOverlay:
-    """Four edge strips and a pill, all click-through, styled with CSS.
+    """Draw four edge strips and an action label with GTK CSS.
 
-    No cairo: PyGObject only marshals a cairo.Context when python3-gi-cairo is
-    installed, which it is not by default, so a `draw` handler raises on every
-    frame and the windows come up blank. CSS backgrounds are rendered by GTK
-    itself and need nothing extra.
+    This avoids requiring python3-gi-cairo for a draw handler.
     """
 
     CSS = """
@@ -171,8 +153,7 @@ class _GtkOverlay:
         hexes = ["#ff2d55", "#7c5cff", "#4f7cff", "#00d4ff"]
         css = self.CSS % {
             "c0": hexes[0], "c1": hexes[1], "c2": hexes[2], "c3": hexes[3],
-            # Without a compositor the pill has no alpha channel to sit in, so
-            # it goes fully opaque rather than rendering as a black box.
+            # Use an opaque label when the desktop has no compositor.
             "pill": ("rgba(11,13,20,0.94)" if self.composited else "#0b0d14"),
         }
         provider = Gtk.CssProvider()
@@ -196,9 +177,8 @@ class _GtkOverlay:
         visual = screen.get_rgba_visual()
         self.composited = bool(visual and screen.is_composited())
         if self.composited:
-            # The RGBA visual is what shows the desktop through the pill's
-            # rounded corners. Do not also set app_paintable: GTK then skips
-            # painting the CSS background entirely.
+            # Use the RGBA visual for transparent corners. Leave app_paintable off
+            # so GTK still draws the CSS background.
             win.set_visual(visual)
         win.set_size_request(w, h)
         win.get_style_context().add_class(css_class)
@@ -208,8 +188,7 @@ class _GtkOverlay:
         win.resize(w, h)
         gdk_win = win.get_window()
         if gdk_win is not None:
-            # Every click falls through to the desktop, so the marker can sit on
-            # top of whatever the agent is driving without swallowing input.
+            # Let input pass through the overlay to the desktop.
             try:
                 gdk_win.set_pass_through(True)
             except Exception:
@@ -292,12 +271,7 @@ class _GtkOverlay:
 
 
 class _TkOverlay:
-    """Fallback for a machine with Tk but no PyGObject.
-
-    Four opaque edge strips rather than one transparent sheet: strips need no
-    compositor and no platform-specific transparency attribute, which is what
-    the previous implementation got wrong.
-    """
+    """Use Tk edge strips when GTK is unavailable. They need no transparency support."""
 
     def __init__(self) -> None:
         import tkinter as tk

@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Symbol-level reads: outline and read-one-definition.
-
-The point of the feature is that a model stops guessing line numbers, so the
-tests that matter are the ones about boundaries being right and about the
-result being smaller than the read it replaces.
-"""
+"""Test definition boundaries, outlines and symbol reads that stay smaller than whole-file reads."""
 import json
 import os
 import sys
@@ -128,13 +123,16 @@ class PythonFindTests(_Tmp):
 class JavaScriptTests(_Tmp):
     def test_it_finds_declarations_and_arrow_functions(self):
         got = {e["name"] for e in symbols.outline(JS, "m.js")}
-        self.assertEqual(got, {"alpha", "beta", "Widget"})
+        expected = {"alpha", "beta", "Widget"}
+        if symbols.code_structure.parser_for("m.js"):
+            expected.add("Widget.constructor")
+        self.assertEqual(got, expected)
 
-    def test_javascript_results_are_flagged_inexact(self):
-        # Brace counting cannot handle braces in strings or regex literals, and
-        # the caller has to be able to say so.
+    def test_javascript_boundaries_report_the_parser_used(self):
+        # Bundled Tree-sitter understands braces in strings and regexes. The
+        # dependency-free fallback must still admit its inexact boundaries.
         for e in symbols.outline(JS, "m.js"):
-            self.assertFalse(e["exact"], e["name"])
+            self.assertEqual(e["exact"], bool(symbols.code_structure.parser_for("m.js")), e["name"])
 
     def test_boundaries_are_close_enough_to_be_useful(self):
         alpha = next(e for e in symbols.outline(JS, "m.js") if e["name"] == "alpha")

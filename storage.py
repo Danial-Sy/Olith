@@ -40,9 +40,7 @@ def _write(path: Path, data: Any) -> None:
 
 # Bumped when a stored setting has to be migrated rather than merely defaulted.
 SETTINGS_VERSION = 3
-# A stored value always wins over DEFAULT_SETTINGS, so raising the agentic
-# working set needs a migration or existing installs keep the old window. Only
-# the exact old default moves; a value the user picked is left alone.
+# Migrate only the old default context size. Preserve limits chosen by the user.
 _OLD_AGENT_CTX = 32768
 
 
@@ -68,8 +66,7 @@ def _migrate_settings(s: dict) -> tuple[dict, bool]:
                 role_ctx[role] = int(s[legacy])
         if role_ctx:
             s["role_context"] = role_ctx
-        # A coder window that differed from the agent's is preserved exactly
-        # rather than averaged away, since raising it was never the user's ask.
+        # Preserve a separately chosen coder context limit.
         coder = s.get("coder_context")
         if coder and int(coder) != int(role_ctx.get("agentic") or 0):
             model_ctx = dict(s.get("model_context") or {})
@@ -86,9 +83,8 @@ def _migrate_settings(s: dict) -> tuple[dict, bool]:
 def load_settings() -> dict:
     _ensure()
     s = dict(_read(SETTINGS_PATH, {}) or {})
-    # Pre-1.3 installations persisted a hard agent step ceiling.  It is ignored
-    # by the progress-based loop and must not leak back into API responses or a
-    # later settings save, where it would look like an active safety control.
+    # Remove the obsolete agent_max_steps setting so it cannot appear active
+    # in API responses or later saves.
     s.pop("agent_max_steps", None)
     s, migrated = _migrate_settings(s)
     if migrated:
@@ -179,8 +175,7 @@ def _migrate_chat(chat: dict) -> dict:
     """Chats saved before roles addressed the agentic model by one of two names."""
     legacy = chat.pop("agent_model", None)
     if legacy and not chat.get("model_id"):
-        # "hybrid" swapped models mid-run and no longer exists; it maps to the
-        # executor rather than the slower dense model it also named.
+        # Migrate the removed hybrid mode to its executor model.
         chat["model_id"] = LEGACY_MODEL.get(legacy, DEFAULT_CODER_MODEL if legacy == "hybrid" else legacy)
     return chat
 
@@ -523,9 +518,7 @@ def delete_project(pid: str) -> bool:
     return False
 
 
-# Canon: answers the user has already given to clarifying questions. Every
-# ask_user answer is recorded here and injected into the system prompt, so the
-# same question is never asked twice.
+# Save clarifying answers as canon and include them in later prompts.
 
 def canon_scope(project_id: str | None) -> str:
     return f"canon_project_{project_id}" if project_id else "canon_global"

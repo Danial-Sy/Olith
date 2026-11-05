@@ -18,7 +18,7 @@ from config import DATA, OLLAMA_HOST, OLLAMA_MODELS, ROOT
 CATALOG_PATH = ROOT / "catalog.json"
 PROFILE_CACHE = DATA / "settings" / "models.json"
 
-# Aether runs Ollama with OLLAMA_KV_CACHE_TYPE=q8_0, so one byte per element.
+# Olith runs Ollama with OLLAMA_KV_CACHE_TYPE=q8_0, so one byte per element.
 KV_BYTES_PER_ELEMENT = 1
 # CUDA context and compute buffers, on top of weights and KV.
 RUNTIME_OVERHEAD = 1024**3
@@ -102,8 +102,7 @@ def profile_from_show(
     caps = set(show.get("capabilities") or [])
 
     kv, kv_source = kv_bytes_per_token(info), "computed"
-    # Hybrid-attention models read far too high from the generic formula, so a
-    # measured figure in the catalog wins where we have one.
+    # Prefer measured catalog memory figures for hybrid-attention models.
     if entry.get("kv_bytes_per_token"):
         kv, kv_source = int(entry["kv_bytes_per_token"]), "measured"
 
@@ -177,13 +176,10 @@ def catalog_entry(model_id: str, catalog: dict | None = None) -> dict:
 
 
 def normalize_tag(name: str) -> str:
-    """Ollama library tags are lowercase and default to :latest.
+    """Normalize Ollama tags to lowercase with :latest.
 
-    Hugging Face tags obey neither rule, so they pass through untouched.
-    Ollama keeps the repository's own capitalisation in `ollama list`, so
-    folding the case here would stop an installed model matching itself, and
-    a Hugging Face repository has no `latest`, because the tag after the colon
-    is a quantization and inventing one gets "model not found" from the pull.
+    Keep Hugging Face tags unchanged: repository names are case-sensitive and
+    the suffix names a quantization.
     """
     value = (name or "").strip()
     if value.lower().startswith(("hf.co/", "huggingface.co/")):
@@ -346,6 +342,9 @@ def installed(settings: dict | None = None) -> dict[str, dict]:
 
 
 def can_serve(profile: dict, role: str) -> bool:
+    caps = set(profile.get("capabilities") or [])
+    if "embedding" in caps and "completion" not in caps:
+        return False
     if role == "agentic":
         return bool(profile.get("tools"))
     if role == "reasoning":
@@ -354,8 +353,8 @@ def can_serve(profile: dict, role: str) -> bool:
 
 
 def utility_models(catalog: dict | None = None) -> set[str]:
-    """Models that exist to serve Aether itself and never belong in a picker."""
-    return {e["tag"] for e in (catalog or load_catalog()).get("utility") or []}
+    """Models that exist to serve Olith itself and never belong in a picker."""
+    return {normalize_tag(e["tag"]) for e in (catalog or load_catalog()).get("utility") or []}
 
 
 def role_map(settings: dict | None = None, registry: dict | None = None) -> dict[str, list[str]]:
@@ -367,7 +366,7 @@ def role_map(settings: dict | None = None, registry: dict | None = None) -> dict
     for mid, profile in reg.items():
         roles = stored.get(mid)
         if roles is None:
-            roles = [] if mid in utility else ["chat"] + (["agentic"] if can_serve(profile, "agentic") else [])
+            roles = [] if normalize_tag(mid) in utility else ["chat"] + (["agentic"] if can_serve(profile, "agentic") else [])
         out[mid] = [r for r in ("chat", "agentic") if r in roles and can_serve(profile, r)]
     return out
 
@@ -383,8 +382,8 @@ def models_for(role: str, settings: dict | None = None, registry: dict | None = 
 
 def _preference(role: str) -> tuple[str, ...]:
     if role == "agentic":
-        # The MoE coder activates ~3B parameters per token, so it emits tool
-        # calls far faster than the dense model that shares its role.
+        # The MoE coder activates about 3B parameters per token, giving it faster
+        # tool-call generation than the dense model.
         return (config.DEFAULT_CODER_MODEL, config.DEFAULT_AGENT_MODEL)
     return (config.DEFAULT_CHAT_MODEL,)
 
@@ -405,12 +404,7 @@ def active(role: str, settings: dict | None = None, registry: dict | None = None
 
 
 def vision_models(settings: dict | None = None, registry: dict | None = None) -> list[str]:
-    """Every installed model that can both see and call tools.
-
-    Computer use needs both halves: eyes to read the screen and tool calling to
-    act on it. A vision-only model like gemma3 can describe a screenshot and
-    never click anything, so it is not an option here.
-    """
+    """List installed models that support both vision and tool calling."""
     reg = registry if registry is not None else installed(settings)
     return [m for m in models_for("agentic", settings, reg) if reg[m].get("vision")]
 
@@ -420,21 +414,14 @@ def vision_model(
     registry: dict | None = None,
     preferred: str | None = None,
 ) -> str | None:
-    """Which model computer use runs on.
-
-    `preferred` is the chat's own pick and wins whenever it can see, so any
-    vision model the user selects is the one that drives the desktop. Without
-    that the feature was pinned to whatever `active("agentic")` returned, and
-    choosing a different vision model in the picker changed nothing.
-    """
+    """Choose the computer-use model, keeping the user's preferred vision model when possible."""
     reg = registry if registry is not None else installed(settings)
     options = vision_models(settings, reg)
     if not options:
         return None
     if preferred in options:
         return preferred
-    # Nothing was chosen, so prefer a grounding-trained model: seeing a button
-    # and saying where it is are different skills.
+    # When no model was chosen, prefer one trained to locate screen controls.
     grounded = [m for m in options if config.is_grounding_model(m)]
     if grounded:
         return grounded[0]
@@ -493,6 +480,7 @@ def system_prompt(role: str, profile: dict) -> str:
 def title_model(settings: dict | None = None, registry: dict | None = None) -> str | None:
     """Smallest installed model, so naming a chat never displaces the GPU model."""
     reg = registry if registry is not None else installed(settings)
+    reg = {mid: profile for mid, profile in reg.items() if can_serve(profile, "chat")}
     if config.TITLE_MODEL_ID in reg:
         return config.TITLE_MODEL_ID
     sized = [(p.get("params") or p.get("weights_bytes") or 0, m) for m, p in reg.items()]
@@ -543,11 +531,9 @@ async def refresh_registry() -> dict[str, dict]:
 
 
 def effort_levels(profile: dict | None = None) -> list[dict]:
-    """Effort tiers as this model actually runs them, low to high.
+    """Return this model's effort tiers, from low to high.
 
-    A tier's `think` flag is a ceiling, not a promise: a model with no thinking
-    mode runs every tier direct. The hint says which, because the difference is
-    invisible otherwise and it is the first thing users get wrong.
+    Show thinking as enabled only when both the tier and the model support it.
     """
     supports = bool((profile or {}).get("think"))
     out = []
@@ -659,10 +645,7 @@ def _free_disk_bytes(path: Path) -> int:
         return 0
 
 
-# Without a GPU, size is not the limit, speed is: a 27B on CPU answers at
-# roughly a word a second and a 14B is not much better. RAM says such a model
-# would load, so recommendations are capped into the 8B tier, which is the
-# largest that stays usable on a CPU.
+# Cap CPU recommendations at 8B. Larger models may fit in RAM but run too slowly.
 CPU_RECOMMEND_CAP = 8 * 1024**3
 
 
@@ -701,14 +684,9 @@ def fit_report(profile: dict, budget_bytes: int) -> dict:
 
 
 class PullProgress:
-    """Aggregate an Ollama pull into a single percentage.
+    """Combine per-layer download progress into one percentage.
 
-    Ollama reports bytes per layer, and a layer announces its total before any
-    of it has arrived, so the newest layer's own percentage sends the bar back
-    to zero several times over. Summing every layer seen so far fixes that.
-    Bytes only ever grow; the percentage can still step back slightly when a
-    new layer's total first appears, which for a real model is negligible
-    beside the weights layer.
+    Count all reported layers. The percentage may dip when a new layer's size arrives.
     """
 
     def __init__(self) -> None:
@@ -775,6 +753,7 @@ def install_plan(installed: set[str] | None = None) -> dict:
         "recommended": recommended,
         "same": sorted(default["tags"]) == sorted(recommended["tags"]),
         "library_url": catalog.get("library_url"),
+        "utility_tags": [entry["tag"] for entry in utility if entry.get("tag")],
     }
 
 

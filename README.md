@@ -1,216 +1,254 @@
-# Aether
+# Olith
 
-A local AI desktop app. Chat and a real coding agent, both running on your own
-machine through Ollama.
+Olith is a local AI desktop app, previously called Aether. The idea is simple: chat,
+build things, and work on your projects in one place, with the models running on your
+own machine through Ollama.
 
-Two tabs. **Chat** is a normal conversation, with a deeper reasoning mode and
-vision if the model has it. **Agentic** is a tool-calling agent that reads and
-writes files in a project you point it at, runs shell commands, keeps a task
-list, and asks you when it needs a decision.
+There are two tabs. **Chat** is for normal conversations, images, and deeper reasoning.
+**Agentic** can read and edit your code, run commands, keep a task list, and work
+through a project with you.
 
-Nothing leaves your computer. Ollama downloads the weights and they are not part
-of this repo. Web search is optional and off by default.
+Model inference and code indexing stay local. GitHub, web search, and browser features
+connect to outside services when you use them.
 
-## Models
+## What's new
 
-Any Ollama model works, and any GGUF on Hugging Face. The installer reads your
-hardware and suggests models that fit. After that there is a model browser
-inside Aether covering both libraries, searchable and filtered to what your
-machine can hold. Picking a model shows every version of it with real download
-sizes, and says what that model is missing. Ollama does the download either way,
-so a Hugging Face model is probed, assigned and run by the same code as any
-other.
+### Next release (in progress)
 
-Every model is assigned to Chat, Agentic, or both. Capabilities are read from
-Ollama, so a model that cannot call tools is never offered for agentic work.
+- Aether is now **Olith**, with updated branding and launchers.
+- Local semantic code search, cached syntax parsing, and dependency maps help
+  the agent find the right code with less digging.
+- Test, build, and type-check commands are discovered and saved automatically,
+  with manual overrides when you need them.
+- Task change review lets you undo selected edits while keeping earlier changes.
+- Create projects directly in Olith. The installer prepares an `Olith` folder
+  in your home directory for projects made through the app.
+- Language-server support adds definitions, references, diagnostics, and rename previews.
+- GitHub tools handle repositories, branches, commits, pushes, pulls, and pull requests.
+- The VS Code extension brings an Olith-styled sidebar with formatted replies,
+  copyable code blocks, a local model picker, live progress, file and folder pickers, selected-code actions, and
+  **Fix with Olith** to your editor.
+- Connections groups browser sessions, CLIs, service tools, GitHub and VS Code
+  under Connected or Disconnected. CLI connections work without a browser login.
+- Projects shows linked repos, live editor status and a searchable repo list with cloning.
+- Approval modes include Full access, with a warning before you turn it on.
+- Connections includes 34 website providers and direct MCP service tools, with
+  Railway setup, OAuth sign-in, token storage, and custom hosted or local servers.
+- Normal installs include the embedding model, so code search is easier to set up.
+- Reliability fixes stop rejected rewrites from turning into delete-and-recreate
+  operations, keep finished work from restarting, and make check results clearer.
 
-The defaults are Qwen3.8 27B and Qwen3-Coder 30B. That is what Aether was built
-and tuned on, and it needs a 24 GB card. Smaller setups still work, and every
-model gets the same tools. Giving smaller models a smaller tool surface was
-tried, measured against five models, and it made all of them worse.
+## What you get
 
-## What it can do
+- A coding agent that can work through tasks, with backups and syntax checks.
+- Code search that understands what you're looking for, plus cached symbols
+  and a dependency map so the agent has a better idea of where to look.
+- Automatic discovery of test, build, and type-check commands. You can override
+  them under **Projects → Checks**.
+- Language-server support for definitions, references, diagnostics, and rename
+  previews. Coverage depends on the language and project setup.
+- Per-task change review, with selected changes you can undo without resetting Git.
+- Git and GitHub tools for repositories, branches, commits, push/pull, merges,
+  pull requests, checks, reviews, and issues.
+- A VS Code extension with sidebar chat, right-click selection actions, and
+  **Fix with Olith** on code errors.
+- Images, attachments, optional web search, and browser/computer use.
 
-- Read, write and edit files in a registered project, with anchored edits, a
-  syntax check before every write, and automatic backups
-- Read one function or class by name, or a file's outline, instead of guessing
-  line numbers
-- Run shell commands, auto-running safe work and asking about anything that
-  could change the machine
-- Keep a visible plan and work through it without supervision
-- Ask you a question when it needs one answered
-- Hand survey work on large projects to a read-only sub-agent
-- Handle images and attachments
-- Drive a browser and the desktop in computer use mode
-- Compact its own context so long runs do not fall over
+Computer use is still rough. A model trained for it works much better than a normal
+vision model. Code references and rename previews also aren't a guarantee that every
+dependency has been found, so tests still matter.
 
-[ARCHITECTURE.md](ARCHITECTURE.md) covers how all of that works.
+## Create a project
 
-### Computer use
+Open **Projects**, click **+**, enter a name, and choose **Create project in Olith**.
+Olith creates the folder and selects the project, ready for an Agentic chat. Choose
+**Add existing folder** to use a project already on your computer. Removing a project
+from Olith keeps its files on disk.
 
-This one is still rough. It works best with a model trained to point at things
-on a screen, like the qwen3-vl family, and Aether picks one of those when it has
-one. A general vision model can read the screen fine and still click in the
-wrong place, so expect a lot of misses if that is what you give it. Inside a web
-page the browser tool skips pixels entirely and clicks real elements, which is
-why it is the more reliable of the two.
+The installer creates `~/Olith` on Linux or `%USERPROFILE%\Olith` on Windows. Running
+setup again preserves the projects inside it. Set `OLITH_PROJECTS_ROOT` to use a
+different folder for both installation and the app.
 
-## Hardware
+## Connect more services
 
-Aether runs on what you have. The installer reads your GPU, memory and free
-disk, then suggests models sized for it:
+Use **Connections** to search website sign-ins or choose **Connect service tools** for
+direct access through MCP. Railway, Notion, Linear, Atlassian, Sentry, Supabase, GitHub
+MCP, Vercel, Asana, and Slack have setup presets. Connect your account to discover
+available tools; provider app approval may be required. Custom hosted MCP servers and
+installed local MCP programs are also supported. Credentials stay in your system
+keyring. Service changes ask for approval unless you turn on Full access in Settings.
+See [connection setup](docs/connections.md).
 
-| Usable memory | Suggested |
-|---|---|
-| under 6 GB | one 4B model doing both jobs |
-| 6 to 12 GB | 8B for chat, 7B coder for agentic |
-| 12 to 20 GB | 14B pair |
-| 20 to 64 GB | Qwen3.8 27B and Qwen3-Coder 30B, the tuned default |
-| 64 GB and up | adds a 70B for chat |
-| no GPU | 8B and 7B, sized for speed |
+## Install
 
-VRAM is what counts when you have a GPU. Without one the models run on the CPU
-and the suggestion stays well below what would technically fit, because 128 GB
-of RAM will hold a 70B and it will answer at about a word a second. Aether also
-works out the largest context window each model can have on your machine and
-offers exactly those.
-
-A small model (`qwen2.5:0.5b`, about 400 MB) comes with every choice. It only
-writes chat titles, on the CPU, so naming a conversation never interrupts the
-model you are talking to.
-
-## Windows
+### Windows
 
 1. Download and extract the latest release.
-2. Double-click **`Install-Aether.bat`**.
-3. Choose Default, Recommended for your PC, or type your own model tag.
-4. Launch from the new Desktop or Start Menu shortcut.
+2. Double-click **Install-Olith.bat**.
+3. Pick the default models, the recommendation for your PC, or your own model tag.
+4. Open Olith from the Desktop or Start Menu shortcut.
 
-The installer is a wizard. It installs Python 3.11+ and Ollama if they are
-missing, checks your hardware, pulls only the models you do not already have,
-builds an isolated `.venv`, and makes the shortcuts. Running it again is safe.
+The installer sets up Python, Ollama, the app's Python environment, and models. Running
+it again is fine; models you already have are reused.
 
-For unattended installs:
-
-```bat
-Install-Aether.bat -Models Chat -NonInteractive
-Install-Aether.bat -Models Full -NonInteractive
-Install-Aether.bat -SkipModels -NonInteractive
-```
-
-To move to a newer version later, double-click **`Update-Aether.bat`**.
-
-## Ubuntu
+### Ubuntu
 
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-venv python3-pip python3-gi \
   gir1.2-gtk-3.0 gir1.2-webkit2-4.1
 curl -fsSL https://ollama.com/install.sh | sh
-
-chmod +x setup.sh aether.sh install-desktop.sh update.sh
+chmod +x setup.sh olith.sh install-desktop.sh update.sh
 ./setup.sh
-./aether.sh
+./olith.sh
 ```
 
-If `gir1.2-webkit2-4.1` is not available, install `gir1.2-webkit2-4.0`.
+If WebKit 4.1 isn't available, use `gir1.2-webkit2-4.0`. Use `./setup.sh --skip-models`
+if you don't want any model downloads.
 
-`setup.sh` asks which models you want: Default, Recommended for your machine, or
-a tag you type. Use `--yes` to take the recommendation without being asked,
-`--tags qwen3:8b` to name models directly, or `--skip-models` if Ollama already
-has the weights.
+## Models and code search
 
-`setup.bat` and `setup.py` are the direct entry points if Python and Ollama are
-already set up and you do not want the wizard.
+The main defaults are Qwen3.8 27B and Qwen3-Coder 30B, tuned around a 24 GB GPU. Smaller
+PCs can use smaller models; the installer suggests a setup that fits. You can add Ollama
+models and GGUFs from Hugging Face inside the app.
 
-## Updating
+Normal installs also include a small title model and `nomic-embed-text` for code search.
+Both run on CPU by default to leave GPU memory for the main model.
+
+Open **Projects → Index → Build semantic index** to prepare code search for a project.
+After that, changed files are picked up as you use Olith. The first build can take time;
+later updates reuse what is already indexed. Text and symbol search still work with
+semantic search turned off.
+
+To add the embedding model to an older install:
 
 ```bash
-./update.sh          # Ubuntu
+./setup.sh --models embeddings
+# Windows: py -3 setup.py --models embeddings
 ```
 
-```bat
-Update-Aether.bat
-```
+If you previously disabled semantic search, turn it back on in Settings.
 
-`data/` and `.venv/` are never touched, so chats, memory, projects, settings and
-uploads survive an update.
+## GitHub
 
-## Your data
+Open **Connections → GitHub** and connect your token. An existing `gh auth login` also
+works. Tokens are kept in your OS keyring and aren't given to the model. You can also
+sign in to GitHub in Olith's browser. That saves a website session; repo access uses
+your token or CLI login.
 
-Chats, memory, projects, settings and uploads live under `data/`, which is
-gitignored so a commit or a release cannot publish your conversations.
+Your repos appear under **Projects**, where you can search, clone or open a local copy.
+Project cards show the linked repo and whether VS Code is actively connected.
+**Connections** shows your GitHub account and editor windows.
 
-The agent can only touch registered projects, Aether's own folder, Documents,
-Desktop, and files you upload. Shell commands are classified before they run.
-Reads, builds, tests and installs go through. Anything that could destroy data,
-escalate privilege or change the system asks first. You can widen or narrow that
-in Settings.
+Both classic and fine-grained tokens work:
 
-## Configuration
+- **Classic:** enable `repo`, or `public_repo` for public repos only. Add
+  `workflow` if Olith will push GitHub Actions workflow changes.
+- **Fine-grained:** select your repositories, then give Contents, Pull requests,
+  and Issues read/write access. Give Checks and Commit statuses read access.
+  Add Repository creation write access if you want to create repositories.
 
-Defaults assume a standard local Ollama install. For custom layouts:
+Open a project's **···** menu and choose **Git** for local Git and pull-request actions.
+Repository changes ask for confirmation. Pulls use fast-forward only, and merge
+conflicts stay available to review and fix. Git must be installed and on PATH.
 
-| Variable | Purpose |
-|---|---|
-| `AETHER_OLLAMA` | Path to `ollama` or `ollama.exe` |
-| `AETHER_OLLAMA_MODELS` | Custom Ollama model directory |
-| `AETHER_AI_ROOT` | A workspace containing a sibling `ollama` directory |
-| `OLLAMA_HOST` | Ollama API address |
-| `AETHER_UPDATE_REPO` | GitHub repository the updater tracks |
-| `GITHUB_TOKEN` | Raises the updater's GitHub rate limit |
+This version supports github.com. Projects loads the repos your token can access,
+including accounts with more than 100 repos. You can also clone by owner/name.
 
-Model metadata, context sizes and system prompts live in `config.py`. Per-user
-settings are written to `data/settings/settings.json` at runtime.
+## VS Code
 
-## Development
+1. Start Olith and open **Connections → VS Code**. Use **Install / update in
+   VS Code**, or download the latest extension for a manual install.
+2. For a manual install, press **Ctrl+Shift+P** in VS Code to open the Command Palette. Search for
+   **Extensions: Install from VSIX…**, press Enter, and choose the downloaded file.
+   Run **Developer: Reload Window** in VS Code after installing.
+3. Choose **File → Open Folder…** and open the project you want Olith to work on.
+   The extension needs a trusted local workspace.
+4. Back in Olith, click **Generate pairing code**. In VS Code, open the Command
+   Palette again, run **Olith: Connect to Olith**, and enter that code within
+   two minutes. The panel shows a countdown and clears the code when it expires;
+   click **Generate new code** for another. Pairing also adds the folder to
+   Olith's projects if needed. The two-minute limit only applies to the code.
+5. Open the **Olith** icon in VS Code's left sidebar, or run **Olith: Open Chat**
+   from the Command Palette. Check the project name at the top; hover it for the
+   full folder path.
+6. Try a prompt like **"Explain how this project starts up"**, then send it.
+
+The model dropdown beside Send uses your installed Agentic models from Olith. Your
+choice is saved for the chat. Click **↻** to refresh after changing your models.
+
+Click **Add files** above the message box, or use the active-file button, to give Olith
+specific source context. Click the folder name at the top to switch projects or open
+another folder. New folders need their own pairing. Live updates show what Olith is
+reading, editing, and checking as it works.
+
+For selected code, highlight it, right-click, choose **Olith: Send Selection**, and tell
+Olith what you want done. For a red squiggle, place your cursor on the error, press
+**Ctrl+.**, and choose **Fix with Olith**. VS Code needs a diagnostic from its language
+support for that quick fix to appear.
+
+Use the clipboard icon at the top to review task changes and check results. The send
+arrow becomes a stop button while Olith works. Approvals appear inside VS Code. The
+desktop app stays running in the background. More examples and troubleshooting are in
+the [VS Code guide](extensions/olith-vscode/README.md).
+
+File-tool edits go through VS Code, so normal editor undo works. Olith asks before
+saving existing unsaved changes and rejects edits if the file changes while it is
+preparing them. Shell commands, checks, and Git still change files through the backend.
+Local workspaces are supported; remote/WSL/SSH workspaces aren't yet. Pair once per
+workspace. Olith remembers it across app and computer restarts, and VS Code reconnects
+when the desktop app is available. Use **Olith: Disconnect** to remove a pairing.
+
+## Updates and your data
+
+Run **Update-Olith.bat** on Windows or `./update.sh` on Ubuntu. Chats, projects, memory,
+settings, and uploads live in the ignored `data/` folder. Updates preserve that folder
+and `.venv/`.
+
+Coming from Aether? Its old updater expects the old app manifest. For the first Olith
+upgrade, copy the extracted release's contents into your existing install and run the
+new installer. Keep your existing `data/` folder. Later Olith updates use the updater
+normally.
+
+Choose an approval mode in Settings. Balanced runs safe commands and asks before risky
+commands, GitHub changes and service actions. Shell only skips command approvals. Full
+access skips all three, with a warning about the risk. It is off by default. File access
+has its own setting.
+
+Integrations use the accounts you connect.
+
+## Development and releases
 
 ```bash
 python3 setup.py --skip-models
 .venv/bin/python -m uvicorn server:app --host 127.0.0.1 --port 7878
-```
-
-On Windows use `py -3` and `.venv\Scripts\python.exe`.
-
-Tests:
-
-```bash
 .venv/bin/python -m unittest discover -s tests
+node extensions/olith-vscode/test/client.test.js
 ```
 
-The suite skips the server tests when FastAPI is not importable, so run it from
-the venv rather than a bare `python3`. Quick static checks:
+On Windows, use `py -3` and `.venv\Scripts\python.exe`. Run `python
+scripts/package_vscode.py` to build `dist/olith-vscode.vsix`.
+
+For a new release, update `VERSION` in `config.py` and the version in `olith.json`,
+commit and push your changes, then push a new version tag. For example, if the version
+is 1.6.0:
 
 ```bash
-python3 -m compileall -q -x '(^|/)(data|\.venv)(/|$)' .
-node --check static/app.js
+git tag -a v1.6.0 -m "Olith 1.6.0"
+git push origin v1.6.0
 ```
 
-## Releases
+The tag starts the release workflow. It runs the checks, then publishes the source ZIP
+and VS Code extension. Don't reuse an existing release tag.
 
-CI runs the Python and JavaScript checks on every push, and a Windows runner
-parses the PowerShell wizard and runs its model-detection tests. Pushing a
-version tag builds a source ZIP and publishes it as a GitHub release:
-
-```bash
-git tag v1.5.0
-git push origin v1.5.0
-```
-
-The archive leaves out `.venv`, model weights, and everything under `data/`.
-That release is what `update.py` compares against, so bump `VERSION` in
-`config.py` and the version in `aether.json` in the same commit as the tag. The
-updater reads `config.py` to decide whether a copy is current.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details. To measure retrieval
+locally, run `.venv/bin/python scripts/bench_repo_index.py`. Measured results are in
+[performance notes](docs/performance.md). For the rename, push, and release steps, see
+[publishing Olith](docs/publishing.md).
 
 ## License
 
-Aether is licensed under the GNU Affero General Public License v3.0. The full
-text is in [LICENSE](LICENSE).
+GNU Affero General Public License v3.0. Use it, change it, and share it under the same
+license. The full terms are in [LICENSE](LICENSE).
 
 Copyright (C) 2026 Danial Syed
-
-In plain terms: use it, modify it and share it freely, including running it
-yourself for whatever you like. If you distribute a modified version, or run one
-as a service other people can use over a network, you have to publish your
-source under the same license. That summary is not a substitute for the license
-text.

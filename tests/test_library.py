@@ -108,9 +108,8 @@ class NumberTests(unittest.TestCase):
 
 
 class QuantTests(unittest.TestCase):
-    # Captured from unsloth/Qwen3.8-27B-GGUF, which carries every awkward case
-    # a Hugging Face repository has: a split quant in a directory, a vision
-    # projector, calibration data and a speculative-decoding head.
+    # Fixture with split quantizations, a vision projector, calibration data
+    # and a speculative-decoding head from unsloth/Qwen3.8-27B-GGUF.
     SIBLINGS = [
         {"rfilename": "BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf", "size": 49 * GIB},
         {"rfilename": "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf", "size": 5 * GIB},
@@ -171,7 +170,7 @@ class CursorTests(unittest.TestCase):
 
 
 class WarningTests(unittest.TestCase):
-    """What Aether can honestly say before a byte has been downloaded."""
+    """What Olith can honestly say before a byte has been downloaded."""
 
     def warn(self, **row):
         base = {"id": "someone/Model-GGUF", "gguf": {"total": 8e9, "context_length": 32768,
@@ -483,7 +482,7 @@ class BrowseTests(unittest.TestCase):
             self.assertEqual(asyncio.run(L.browse("ollama"))["items"], [])
 
 
-@unittest.skipUnless(os.environ.get("AETHER_LIVE_TESTS") == "1", "set AETHER_LIVE_TESTS=1")
+@unittest.skipUnless(os.environ.get("OLITH_LIVE_TESTS") == "1", "set OLITH_LIVE_TESTS=1")
 class LiveTests(unittest.TestCase):
     def test_ollamas_library_page_still_parses(self):
         rows = asyncio.run(L.ollama_library(refresh=True))

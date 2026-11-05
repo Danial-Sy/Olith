@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Browser control: aiming by name instead of by pixel.
+"""Test browser actions, covered targets, text insertion and shared editing guards.
 
-What this replaces is on record. A run spent six clicks at the same wrong spot
-hunting a toolbar button fourteen frame-pixels wide, put a paragraph inside its
-own title because a click landed between two letters, and lost a quarter of
-that paragraph to synthetic typing. Here the button has a name, the click is
-refused if something is on top of it, and the text goes in as one insert.
-
-The protocol itself is exercised against a real headless Chrome in
-`scripts/browser_smoke.py`; these tests hold the decisions made around it,
-which is where the bugs that reach a user live.
+The real DevTools protocol is checked by scripts/browser_smoke.py.
 """
 import json
 import os
@@ -27,6 +19,32 @@ import guards
 
 
 class ActionTests(unittest.TestCase):
+    def test_user_sign_in_focuses_the_window_without_waiting_for_page_resources(self):
+        with patch.object(browser, "available", return_value=(True, "")), \
+             patch.object(browser, "cmd", return_value={}) as command, \
+             patch.object(browser, "_wait_loaded") as wait, patch.object(browser, "evaluate") as evaluate:
+            out = json.loads(browser.run({"action": "open", "url": "http://127.0.0.1:7878/connect/vercel", "focus": True, "wait": False}))
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "loading")
+        self.assertEqual([call.args[0] for call in command.call_args_list], ["Page.bringToFront", "Page.navigate"])
+        wait.assert_not_called(); evaluate.assert_not_called()
+
+    def test_normal_browser_navigation_still_waits_and_reports_the_loaded_url(self):
+        with patch.object(browser, "available", return_value=(True, "")), \
+             patch.object(browser, "cmd", return_value={}), \
+             patch.object(browser, "_wait_loaded", return_value="complete") as wait, \
+             patch.object(browser, "evaluate", return_value={"url": "https://example.org/", "title": "Example"}):
+            out = json.loads(browser.run({"action": "open", "url": "https://example.org"}))
+        wait.assert_called_once()
+        self.assertEqual(out["url"], "https://example.org/")
+
+    def test_navigation_errors_cannot_report_a_successful_sign_in_window(self):
+        with patch.object(browser, "available", return_value=(True, "")), \
+             patch.object(browser, "cmd", return_value={"errorText": "net::ERR_CONNECTION_REFUSED"}):
+            out = json.loads(browser.run({"action": "open", "url": "http://127.0.0.1:7878/connect/vercel", "wait": False}))
+        self.assertIn("ERR_CONNECTION_REFUSED", out["error"])
+        self.assertNotIn("ok", out)
+
     def test_an_unknown_action_is_refused_with_the_list(self):
         out = json.loads(browser.run({"action": "teleport"}))
         self.assertIn("Unknown browser action", out["error"])
@@ -82,13 +100,7 @@ class RefTests(unittest.TestCase):
 
 
 class TabPinTests(unittest.TestCase):
-    """Aether drives a tab it owns, not whichever one is first.
-
-    A browser window the user is also using collects tabs, and after a Google
-    sign-in, Chrome's own account machinery opened one of its own. Taking
-    "whichever page comes back first" means a later command can navigate away
-    from what the user is in the middle of.
-    """
+    """Keep driving Olith's chosen tab when Chrome opens other tabs."""
 
     def setUp(self):
         browser._target_id = None
@@ -107,7 +119,7 @@ class TabPinTests(unittest.TestCase):
             {"id": "T1", "type": "page", "url": "https://claude.ai/oauth/authorize"},
             {"id": "T2", "type": "page", "url": "https://accounts.google.com/"},
         ]):
-            # T1 is first and is not Aether's. Driving it would navigate the
+            # T1 is first and is not Olith's. Driving it would navigate the
             # user's own tab out from under them.
             self.assertEqual(browser._page()["id"], "T2")
 
@@ -129,13 +141,7 @@ class TabPinTests(unittest.TestCase):
 
 
 class CoveredElementTests(unittest.TestCase):
-    """"Behind something else" has to mean it, or it stops a run dead.
-
-    In Google Docs the check fired thirteen times on menu items whose own
-    wrapper sits over their middle. The element was reachable the whole time,
-    just not at the single point being sampled, and every refusal sent the
-    model back to reopen the menu it already had open.
-    """
+    """Check several points on an element before reporting it covered."""
 
     def test_the_element_is_clicked_at_a_point_where_it_is_reachable(self):
         # Centre blocked, a point above it clear: that is a widget's own
@@ -166,14 +172,7 @@ class CoveredElementTests(unittest.TestCase):
 
 
 class WorldMovedTests(unittest.TestCase):
-    """The browser reports when it changed the page.
-
-    The loop's duplicate-call guard asks each tool whether the world moved.
-    The desktop answers with the screenshot's frame id; a run that only used
-    the browser had no answer at all, so the world looked frozen and every
-    legitimate second click came back refused as a duplicate, twenty-one
-    times in one run.
-    """
+    """Advance the browser change counter so valid repeat actions can run."""
 
     def _run(self, args, **patches):
         defaults = dict(
@@ -265,13 +264,7 @@ class TypingTests(unittest.TestCase):
 
 
 class SignInTests(unittest.TestCase):
-    """Aether's browser has its own profile, so it is signed in to nothing.
-
-    The session the user is already using lives in the browser they opened
-    themselves, and no amount of clicking gets to it from here. What matters is
-    that a run says so instead of spending twenty turns on a login wall, and
-    that it never types a password on someone's behalf.
-    """
+    """Use Olith's own browser profile and never fill password fields."""
 
     def _snapshot(self, sign_in):
         payload = {"url": "https://accounts.google.com/", "title": "Sign in",
@@ -284,7 +277,7 @@ class SignInTests(unittest.TestCase):
 
     def test_a_login_wall_is_reported_not_worked_around(self):
         out = self._snapshot(True)
-        self.assertIn("sign in once in the Aether browser window",
+        self.assertIn("sign in once in the Olith browser window",
                       out["sign_in_required"])
         self.assertIn("does not share the session", out["sign_in_required"])
 
@@ -316,14 +309,7 @@ class SignInTests(unittest.TestCase):
 
 
 class SharedGuardTests(unittest.TestCase):
-    """The browser reaches the same document the desktop tool does.
-
-    Every rule about not destroying a page was built into the desktop tool, and
-    the browser arrived later with the same reach and none of them. A run then
-    sent ctrl+a through the browser fourteen times and nothing stopped it. The
-    rules live in `guards` now and both tools ask the same questions of the
-    same state.
-    """
+    """Apply the same document guards and selection state to both browser and desktop actions."""
 
     def setUp(self):
         guards.begin_run()

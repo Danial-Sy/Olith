@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Launch Aether as a native desktop window (WebView2 on Windows, GTK/Qt on Linux)."""
+"""Launch Olith as a native desktop window (WebView2 on Windows, GTK/Qt on Linux)."""
 from __future__ import annotations
 
 import atexit
@@ -18,9 +18,9 @@ ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = 7878
 URL = f"http://{HOST}:{PORT}"
-ICON = ROOT / "static" / "assets" / "aether.ico"
-ICON_PNG = ROOT / "static" / "assets" / "aether.png"
-DESKTOP_PID = ROOT / "data" / "aether-desktop.pid"
+ICON = ROOT / "static" / "assets" / "olith.ico"
+ICON_PNG = ROOT / "static" / "assets" / "olith.png"
+DESKTOP_PID = ROOT / "data" / "olith-desktop.pid"
 
 
 def _env() -> dict:
@@ -29,7 +29,7 @@ def _env() -> dict:
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     # The server serves its own consent page, so it has to know where it is.
-    env["AETHER_PORT"] = str(PORT)
+    env["OLITH_PORT"] = str(PORT)
     return env
 
 
@@ -39,7 +39,7 @@ def _port_open() -> bool:
         return s.connect_ex((HOST, PORT)) == 0
 
 
-def _is_aether_server() -> bool:
+def _is_olith_server() -> bool:
     if not _port_open():
         return False
     try:
@@ -47,14 +47,14 @@ def _is_aether_server() -> bool:
 
         with urllib.request.urlopen(f"{URL}/openapi.json", timeout=2) as response:
             document = json.loads(response.read().decode("utf-8"))
-        return (document.get("info") or {}).get("title") == "Aether"
+        return (document.get("info") or {}).get("title") == "Olith"
     except Exception:
         return False
 
 
 def _activate_existing() -> bool:
-    """Make repeated launcher clicks harmless while Aether is already running."""
-    if not _is_aether_server():
+    """Make repeated launcher clicks harmless while Olith is already running."""
+    if not _is_olith_server():
         return False
     try:
         owner_pid = int(DESKTOP_PID.read_text(encoding="utf-8").strip())
@@ -68,14 +68,13 @@ def _activate_existing() -> bool:
             import ctypes
 
             user32 = ctypes.windll.user32
-            hwnd = user32.FindWindowW(None, "Aether")
+            hwnd = user32.FindWindowW(None, "Olith")
             if hwnd:
                 user32.ShowWindow(hwnd, 9)  # SW_RESTORE
                 user32.SetForegroundWindow(hwnd)
         except Exception:
             pass
-    # On Linux the existing window remains open; do not kill its backend merely
-    # because the desktop icon was clicked twice.
+    # Keep the existing Linux window and backend on a second launcher click.
     return True
 
 
@@ -93,13 +92,13 @@ def _clear_desktop_owner() -> None:
 
 
 def _kill_port() -> None:
-    """Stop a stale Aether process without touching unrelated applications."""
+    """Stop a stale Olith process without touching unrelated applications."""
     if not _port_open():
         return
-    if not _is_aether_server():
+    if not _is_olith_server():
         raise RuntimeError(
             f"Port {PORT} is already used by another application. "
-            "Close that application or change Aether's port before launching."
+            "Close that application or change Olith's port before launching."
         )
     try:
         if sys.platform == "win32":
@@ -128,10 +127,10 @@ def _kill_port() -> None:
 
 def _start_server() -> subprocess.Popen | None:
     if _port_open():
-        if not _is_aether_server():
+        if not _is_olith_server():
             raise RuntimeError(
                 f"Port {PORT} is already used by another application. "
-                "Close that application or change Aether's port before launching."
+                "Close that application or change Olith's port before launching."
             )
         try:
             import urllib.request
@@ -161,13 +160,13 @@ def _start_server() -> subprocess.Popen | None:
         kwargs = {"start_new_session": True}
     # Send the server's output to a rolling log instead of DEVNULL. Without it a
     # backend traceback is invisible: the UI just stops mid-stream with no trace.
-    log_path = ROOT / "data" / "aether-server.log"
+    log_path = ROOT / "data" / "olith-server.log"
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         if log_path.exists() and log_path.stat().st_size > 5_000_000:
             log_path.replace(log_path.with_suffix(".log.1"))
         log = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
-        log.write(f"\n===== Aether server start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+        log.write(f"\n===== Olith server start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
         sink: dict = {"stdout": log, "stderr": subprocess.STDOUT}
     except Exception:
         sink = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
@@ -186,7 +185,7 @@ def _wait_ready(timeout: float = 45.0) -> None:
         if _port_open():
             return
         time.sleep(0.2)
-    raise RuntimeError("Aether server failed to start")
+    raise RuntimeError("Olith server failed to start")
 
 
 def _windows_branding() -> None:
@@ -195,7 +194,7 @@ def _windows_branding() -> None:
         return
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Aether.Desktop")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Olith.Desktop")
     except Exception:
         pass
 
@@ -212,7 +211,7 @@ def _windows_branding() -> None:
             LR_DEFAULTSIZE = 0x0040
             ico = str(ICON)
             for _ in range(80):
-                hwnd = user32.FindWindowW(None, "Aether")
+                hwnd = user32.FindWindowW(None, "Olith")
                 if hwnd:
                     hicon = user32.LoadImageW(None, ico, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
                     if hicon:
@@ -223,7 +222,21 @@ def _windows_branding() -> None:
         except Exception:
             pass
 
-    threading.Thread(target=_apply_icon, name="aether-icon", daemon=True).start()
+    threading.Thread(target=_apply_icon, name="olith-icon", daemon=True).start()
+
+
+def _linux_branding() -> None:
+    """Match GTK's taskbar/Wayland identity to the installed desktop launcher."""
+    if not sys.platform.startswith("linux"):
+        return
+    # Set this before importing GTK/pywebview, including when using Wayland.
+    os.environ["GDK_PROGRAM_CLASS"] = "olith"
+    try:
+        from gi.repository import GLib
+        GLib.set_prgname("olith")
+        GLib.set_application_name("Olith")
+    except ImportError:
+        pass  # The Qt fallback can still start without GTK installed.
 
 
 _cleaned = False
@@ -257,6 +270,7 @@ def main() -> None:
     os.chdir(ROOT)
     sys.path.insert(0, str(ROOT))
     _windows_branding()
+    _linux_branding()
 
     if _activate_existing():
         return
@@ -278,8 +292,9 @@ def main() -> None:
         _wait_ready()
         import webview
 
+        webview.settings["ALLOW_DOWNLOADS"] = True
         webview.create_window(
-            title="Aether",
+            title="Olith",
             url=URL,
             width=1280,
             height=860,
@@ -306,7 +321,7 @@ def main() -> None:
                     webview.start(icon=icon)
                 except Exception:
                     raise RuntimeError(
-                        "Could not open the Aether window. On Ubuntu install:\n"
+                        "Could not open the Olith window. On Ubuntu install:\n"
                         "  sudo apt install -y python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-webkit2-4.1"
                     ) from None
             else:

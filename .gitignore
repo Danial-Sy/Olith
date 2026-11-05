@@ -11,9 +11,9 @@ __pycache__/
 .env
 .env.*
 !.env.example
-aether.local.json
+olith.local.json
 
-# User-created Aether data
+# User-created Olith data
 data/*
 !data/.gitkeep
 

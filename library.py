@@ -1,17 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""The two remote libraries Aether installs from: Ollama's and Hugging Face's.
+"""Browse Ollama models and Hugging Face GGUFs in the same format.
 
-Both are browse-only. Nothing here runs a model or decides what one can do.
-Installing goes through the same `ollama pull` either way, because Ollama
-imports GGUF straight from Hugging Face when the tag starts with `hf.co/`, and
-the real capability answer still comes from `/api/show` after the download.
-
-So this module has one job: turn two very different catalogues into one row
-shape the models screen can render, and say honestly what we know about a
-model before a byte of it has arrived. Hugging Face is a hundred thousand
-repositories with no curation, so "what is wrong with this one" matters more
-than "what is right with it": every row carries its own warnings.
+Both install through Ollama. Show available metadata and warnings before
+download, then use /api/show to check the installed model's capabilities.
 """
 from __future__ import annotations
 
@@ -30,8 +22,7 @@ HF_API = "https://huggingface.co/api/models"
 HF_PREFIX = "hf.co/"
 
 CACHE_PATH = DATA / "settings" / "library-ollama.json"
-# Ollama ships a handful of models a month. A day-old list is never wrong in a
-# way the user would notice, and it makes search feel local, because it is.
+# Cache the Ollama model list for one day.
 CACHE_TTL = 24 * 3600
 
 PAGE = 24
@@ -53,9 +44,8 @@ PARAM_BANDS = {
     "large": (35e9, None),
 }
 
-# Neither library exposes an embedding flag we can trust, so we match the
-# words both use. An embedding model cannot hold a conversation, and Aether
-# has no role for one, so it is noise in a picker rather than a choice.
+# Filter embedding models by name because neither library provides a
+# reliable flag. They cannot serve chat roles.
 _EMBEDDING_PIPELINES = {"feature-extraction", "sentence-similarity"}
 
 _SUFFIX = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}
@@ -96,12 +86,8 @@ def size_label(params: int) -> str:
     return f"{round(params / 1e6)}M"
 
 
-# ── Ollama's library ───────────────────────────────────────────────────────
-#
-# Ollama publishes no browse API, so the library page is parsed. That is a
-# scrape and scrapes rot, which is why every failure here degrades to the
-# curated catalog.json rather than to an error: a stale list of good models
-# beats a broken screen.
+# Ollama library
+# Parse the library page and fall back to catalog.json if fetching or parsing fails.
 
 _LI = re.compile(r'<li\s[^>]*class="flex items-baseline.*?</li>', re.S)
 _NAME = re.compile(r'href="/library/([^"?#/]+)"')
@@ -180,8 +166,7 @@ async def ollama_library(*, refresh: bool = False, timeout: float = 20.0) -> lis
     except Exception:
         return cached.get("models") or []
     if not models:
-        # The page loaded but parsed to nothing, which means the markup moved.
-        # Keep whatever we had rather than caching the emptiness.
+        # Keep the last good list if a fetched page has no parseable models.
         return cached.get("models") or []
     _cache_write(models)
     return models
@@ -220,13 +205,8 @@ async def ollama_variants(name: str, *, timeout: float = 20.0) -> list[dict]:
     return out
 
 
-# ── Hugging Face ───────────────────────────────────────────────────────────
-#
-# Queried live rather than cached: the GGUF corner alone is tens of thousands
-# of repositories and grows hourly, so there is nothing here worth keeping a
-# local copy of. `expand[]` returns the GGUF header inline, which is what lets
-# a row say how big the model is and whether its template can call tools
-# without downloading anything.
+# Hugging Face
+# Fetch pages as needed. expand[] includes GGUF metadata for size and tool warnings.
 
 _HF_EXPAND = ("gguf", "downloads", "likes", "lastModified", "createdAt",
               "gated", "pipeline_tag", "tags", "author", "cardData")
@@ -309,9 +289,7 @@ async def hf_search(
 
 
 def _next_cursor(link_header: str | None) -> str | None:
-    """Hugging Face pages with an opaque cursor in a Link header. Only the
-    cursor is kept and the URL is rebuilt here, so a header from the network
-    can never redirect our next request somewhere else."""
+    """Read the next-page cursor from the Link header and rebuild the URL locally."""
     match = re.search(r'<([^>]+)>;\s*rel="next"', link_header or "")
     if not match:
         return None
@@ -330,9 +308,8 @@ async def hf_repo_detail(repo: str, *, timeout: float = 25.0) -> dict:
 
 # ── One row shape ──────────────────────────────────────────────────────────
 
-# Q4_K_M, the quantization both libraries default to, lands near 4.8 bits per
-# weight. Used only to filter and to warn; exact bytes arrive with the variant
-# list, and the truth arrives with /api/show after the install.
+# Estimate Q4_K_M at 4.8 bits per weight for filtering. Use reported sizes
+# and /api/show when they are available.
 BITS_PER_WEIGHT = 4.8
 
 
@@ -373,18 +350,14 @@ def _same_size(a: int, b: int, tolerance: float = 0.02) -> bool:
     return bool(a and b) and abs(a - b) <= tolerance * max(a, b)
 
 
-# What may follow a model's name and still be the same model: nothing, the
-# repacker's suffix, or a separator into its parameter size.
+# Allowed model-name suffixes: repacker names and parameter sizes.
 _NAME_ENDS = re.compile(r"^(?:$|[-_ ]gguf\b|[-_ ]\d)", re.I)
 
 
 def _names_match(family: str, path: str) -> bool:
-    """Is `family` the whole name in `path`, rather than the start of another?
+    """Match a full model name, allowing a size suffix.
 
-    `qwen3.8` is the model in `unsloth/Qwen3.8-27B-GGUF`, because what follows
-    it is its size. `qwen3` is not, twice over: in `Qwen3.8-27B` the name keeps
-    going into another digit, and in `qwen3-coder-30b` it keeps going into
-    another word. Both are different models that merely start the same way.
+    qwen3.8 matches Qwen3.8-27B-GGUF; qwen3 does not match qwen3.8 or qwen3-coder.
     """
     if not family or not path:
         return False
@@ -394,12 +367,7 @@ def _names_match(family: str, path: str) -> bool:
 
 
 def installed_index(registry: dict[str, dict] | None) -> list[tuple]:
-    """Installed models in the shapes a browse row can be recognised by.
-
-    The point is that the same weights carry the same name whichever library
-    they came through, so pulling Qwen3.8 from Ollama has to stop Hugging Face
-    offering to download it again under a repository name.
-    """
+    """Build the name and metadata matches used to find installed models across both libraries."""
     out = []
     for model_id, profile in (registry or {}).items():
         path = hf_repo(model_id) if is_hf_tag(model_id) else model_id.split(":")[0]
@@ -413,9 +381,7 @@ def installed_index(registry: dict[str, dict] | None) -> list[tuple]:
 
 
 def same_weights_warning(model_id: str) -> str:
-    """Architecture and parameter count identify a model, not a copy of it: an
-    abliterated or uncensored fine-tune matches its base on both. So this says
-    what is actually known and leaves the judgement to the reader."""
+    """Match architecture and parameter count. Label it as a match, since fine-tunes can share both."""
     return (f"Same size and architecture as {model_id}, which you already have. "
             "If this is a repack rather than a fine-tune, it is the same weights twice.")
 
@@ -423,12 +389,7 @@ def same_weights_warning(model_id: str) -> str:
 def already_installed_as(
     index: list[tuple], *, family: str = "", params: int = 0, name: str = ""
 ) -> str:
-    """The installed model that is these same weights from the other library.
-
-    Architecture and parameter count are read from the GGUF header by both
-    libraries, so they agree exactly; the name is the fallback for an Ollama
-    row, whose architecture is not known until something is installed.
-    """
+    """Find an installed model with matching architecture and size. Use its name when metadata is missing."""
     for model_id, its_family, its_params, its_path in index:
         if not _same_size(params, its_params):
             continue
@@ -490,9 +451,7 @@ def normalize_ollama(row: dict, *, installed: set[str], budget: int,
 
 
 def _hf_description(row: dict, gguf: dict) -> str:
-    """Hugging Face has no description field, so this is assembled from what
-    the repository does state. `base_model` is the useful part: a GGUF repo is
-    almost always somebody's quantization of a model named there."""
+    """Build a description from the repository metadata, including base_model."""
     card = row.get("cardData") or {}
     base = card.get("base_model")
     if isinstance(base, list):
@@ -538,9 +497,8 @@ def normalize_hf(row: dict, *, installed: set[str], budget: int,
     if context and context < 8192:
         warnings.append(f"Short {context // 1024}K context window.")
 
-    # The architecture and parameter count come from the same GGUF header
-    # Ollama reads, so this catches the same model arriving under a repository
-    # name that looks nothing like the Ollama tag already installed.
+    # Match GGUF architecture and size even when the repository and Ollama tag
+    # use different names.
     elsewhere = "" if here else already_installed_as(
         index or [], family=gguf.get("architecture") or "", params=params,
         name=repo.split("/")[-1])
@@ -587,13 +545,9 @@ def is_chattable(row: dict) -> bool:
     return "embedding" not in caps
 
 
-# ── Browsing ───────────────────────────────────────────────────────────────
-#
-# One screen, two libraries, one scroll. Ollama's list is small and held
-# locally, so it sorts and filters exactly. Hugging Face is streamed a page at
-# a time behind its own cursor, and the band and fit filters are applied to
-# each page as it arrives, so a filtered scroll walks several upstream pages
-# to fill one of ours rather than returning three rows and looking finished.
+# Browsing
+# Filter cached Ollama rows locally. Fetch and filter Hugging Face pages
+# until this page is full or there are no more results.
 
 _MAX_UPSTREAM_PAGES = 5
 
@@ -719,9 +673,7 @@ async def variants(source: str, model_id: str, *, budget: int = 0) -> dict:
         row["fits"] = bool(budget) and row["weights_bytes"] > 0 and needed <= budget
         row["recommended"] = False
 
-    # Quantization trades accuracy for room, so the best version of a model is
-    # the largest one this machine can actually hold. It goes first, because a
-    # list of twenty-five is a question nobody wants to be asked.
+    # Show the largest quantization that fits first.
     best = max((r for r in out if r["fits"]), key=lambda r: r["weights_bytes"], default=None)
     if best:
         best["recommended"] = True
@@ -731,10 +683,10 @@ async def variants(source: str, model_id: str, *, budget: int = 0) -> dict:
 
 
 def hf_tag_size(tag: str, *, timeout: float = 15.0) -> int:
-    """Download bytes behind one `hf.co/owner/repo:QUANT` tag, 0 when the
-    quantization is not in the repository. Uses urllib rather than httpx so
-    the installer can call it before pip has run, which is the same reason
-    models.manifest_size does."""
+    """Return download size for an hf.co tag, or 0 if missing.
+
+    Use urllib so setup can call this before installing Python packages.
+    """
     import urllib.request
 
     body = re.sub(r"^(hf\.co|huggingface\.co)/", "", (tag or "").strip(), flags=re.I)

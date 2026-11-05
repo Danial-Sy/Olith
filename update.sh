@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-# Same Python rule as setup.sh: prefer the distro interpreter so the updater
-# behaves identically to the installer that built the venv.
+# Use the same distro Python as setup.sh.
 if [[ -x /usr/bin/python3 ]]; then
   PY=/usr/bin/python3
 elif command -v python3 >/dev/null 2>&1; then

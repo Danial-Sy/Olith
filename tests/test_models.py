@@ -107,7 +107,7 @@ class SamplingTests(unittest.TestCase):
         self.assertEqual(parsed, {"temperature": 0.6, "top_k": 40})
 
     def test_catalog_tuning_wins_over_the_models_own_parameters(self):
-        # The GGUF ships temperature 1; Aether's tuned value must survive.
+        # The GGUF ships temperature 1; Olith's tuned value must survive.
         profile = m.profile_from_show(
             "qwen3.8:27b", QWEN38, entry={"tuning": {"temperature": 0.7, "top_p": 0.95}}
         )
@@ -182,7 +182,7 @@ class CatalogTests(unittest.TestCase):
         for lower, upper in zip(tiers, tiers[1:]):
             self.assertEqual(float(lower["max_gb"]), float(upper["min_gb"]))
 
-    def test_a_24gb_card_is_recommended_the_pair_aether_was_tuned_on(self):
+    def test_a_24gb_card_is_recommended_the_pair_olith_was_tuned_on(self):
         tags = {entry["tag"] for entry in m.recommend(24, self.catalog)["models"]}
 
         self.assertEqual(tags, {"qwen3.8:27b", "qwen3-coder:30b"})
@@ -241,7 +241,7 @@ class LiveContractTests(unittest.TestCase):
     def test_show_still_reports_capabilities(self):
         for name, show in self.shown.items():
             self.assertIsInstance(show.get("capabilities"), list, name)
-            self.assertIn("completion", show["capabilities"], name)
+            self.assertTrue({"completion", "embedding"} & set(show["capabilities"]), name)
 
     def test_show_still_carries_the_fields_the_fit_math_reads(self):
         for name, show in self.shown.items():
@@ -249,7 +249,8 @@ class LiveContractTests(unittest.TestCase):
             arch = info.get("general.architecture")
             self.assertTrue(arch, name)
             self.assertTrue(info.get(f"{arch}.block_count"), name)
-            self.assertTrue(info.get(f"{arch}.attention.head_count_kv"), name)
+            if "completion" in show["capabilities"]:
+                self.assertTrue(info.get(f"{arch}.attention.head_count_kv"), name)
             self.assertTrue(info.get(f"{arch}.context_length"), name)
 
     def test_every_installed_model_profiles_and_sizes(self):
@@ -257,7 +258,10 @@ class LiveContractTests(unittest.TestCase):
             profile = m.profile_from_show(
                 name, self.shown[name], weights_bytes=size, entry=m.catalog_entry(name)
             )
-            self.assertGreater(profile["kv_bytes_per_token"], 0, name)
+            if "completion" in self.shown[name]["capabilities"]:
+                self.assertGreater(profile["kv_bytes_per_token"], 0, name)
+            else:
+                self.assertFalse(m.can_serve(profile, "chat"), name)
             self.assertGreater(profile["context_max"], 0, name)
             self.assertGreater(m.max_context(profile, 24 * GIB), 0, name)
 
@@ -274,7 +278,7 @@ class LiveContractTests(unittest.TestCase):
                 self.assertEqual(profile[field], meta[field], f"{model_id}.{field}")
 
 
-@unittest.skipUnless(os.environ.get("AETHER_LIVE_TESTS") == "1", "set AETHER_LIVE_TESTS=1")
+@unittest.skipUnless(os.environ.get("OLITH_LIVE_TESTS") == "1", "set OLITH_LIVE_TESTS=1")
 class RegistryTests(unittest.TestCase):
     def test_every_catalog_tag_resolves_to_a_real_download(self):
         catalog = m.load_catalog()
@@ -292,6 +296,12 @@ def _reg(**models):
 
 
 class RoleTests(unittest.TestCase):
+    def test_embedding_models_cannot_be_assigned_chat_or_used_for_titles(self):
+        reg = _reg(embed={"capabilities": ["embedding"], "params": 1}, chat={"params": 10})
+        settings = {"model_roles": {"embed": ["chat", "agentic"]}}
+        self.assertEqual(m.role_map(settings, reg)["embed"], [])
+        self.assertEqual(m.title_model(settings, reg), "chat")
+
     def test_one_model_serves_every_role(self):
         reg = _reg(solo={"think": True})
 
@@ -468,7 +478,7 @@ class ThinkingTagTests(unittest.TestCase):
         try:
             import server
         except ModuleNotFoundError:
-            self.skipTest("server dependencies are installed in Aether's .venv")
+            self.skipTest("server dependencies are installed in Olith's .venv")
         self.split = server._split_thinking
 
     def test_every_known_tag_family_is_recognised(self):
@@ -639,12 +649,7 @@ class ProbeCacheTests(unittest.TestCase):
 
 
 class DefaultParityTests(unittest.TestCase):
-    """The tuned pair must resolve exactly as it did before modularity.
-
-    Captured from config.py at commit 8052512, the last release before roles.
-    Everything else grows off this, so a drift here is a real regression even
-    when every other test passes.
-    """
+    """Keep the default model pair's settings from commit 8052512 when resolving roles."""
 
     GOLDEN = {
         ("general", "chat", config.DEFAULT_CHAT_MODEL): {
@@ -720,12 +725,7 @@ class DefaultParityTests(unittest.TestCase):
 
 
 class EffortDisclosureTests(unittest.TestCase):
-    """Users could not tell which effort levels actually think.
-
-    With one model family that was a documentation problem. With any Ollama
-    model it is a correctness one: the default agentic model cannot think, so
-    the old hints claimed a reasoning pass that never happened.
-    """
+    """Show which effort levels actually enable thinking for the selected model."""
 
     def test_a_thinking_model_marks_exactly_the_thinking_tiers(self):
         levels = {lv["key"]: lv for lv in m.effort_levels({"think": True})}
@@ -971,3 +971,4 @@ class InstallPlanTests(unittest.TestCase):
             plan = self._plan(vram)
             for key in ("default", "recommended"):
                 self.assertIn(config.TITLE_MODEL_ID, plan[key]["tags"], f"{vram}/{key}")
+                self.assertIn(config.EMBEDDING_MODEL_ID, plan[key]["tags"], f"{vram}/{key}")

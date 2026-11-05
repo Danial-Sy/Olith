@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""How much of Aether's surface a given model can hold.
+"""Optional tool-list changes by model size.
 
-Maps a capability profile onto a set of dials. `agent` decides what the dials
-mean. Every dial ships off: see ARCHITECTURE.md for the measurements.
+All options are off after benchmark results. See ARCHITECTURE.md.
 """
 from __future__ import annotations
 
 B = 1_000_000_000
 
-# Parameter count is all that is known before a model has run, so it seeds the
-# tier. Anything measured later outranks it.
+# Use parameter count for the initial tier. Prefer measured capabilities later.
 TIER_BOUNDS = (
     ("tiny", 2 * B),
     ("small", 8 * B),
@@ -18,9 +16,8 @@ TIER_BOUNDS = (
 )
 FULL = "full"
 
-# Every dial is off. All three were implemented, benchmarked against five real
-# models and rejected because they measured worse. The table stays so
-# scripts/bench_tool_choice.py can re-ask on a model we have not seen.
+# Keep all options off; each performed worse in the five-model benchmark.
+# Leave the table available for future comparisons.
 _OFF = {"tool_budget": None, "order_tools": False, "lean_schemas": False}
 POLICIES = {
     "tiny": dict(_OFF),
@@ -50,11 +47,7 @@ def policy_for(profile: dict | None) -> dict:
 
 
 def edge_order(items: list) -> list:
-    """Reorder by priority so the most important sit at the ends.
-
-    Tools in the middle of a list are selected correctly 22-52% of the time
-    against 31-32% at either end, so the least important end up there.
-    """
+    """Put high-priority tools at the ends of the list. Used only by the benchmark."""
     out: list = [None] * len(items)
     front, back = 0, len(items) - 1
     for i, item in enumerate(items):

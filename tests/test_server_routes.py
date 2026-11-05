@@ -59,9 +59,9 @@ class WarmupRouteTests(unittest.TestCase):
         self.assertEqual(res.json()["detail"], "Unknown model")
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class ConsentPageTests(unittest.TestCase):
-    """The page Aether shows before handing anyone to a login form."""
+    """The page Olith shows before handing anyone to a login form."""
 
     def _page(self, cid):
         import asyncio
@@ -74,15 +74,16 @@ class ConsentPageTests(unittest.TestCase):
 
     def test_it_says_who_is_asking_and_for_what(self):
         page = self._page("google")
-        self.assertIn("Aether wants to connect to Google", page)
-        self.assertIn("This window belongs to Aether", page)
+        self.assertIn("Sign in to Google in Olith's browser", page)
+        self.assertIn("This window belongs to Olith", page)
         self.assertIn("never sees your password", page)
+        self.assertIn("not authorization for direct", page)
 
     def test_it_links_on_to_the_real_sign_in(self):
         self.assertIn('href="https://accounts.google.com/ServiceLogin"', self._page("google"))
 
     def test_it_tells_you_what_to_do_if_you_did_not_ask_for_it(self):
-        self.assertIn("If you did not press Connect in Aether", self._page("google"))
+        self.assertIn("If you did not press Connect in Olith", self._page("google"))
 
     def test_a_service_that_does_not_exist_is_not_a_page(self):
         from fastapi import HTTPException

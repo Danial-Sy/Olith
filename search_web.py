@@ -11,7 +11,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
-_UA = "Mozilla/5.0 (compatible; AetherBot/1.0; +local)"
+_UA = "Mozilla/5.0 (compatible; OlithBot/1.0; +local)"
 _WEATHER_RE = re.compile(
     r"\b(weather|temperature|forecast|humidity|wind\s*chill|radar|"
     r"how\s+hot|how\s+cold|rain(?:ing)?|snow(?:ing)?|humid)\b",

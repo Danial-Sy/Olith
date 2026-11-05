@@ -12,6 +12,40 @@ from config import ROOT
 
 
 class AgentToolTests(unittest.TestCase):
+    @unittest.skipIf(__import__("os").name == "nt", "Bash pipe semantics")
+    def test_pipeline_does_not_hide_a_failed_check_behind_tail(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            result = json.loads(agent.run_tool("run_shell", {"command": "printf 'FAILED test\\n'; false | tail -20"}, Path(folder)))
+        self.assertNotEqual(result["exit_code"], 0)
+
+    def test_failed_shell_activity_does_not_show_a_success_tick(self):
+        line = agent.tool_activity_line("run_shell", {"command": "make test"}, json.dumps({"exit_code": 1}))
+        self.assertIn("✗ exit 1", line)
+        self.assertNotIn("✓", line)
+
+    def test_internal_verification_label_never_reaches_a_shell(self):
+        with unittest.mock.patch.object(agent.subprocess, "run", side_effect=AssertionError("must not execute")):
+            result = json.loads(agent.run_tool("run_shell", {"command": agent.INTERNAL_VERIFICATION_COMMAND}, None, chat={"verification": {"commands": []}}))
+        self.assertIn("not a shell command", result["error"])
+
+    def test_file_body_limit_is_enforced_before_creating_a_file(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            root = Path(folder)
+            result = json.loads(agent.run_tool("write_file", {"path": "game.cpp", "content": "x" * (agent.MAX_WRITE_CHARS + 1)}, root))
+            self.assertFalse(result["changed"]); self.assertFalse((root / "game.cpp").exists())
+
+    def test_plan_cannot_reopen_finished_work_in_the_same_job_but_new_requests_can(self):
+        chat = {"messages": [{"role": "user", "id": "one", "content": "Build the game"}]}
+        plan = [{"id": "1", "content": "Build", "status": "in_progress"}, {"id": "2", "content": "Test", "status": "pending"}]
+        agent.run_tool("todo_write", {"todos": plan}, None, chat=chat)
+        agent.run_tool("todo_write", {"merge": True, "todos": [{"id": "1", "status": "completed"}]}, None, chat=chat)
+        agent.run_tool("todo_write", {"merge": True, "todos": [{"id": "2", "status": "completed"}]}, None, chat=chat)
+        reset = json.loads(agent.run_tool("todo_write", {"merge": True, "todos": plan}, None, chat=chat))
+        self.assertEqual(reset["open"], 0); self.assertEqual(len(reset["restored"]), 2)
+        chat["messages"].append({"role": "user", "id": "two", "content": "Fix the collision bug"})
+        fresh = json.loads(agent.run_tool("todo_write", {"todos": plan}, None, chat=chat))
+        self.assertEqual(fresh["open"], 2); self.assertEqual(fresh["restored"], [])
+
     def test_shell_inspection_classifier_separates_searches_from_validation(self):
         self.assertTrue(agent.shell_is_inspection('grep -n "cooldown" jungle.html'))
         self.assertTrue(agent.shell_is_inspection("rg gravity . | head -20"))
@@ -60,11 +94,7 @@ class AgentToolTests(unittest.TestCase):
         self.assertEqual(chat["agent_todos"][1]["status"], "in_progress")
 
     def test_batch_completion_applies_one_milestone_and_defers_the_rest(self):
-        """Rejecting the whole call advanced nothing, which livelocked the run.
-
-        With open todos the runtime refuses every debrief, so a model trying to
-        close out its plan could neither finish the plan nor end the turn.
-        """
+        """Complete the active milestone while leaving other requested completions pending."""
         chat = {"agent_todos": [
             {"id": "inspect", "content": "Inspect files", "status": "in_progress"},
             {"id": "build", "content": "Build feature", "status": "pending"},
@@ -107,10 +137,9 @@ class AgentToolTests(unittest.TestCase):
         definitions = {
             item["function"]["name"]: item["function"] for item in agent.TOOL_DEFS
         }
-        self.assertEqual(
-            definitions["write_file"]["parameters"]["properties"]["content"]["maxLength"],
-            12000,
-        )
+        # A rewrite carries the whole file, so only new files are chunked.
+        self.assertNotIn("maxLength", definitions["write_file"]["parameters"]["properties"]["content"])
+        self.assertIn("12,000", definitions["write_file"]["parameters"]["properties"]["content"]["description"])
         self.assertEqual(
             definitions["append_file"]["parameters"]["properties"]["content"]["maxLength"],
             12000,
@@ -244,7 +273,7 @@ class AgentToolTests(unittest.TestCase):
             root = Path(folder)
             target = root / "game.js"
             target.write_text("const ready = true;\n", encoding="utf-8")
-            marker = "[Aether replay elision: 5000 characters]"
+            marker = "[Olith replay elision: 5000 characters]"
             append_result = json.loads(agent.run_tool(
                 "append_file", {"path": "game.js", "content": marker}, root
             ))
@@ -257,9 +286,7 @@ class AgentToolTests(unittest.TestCase):
             self.assertFalse((root / "other.js").exists())
 
     def test_a_missed_anchor_reports_the_closest_real_lines(self):
-        # Refusing without showing what IS there costs a reread per attempt, and
-        # that reread is what the redundant-read guard blocks. The observed loop
-        # was ten identical retries of one edit.
+        # Return matching source lines so the next edit can fix its anchor.
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
             root = Path(folder)
             (root / "a.js").write_text(
@@ -277,13 +304,7 @@ class AgentToolTests(unittest.TestCase):
             self.assertEqual(result["nearest"][0]["text"], "const FLIP_CD=1.8; // seconds")
 
     def test_anchored_edit_without_a_replacement_is_refused(self):
-        """`replace` absent is not `replace: ""`.
-
-        Coercing the missing key to empty turned the call into a silent
-        deletion that still reported ok. Measured on one run: 33 such calls
-        removed ~10k characters of the user's file, after which the anchors for
-        every later edit no longer existed.
-        """
+        """Require replace explicitly. A missing key must not become an empty replacement."""
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
             root = Path(folder)
             target = root / "example.js"
@@ -331,12 +352,7 @@ class AgentToolTests(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "const one = 1;\n")
 
     def test_validate_file_fails_on_an_unclosed_script_block(self):
-        """Failing open here is how a shredded file passed its own gate.
-
-        Once </script> was destroyed the block regex matched nothing, the scan
-        reported "No inline scripts" with ok=true, and every later edit
-        committed with no JavaScript check at all.
-        """
+        """Reject broken script tags so an edit cannot skip JavaScript validation."""
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
             root = Path(folder)
             target = root / "game.html"
@@ -550,12 +566,7 @@ class AgentToolTests(unittest.TestCase):
         self.assertEqual(agent.classify_shell("echo $(rm -rf /tmp/x)")[0], "review")
 
     def test_inline_js_errors_point_at_the_html_line(self):
-        """A syntax error must name a line the model can actually edit.
-
-        Inline scripts are concatenated into one temp .js before `node --check`,
-        so the reported line belonged to that concatenation. A model correcting
-        "line 5" edited an unrelated part of the HTML and failed again.
-        """
+        """Map combined-script errors back to the editable HTML file's line numbers."""
         if not shutil.which("node"):
             self.skipTest("node is required for the inline JavaScript validator")
         with tempfile.TemporaryDirectory() as tmp:
@@ -579,7 +590,7 @@ class AgentToolTests(unittest.TestCase):
             error = result["error"]
             # Names the real file, never the temp concatenation.
             self.assertIn("page.html:", error)
-            self.assertNotIn("aether-inline-", error)
+            self.assertNotIn("olith-inline-", error)
             # And a line at or after the break, not one from the concatenation.
             reported = int(error.split("page.html:")[1].split("\n")[0])
             self.assertGreaterEqual(reported, broken_line)
@@ -612,11 +623,7 @@ class AgentToolTests(unittest.TestCase):
                 self.assertIn("system path", why)
 
     def test_anchored_edits_survive_each_other_in_one_batch(self):
-        """Line numbers go stale after every applied edit; anchors do not.
-
-        The observed loop was read x5, edit, read x7, edit. The model
-        recalibrating line numbers it had just invalidated.
-        """
+        """Use text anchors so earlier edits do not make later locations stale."""
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
             root = Path(folder)
             target = root / "game.html"
@@ -685,7 +692,7 @@ class AgentToolTests(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), original)
             # And the error names the real file, not the temp copy it checked.
             self.assertIn("game.html:", result["validation"]["error"])
-            self.assertNotIn("aether-", result["validation"]["error"])
+            self.assertNotIn("olith-", result["validation"]["error"])
 
     def test_mixing_anchored_and_line_edits_is_refused(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
@@ -763,28 +770,29 @@ class AgentToolTests(unittest.TestCase):
         self.assertEqual(result["active_id"], "music")
         self.assertEqual(result["send_exactly"]["todos"][0]["id"], "music")
 
-    def test_write_file_will_not_touch_an_existing_file(self):
-        """A file is written once and edited from then on.
-
-        Letting write_file replace an existing file makes every call a chance to
-        drop whatever the model did not retype.
-        """
+    def test_write_file_replaces_an_existing_file_and_keeps_a_backup(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
             root = Path(folder)
-            target = root / "game.html"
-            original = "<script>\nlet a = 1;\nlet b = 2;\n</script>\n"
+            target = root / "game.cpp"
+            original = "// existing game\n" * 1200
             target.write_text(original, encoding="utf-8")
+            backups = root / "backups"
+            with unittest.mock.patch.object(agent, "BACKUP_DIR", backups):
+                result = json.loads(agent.run_tool("write_file", {"path": "game.cpp", "content": "int main() {}\n"}, root))
+            self.assertTrue(result["changed"], result)
+            self.assertEqual(result["replaced"], {"lines_before": 1201, "lines_after": 2})
+            self.assertEqual(target.read_text(encoding="utf-8"), "int main() {}\n")
+            saved = list((backups / "game.cpp").iterdir())
+            self.assertEqual([f.read_text(encoding="utf-8") for f in saved], [original])
 
-            # Even growing content is refused: this is edit_file's job.
-            result = json.loads(agent.run_tool("write_file", {
-                "path": "game.html",
-                "content": original.replace("</script>", "let c = 3;\n</script>"),
-            }, root))
-
-            self.assertFalse(result["changed"])
-            self.assertIn("use edit_file", result["error"])
-            self.assertEqual(result["existing_lines"], 5)
-            self.assertEqual(target.read_text(encoding="utf-8"), original)
+    def test_editing_after_a_rewrite_needs_no_shell_workaround(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            root = Path(folder); chat = {}
+            (root / "dino.cpp").write_text("int score = 0;\n")
+            agent.run_tool("write_file", {"path": "dino.cpp", "content": "int score = 1;\n"}, root, chat=chat)
+            self.assertIsNone(agent._rewrite_shell_guard("rm -f dino.o && g++ dino.cpp -o dino", root, chat))
+            emptied = json.loads(agent.run_tool("edit_file", {"path": "dino.cpp", "find": "int score = 1;\n", "replace": ""}, root, chat=chat))
+            self.assertFalse(emptied["changed"])
 
     def test_write_file_creates_a_file_that_does_not_exist(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
@@ -795,53 +803,32 @@ class AgentToolTests(unittest.TestCase):
             self.assertTrue(result["changed"])
             self.assertTrue((root / "fresh.html").is_file())
 
-    def test_explicit_overwrite_is_allowed_but_still_cannot_gut_the_file(self):
+    def test_a_large_file_can_be_rewritten_in_one_overwrite(self):
+        # The chunk cap plus the shrink floor once made any file over ~13K
+        # characters impossible to rewrite, and a run looped for 150 steps.
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
             root = Path(folder)
-            target = root / "game.html"
-            big = "<script>\n" + "".join(
-                f"function helper{i}(){{ return {i}; }}\n" for i in range(300)
-            ) + "</script>\n"
-            target.write_text(big, encoding="utf-8")
-
-            # A genuine same-size rewrite goes through.
-            rewritten = big.replace("return 0;", "return 42;")
-            self.assertTrue(json.loads(agent.run_tool("write_file", {
-                "path": "game.html", "content": rewritten, "overwrite": True,
-            }, root))["changed"])
-
-            # Gutting it does not, even with the flag set.
-            result = json.loads(agent.run_tool("write_file", {
-                "path": "game.html",
-                "content": "<script>\nfunction helper0(){ return 0; }\n</script>\n",
-                "overwrite": True,
-            }, root))
-            self.assertFalse(result["changed"])
-            self.assertIn("ask_user", result["hint"])
-            self.assertEqual(target.read_text(encoding="utf-8"), rewritten)
-
-    def test_write_file_refuses_to_shrink_a_substantial_file(self):
-        """One write_file regenerated a 687-line game as 16k chars.
-
-        Everything the model did not reproduce was destroyed, and recovering it
-        meant stitching the file back out of chat transcripts.
-        """
-        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
-            root = Path(folder)
-            target = root / "game.html"
-            original = "<script>\n" + "".join(
-                f"function helper{i}(){{ return {i}; }}\n" for i in range(300)
-            ) + "</script>\n"
+            target = root / "game.cpp"
+            original = "// existing game\n" * 1200
             target.write_text(original, encoding="utf-8")
+            for size in (len(original) + 7, int(len(original) * 0.84)):
+                rewritten = "// polished\n" * (size // 12)
+                result = json.loads(agent.run_tool("write_file", {
+                    "path": "game.cpp", "content": rewritten, "overwrite": True,
+                }, root))
+                self.assertTrue(result["changed"], result)
+                self.assertEqual(target.read_text(encoding="utf-8"), rewritten)
+                target.write_text(original, encoding="utf-8")
 
-            result = json.loads(agent.run_tool("write_file", {
-                "path": "game.html",
-                "content": "<script>\nfunction helper0(){ return 0; }\n</script>\n",
-            }, root))
-
-            self.assertFalse(result["changed"])
-            self.assertIn("edit_file", result["error"])
-            self.assertEqual(target.read_text(encoding="utf-8"), original)
+    def test_search_files_accepts_a_single_file_path(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            root = Path(folder)
+            (root / "dino.cpp").write_text("int main() {\n  g.score += 1;\n}\n", encoding="utf-8")
+            (root / "other.cpp").write_text("int score;\n", encoding="utf-8")
+            for grep in (shutil.which("grep"), None):
+                with unittest.mock.patch.object(agent, "shutil_which", return_value=grep):
+                    hits = json.loads(agent.run_tool("search_files", {"pattern": "score", "path": "dino.cpp"}, root))["hits"]
+                self.assertEqual(hits, [{"file": "dino.cpp", "line": 2, "text": "g.score += 1;"}], grep)
 
     def test_write_file_still_allows_growth_and_small_files(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
@@ -893,7 +880,7 @@ class AgentToolTests(unittest.TestCase):
         replay = agent.to_ollama_tool_calls(stored, elide_large_inputs=True)
         self.assertEqual(normal[0]["function"]["arguments"]["content"], body)
         replay_body = replay[0]["function"]["arguments"]["content"]
-        self.assertIn("Aether replay elision", replay_body)
+        self.assertIn("Olith replay elision", replay_body)
         self.assertLess(len(replay_body), 300)
 
     def test_large_append_body_is_elided_for_replay(self):
@@ -902,7 +889,7 @@ class AgentToolTests(unittest.TestCase):
             [{"name": "append_file", "arguments": {"path": "game.js", "content": body}}],
             elide_large_inputs=True,
         )
-        self.assertIn("Aether replay elision", replay[0]["function"]["arguments"]["content"])
+        self.assertIn("Olith replay elision", replay[0]["function"]["arguments"]["content"])
 
     def test_read_results_include_revision_for_cross_turn_reuse(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
@@ -988,9 +975,7 @@ class SearchRoutingTests(unittest.TestCase):
 
 
 class ToolOutputOffloadTests(unittest.TestCase):
-    """Phase 4: oversized tool output goes to the filesystem and rides in the
-    prompt as head + tail + path. Truncating cut exactly the tail the model
-    needed next; the old one-line receipt cut everything."""
+    """Save large results to disk and keep their head, tail and path in context."""
 
     CHAT = "offload-tests"
 
@@ -1102,13 +1087,7 @@ class ToolOutputOffloadTests(unittest.TestCase):
 
 
 class NarrationVersusDeliverableTests(unittest.TestCase):
-    """A written-out plan is a failed action, not a finished turn.
-
-    looks_like_final_answer treats anything over 400 characters as the
-    deliverable. A plan defeats that by being long and well formed while its
-    closing line is still only a promise, so the agent loop ended runs having
-    called no tools at all and handed the user a plan as if it were the work.
-    """
+    """Treat a reply ending with a promised action as unfinished, even when it is long."""
 
     PLAN = (
         "Here is my plan for the jungle platformer:\n\n"
@@ -1160,13 +1139,7 @@ class NarrationVersusDeliverableTests(unittest.TestCase):
 
 
 class PlanRewriteTests(unittest.TestCase):
-    """A merge=false rewrite must not resurrect finished work.
-
-    Qwen re-emits the whole plan mid-run to expand the step it is about to start,
-    and regenerates every item as "pending" because it does not track its own
-    statuses. Replacing the list wholesale reset a run that was four milestones
-    deep back to nothing done.
-    """
+    """Keep completed milestones when a rewritten plan resets every status."""
 
     PLAN = [
         {"id": "scaffold", "content": "Create index.html shell", "status": "completed"},
@@ -1244,12 +1217,7 @@ class PlanRewriteTests(unittest.TestCase):
 
 
 class ContentToolCallTests(unittest.TestCase):
-    """Weak models write tool calls into the reply instead of the tool_calls field.
-
-    Measured on llama3.2:3b with Aether's real schemas: 2 of 16 replies did it,
-    both on the deeply nested ones (todo_write, ask_user). Without a fallback
-    the loop reads them as a final answer and the run ends having done nothing.
-    """
+    """Recover tool calls written into the reply body instead of tool_calls."""
 
     def _names(self, content, native=None):
         return [c["name"] for c in
@@ -1326,7 +1294,7 @@ class SchemaTrimTests(unittest.TestCase):
 
     def test_the_default_agentic_window_is_not_trimmed(self):
         # 65536 is DEFAULT_SETTINGS' agentic window; trimming it would be a
-        # regression for the model Aether was built on.
+        # regression for the model Olith was built on.
         self.assertEqual(self._names(65536), self._names(None))
 
     def test_a_small_window_drops_the_optional_tools(self):
@@ -1359,14 +1327,7 @@ class SchemaTrimTests(unittest.TestCase):
 
 
 class BrokenToolCallTests(unittest.TestCase):
-    """A tool call written into the reply AND malformed.
-
-    Observed live on llama3.2:3b asked to plan with todo_write: it emitted
-    `"todos":[["activeForm":...]]`, square brackets where objects belonged.
-    The JSON never parses, so the arguments cannot be recovered. Executing a
-    guess would run something the model did not ask for, so the loop retries
-    instead.
-    """
+    """Retry malformed calls without guessing their arguments."""
 
     def test_the_malformed_call_observed_live_is_recognised(self):
         observed = ('{"name":"todo_write","parameters":{"merge":true,"todos":'
@@ -1401,12 +1362,7 @@ class BrokenToolCallTests(unittest.TestCase):
 
 
 class TrailingCallTests(unittest.TestCase):
-    """Models often write a sentence and then the call.
-
-    Observed live: 'Here is the updated plan:\\n{"name": "todo_write", ...}'.
-    Requiring the JSON to reach the end of the reply is what separates that
-    from a call quoted mid-sentence, which is followed by more prose.
-    """
+    """Accept a call after prose only when its JSON reaches the end of the reply."""
 
     def _names(self, content):
         return [c["name"] for c in agent.extract_tool_calls({"content": content, "tool_calls": []})]

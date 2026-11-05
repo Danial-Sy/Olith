@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Exercise Aether's real Ollama agent across multi-round, multi-file jobs.
+"""Run real-model tasks on temporary multi-file projects and check the results.
 
-Unlike the unit tests, this suite does not mock model output.  It builds disposable
-projects, lets the configured Aether agent inspect and modify them, then checks the
-result independently.  Nothing in the Aether checkout is edited by the scenarios.
+Model output is not mocked. The Olith checkout stays unchanged.
 """
 from __future__ import annotations
 
@@ -131,7 +129,7 @@ def verify_fixture(root: Path) -> tuple[bool, str]:
         source = game.read_text(encoding="utf-8", errors="replace")
         lower = source.lower()
         closing = lower.rfind("</html>")
-        if "[Aether replay elision:" in source:
+        if "[Olith replay elision:" in source:
             return False, (details + "\nInternal replay marker leaked into game source.")[-4000:]
         if closing < 0 or source[closing + len("</html>"):].strip():
             return False, (details + "\nGame source exists outside the closing HTML tag.")[-4000:]
@@ -145,7 +143,7 @@ async def run_scenario(
     effort: str,
     think: bool,
 ) -> dict:
-    with tempfile.TemporaryDirectory(prefix="aether-agent-complex-") as temp:
+    with tempfile.TemporaryDirectory(prefix="olith-agent-complex-") as temp:
         root = Path(temp)
         write_fixture(root, scenario)
         chat = {

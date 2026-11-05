@@ -1,16 +1,10 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""
-Search router: deterministic gates plus follow-up carry.
+"""Decide whether a message needs web search and choose a query from chat context.
 
-Decides whether a turn needs a live web search and what query to run, using the
-current message plus prior chat context. No LLM call required for the common path.
-
-Toggle semantics (server):
-  force_on  → always search
-  auto      → this router decides (default when toggle is off)
-  Message "don't search" always vetoes.
+force_on always searches unless the user says not to. auto uses the router.
+Ordinary routing does not call a model.
 """
 from __future__ import annotations
 
@@ -47,7 +41,7 @@ _CURRENT_INFO = re.compile(
 )
 _LEAD = re.compile(
     r"^(hey|yo|ok|okay|so|and|please|could you|can you|would you|will you|"
-    r"aether)[\s,]*",
+    r"olith)[\s,]*",
     re.I,
 )
 _ENTITY = re.compile(
@@ -88,7 +82,7 @@ _OPINIONY = re.compile(
     r"|\bpower[\s-]?scal|\bbe\s+honest\b|\bhot\s+take\b|\bcould\s+\w+\s+beat\b",
     re.I,
 )
-_SELF_DIRECTED = re.compile(r"\b(you|your|yours|u|ya|yourself|aether|we|us|our)\b", re.I)
+_SELF_DIRECTED = re.compile(r"\b(you|your|yours|u|ya|yourself|olith|we|us|our)\b", re.I)
 _REMINISCE = re.compile(
     r"\b(you remember|remember (?:when|that|the|how)|do you remember|recall when|"
     r"that (?:part|bit|scene|moment) (?:where|when)|the (?:part|bit|scene) (?:where|when)|"
@@ -262,9 +256,7 @@ def _entity_question(msg: str) -> bool:
         return False
     if _INTERROGATIVE_OPEN.search(msg):
         return True
-    # A long instruction ending in "ok?" is not a question. The entity pattern
-    # matches any word followed by a number, so "your 8 bit music" plus a "?"
-    # was forcing a web search on an ordinary implementation request.
+    # Do not treat a long instruction ending in "ok?" as a search question.
     return bool(_QUESTIONISH.search(msg)) and len(msg.split()) <= _ENTITY_QUESTION_MAX_WORDS
 
 
@@ -442,11 +434,9 @@ def route_search(
     force_on: bool = False,
     agentic: bool = False,
 ) -> SearchDecision:
-    """
-    Decide whether to search and what query to use.
+    """Choose whether to search and which query to use.
 
-    force_on: UI toggle forced, but still respects an explicit 'don't search'.
-    agentic: tool-loop turn, so never search on a heuristic, only when asked.
+    force_on still respects "don't search". Agentic runs search only when asked.
     """
     raw = strip_research_block(user_msg or "").strip()
     if not raw:
@@ -456,10 +446,8 @@ def route_search(
         return SearchDecision(False, reason="no-search-veto")
 
     if agentic and not (force_on or _positive_search_cmd(raw)):
-        # Agentic turns are about the project on disk, and these heuristics
-        # misfire on build requests. The cost is not just noise: results are
-        # untrusted text pasted into the prompt of an agent that runs shell
-        # commands. Search only when explicitly asked.
+        # Search during Agentic turns only when asked. Build requests can look like
+        # search questions, and results add outside text to the tool prompt.
         return SearchDecision(False, reason="agentic-needs-explicit-request")
 
     if _DATE_Q.search(raw):

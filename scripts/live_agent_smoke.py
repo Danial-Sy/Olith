@@ -27,7 +27,7 @@ async def main() -> int:
             ),
         }],
     }
-    project = {"id": "live-project", "name": "Aether", "root": str(ROOT), "description": ""}
+    project = {"id": "live-project", "name": "Olith", "root": str(ROOT), "description": ""}
     settings = {
         "agent_repeat_limit": 3,
         "agent_context": 65536,
@@ -64,7 +64,7 @@ async def main() -> int:
         ),
         "",
     ).strip()
-    ok = "read_file" in tool_names and "Aether" in final
+    ok = "read_file" in tool_names and "Olith" in final
     print({"ok": ok, "tools": tool_names, "final": final})
     return 0 if ok else 1
 

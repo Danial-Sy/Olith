@@ -1,0 +1,174 @@
+{
+  "package": "simple-icons",
+  "version": "16.36.0",
+  "icons": {
+    "notion": {
+      "title": "Notion",
+      "source": "https://www.notion.so",
+      "upstream_hex": "000000",
+      "display_hex": "F5F5F5"
+    },
+    "linear": {
+      "title": "Linear",
+      "source": "https://linear.app",
+      "upstream_hex": "5E6AD2",
+      "display_hex": "5E6AD2"
+    },
+    "trello": {
+      "title": "Trello",
+      "source": "https://atlassian.design/resources/logo-library",
+      "upstream_hex": "0052CC",
+      "display_hex": "F5F5F5"
+    },
+    "asana": {
+      "title": "Asana",
+      "source": "https://asana.com/brand",
+      "upstream_hex": "F06A6A",
+      "display_hex": "F06A6A"
+    },
+    "clickup": {
+      "title": "ClickUp",
+      "source": "https://clickup.com/brand",
+      "upstream_hex": "7B68EE",
+      "display_hex": "7B68EE"
+    },
+    "airtable": {
+      "title": "Airtable",
+      "source": "https://airtable.com/newsroom",
+      "upstream_hex": "18BFFF",
+      "display_hex": "18BFFF"
+    },
+    "atlassian": {
+      "title": "Atlassian",
+      "source": "https://atlassian.design/resources/logo-library",
+      "upstream_hex": "0052CC",
+      "display_hex": "F5F5F5"
+    },
+    "todoist": {
+      "title": "Todoist",
+      "source": "https://doist.com/press",
+      "upstream_hex": "E44332",
+      "display_hex": "E44332"
+    },
+    "discord": {
+      "title": "Discord",
+      "source": "https://discord.com/branding",
+      "upstream_hex": "5865F2",
+      "display_hex": "5865F2"
+    },
+    "telegram": {
+      "title": "Telegram",
+      "source": "https://telegram.org/tour/screenshots",
+      "upstream_hex": "26A5E4",
+      "display_hex": "26A5E4"
+    },
+    "whatsapp": {
+      "title": "WhatsApp",
+      "source": "https://about.meta.com/brand/resources/whatsapp/whatsapp-brand",
+      "upstream_hex": "25D366",
+      "display_hex": "25D366"
+    },
+    "proton": {
+      "title": "Proton",
+      "source": "https://proton.me/media/kit",
+      "upstream_hex": "6D4AFF",
+      "display_hex": "6D4AFF"
+    },
+    "dropbox": {
+      "title": "Dropbox",
+      "source": "https://www.dropbox.com/branding",
+      "upstream_hex": "0061FF",
+      "display_hex": "0061FF"
+    },
+    "box": {
+      "title": "Box",
+      "source": "https://www.box.com/en-gb/about-us/press",
+      "upstream_hex": "0061D5",
+      "display_hex": "F5F5F5"
+    },
+    "icloud": {
+      "title": "iCloud",
+      "source": "https://commons.wikimedia.org/wiki/File:ICloud_logo.svg",
+      "upstream_hex": "3693F3",
+      "display_hex": "3693F3"
+    },
+    "gitlab": {
+      "title": "GitLab",
+      "source": "https://about.gitlab.com/press/press-kit/",
+      "upstream_hex": "FC6D26",
+      "display_hex": "FC6D26"
+    },
+    "bitbucket": {
+      "title": "Bitbucket",
+      "source": "https://atlassian.design/resources/logo-library",
+      "upstream_hex": "0052CC",
+      "display_hex": "F5F5F5"
+    },
+    "huggingface": {
+      "title": "Hugging Face",
+      "source": "https://huggingface.co/brand",
+      "upstream_hex": "FFD21E",
+      "display_hex": "FFD21E"
+    },
+    "kaggle": {
+      "title": "Kaggle",
+      "source": "https://www.kaggle.com/brand-guidelines",
+      "upstream_hex": "20BEFF",
+      "display_hex": "20BEFF"
+    },
+    "railway": {
+      "title": "Railway",
+      "source": "https://railway.app",
+      "upstream_hex": "0B0D0E",
+      "display_hex": "F5F5F5"
+    },
+    "vercel": {
+      "title": "Vercel",
+      "source": "https://vercel.com/geist/brands",
+      "upstream_hex": "000000",
+      "display_hex": "F5F5F5"
+    },
+    "netlify": {
+      "title": "Netlify",
+      "source": "https://www.netlify.com/press/",
+      "upstream_hex": "00C7B7",
+      "display_hex": "00C7B7"
+    },
+    "cloudflare": {
+      "title": "Cloudflare",
+      "source": "https://www.cloudflare.com/logo/",
+      "upstream_hex": "F38020",
+      "display_hex": "F38020"
+    },
+    "supabase": {
+      "title": "Supabase",
+      "source": "https://github.com/supabase/supabase/blob/4031a7549f5d46da7bc79c01d56be4177dc7c114/packages/common/assets/images/supabase-logo-wordmark--light.svg",
+      "upstream_hex": "3FCF8E",
+      "display_hex": "3FCF8E"
+    },
+    "render": {
+      "title": "Render",
+      "source": "https://render.com",
+      "upstream_hex": "000000",
+      "display_hex": "F5F5F5"
+    },
+    "sentry": {
+      "title": "Sentry",
+      "source": "https://sentry.io/branding/",
+      "upstream_hex": "362D59",
+      "display_hex": "F5F5F5"
+    },
+    "figma": {
+      "title": "Figma",
+      "source": "https://www.figma.com/using-the-figma-brand/",
+      "upstream_hex": "F24E1E",
+      "display_hex": "F24E1E"
+    },
+    "miro": {
+      "title": "Miro",
+      "source": "https://miro.com",
+      "upstream_hex": "050038",
+      "display_hex": "F5F5F5"
+    }
+  }
+}

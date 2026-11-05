@@ -8,7 +8,7 @@ from unittest.mock import patch
 import server, storage as st
 from config import MODELS
 
-root = Path(tempfile.mkdtemp(prefix="aether-delegate-"))
+root = Path(tempfile.mkdtemp(prefix="olith-delegate-"))
 (root / "auth.py").write_text(
     "\n".join(["# padding" ] * 400) +
     "\n\ndef check_token(tok):\n    '''THE AUTH CHECK LIVES HERE'''\n    return tok == 'ok'\n"

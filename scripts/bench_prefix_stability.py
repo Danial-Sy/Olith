@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Measure how much of each step's prompt is reusable from the previous step.
+"""Measure how much of each prompt still matches the previous prompt's prefix.
 
-Ollama reuses KV cache only for a byte-identical prefix. Anything that rewrites
-already-sent content mid-prompt (a sliding tool-result window, recompression of
-older results, dropping old turns) forces everything after that point to be
-re-evaluated. This walks a realistic agent transcript and reports, per step, how
-much of the previous prompt survived.
+Changing earlier content makes Ollama process everything after it again.
 """
 from __future__ import annotations
 
@@ -51,8 +47,7 @@ def main() -> int:
     limit = server._ctx_limit("coder")
 
     async def fake_summary(chat_, model_key, upto):
-        # Stand-in for the real summarizer so the bench needs no GPU. Length is
-        # representative of a five-section brief.
+        # Use a sample five-section summary so this benchmark needs no GPU.
         return "COMPACTED BRIEF\n" + ("- carried detail\n" * 40)
 
     for step in range(steps):

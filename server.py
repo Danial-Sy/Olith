@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Aether: local Claude-style desktop companion."""
+"""Olith: local Claude-style desktop companion."""
 from __future__ import annotations
 
 import asyncio
@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 import agent
 import attachment_router as ar
+import evidence
 import ollama_client as oc
 import search_router as sr
 import search_web
@@ -39,8 +40,17 @@ import computer
 import computer_overlay
 import connections
 import memory_router
+import repo_index
+import project_commands
+import task_changes
+import language_servers
+import github_tools
+import editor_bridge
+import mcp_connections
+from mcp_routes import router as mcp_router
 
-app = FastAPI(title="Aether", version=VERSION)
+app = FastAPI(title="Olith", version=VERSION)
+app.include_router(mcp_router)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
 STATIC = ROOT / "static"
 UPLOADS.mkdir(parents=True, exist_ok=True)
@@ -63,23 +73,14 @@ def _park_prompt(key: str, event: dict) -> asyncio.Future:
 
 
 def _approval_key(chat: dict) -> str:
-    """Which chat id the UI will answer under.
-
-    A sub-agent runs on a synthetic child id the client has never seen, so its
-    prompts have to be parked under the parent's id or the answer POST lands on
-    nothing and the sub-run waits out the full timeout.
-    """
+    """Use the parent chat ID for prompts raised by a sub-task so the UI can answer them."""
     return str(chat.get("approval_key") or chat.get("id") or "")
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
 @app.middleware("http")
 async def no_stale_ui(request: Request, call_next):
-    """Never let the webview serve a cached app.js/styles.css.
-
-    The desktop shell keeps its cache across restarts, so without this an update
-    to the UI can stay invisible after relaunching and look like a missing feature.
-    """
+    """Disable static-file caching so desktop restarts load the updated UI."""
     response = await call_next(request)
     if request.url.path.startswith("/static") or request.url.path == "/":
         response.headers["Cache-Control"] = "no-store, must-revalidate"
@@ -89,7 +90,7 @@ async def no_stale_ui(request: Request, call_next):
 
 @app.middleware("http")
 async def local_origin_only(request: Request, call_next):
-    """Reject browser writes originating outside Aether's local UI."""
+    """Reject browser writes originating outside Olith's local UI."""
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         origin = request.headers.get("origin")
         if origin and origin not in {
@@ -151,7 +152,8 @@ class MemoryNote(BaseModel):
 
 class ProjectCreate(BaseModel):
     name: str
-    root: str
+    root: str = ""
+    create_folder: bool = False
     description: str = ""
 
 
@@ -170,6 +172,8 @@ _warm_state: dict = {
 }
 _warm_task: asyncio.Task | None = None
 _active_gens: dict[str, asyncio.Task] = {}
+_index_tasks: dict[str, asyncio.Task] = {}
+_index_states: dict[str, dict] = {}
 def _registry() -> tuple[dict, dict]:
     settings = st.load_settings()
     return settings, reg.installed(settings)
@@ -268,6 +272,7 @@ async def _stop_warm_and_unload() -> list[str]:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    await asyncio.to_thread(language_servers.close_all)
     try:
         computer_overlay.set_overlay(False)
     except Exception:
@@ -343,11 +348,7 @@ async def warmup_status():
 
 @app.post("/api/warmup/model/{key:path}")
 async def warmup_model(key: str):
-    """Warm a single model (used when switching). Leaves that model loaded.
-
-    The key is a whole path segment run: a Hugging Face GGUF keeps its
-    repository in its id, so `hf.co/owner/repo:Q6_K` carries slashes that a
-    plain `{key}` cannot match, and the switch answered 404 Not Found."""
+    """Load one model and leave it ready. Accept IDs containing slashes, including Hugging Face tags."""
     settings, registry = _registry()
     model_id = key
     role = "agentic" if key in reg.models_for("agentic", settings, registry) else "chat"
@@ -386,12 +387,7 @@ async def answer_question(cid: str, body: AnswerIn):
 
 @app.get("/api/chats/{cid}/pending")
 async def pending_question(cid: str):
-    """The prompt this chat is currently parked on, if any.
-
-    The UI polls this while a run streams. An approval card that never rendered
-    (a dropped frame, a reload mid-run) is otherwise invisible until the timeout
-    expires, which is the failure this endpoint exists to end.
-    """
+    """Return the chat's open question or approval so polling can recover a missed stream event."""
     entry = _pending_questions.get(cid)
     fut = (entry or {}).get("future")
     if not entry or not fut or fut.done():
@@ -523,7 +519,7 @@ async def api_model_roles(body: ModelRolesIn):
                      "Ollama reports it has no tool support.")
     stored = dict(settings.get("model_roles") or {})
     current = reg.role_map(settings, registry)
-    # Aether with no chat model has nothing to talk to.
+    # Olith with no chat model has nothing to talk to.
     if "chat" not in wanted:
         others = [m for m, roles in current.items() if "chat" in roles and m != body.model]
         if not others:
@@ -551,9 +547,7 @@ async def api_model_active(body: ModelRolesIn):
 @app.get("/api/library")
 async def api_library(source: str = "ollama", q: str = "", sort: str = "popular",
                       cursor: str = "", band: str = "", fits: int = 0):
-    """One page of a remote library. Ollama's is held locally and pages by
-    offset; Hugging Face pages behind its own opaque cursor. The screen does
-    not need to know which, so both answer with items and a next."""
+    """Return a library page as items and a next cursor. Hide source-specific paging from the UI."""
     if source not in lib.SOURCES:
         raise HTTPException(400, f"Unknown library {source!r}.")
     settings, registry = _registry()
@@ -831,9 +825,7 @@ def _model_key(chat: dict, reasoning: bool | None = None, model_key: str | None 
         chosen = reg.active("agentic", settings, registry)
         if chosen:
             return chosen
-        # Nothing is assigned to the role. Falling back to the chat model is
-        # only honest if that model can call tools; otherwise the run would
-        # fail inside Ollama with nothing useful to show the user.
+        # Fall back to the chat model only if it supports tool calling.
         chat_model = reg.active("chat", settings, registry)
         if chat_model and (registry.get(chat_model) or {}).get("tools"):
             return chat_model
@@ -875,7 +867,8 @@ def _chat_has_images(chat: dict) -> bool:
     return False
 
 
-def _num_ctx_for(chat: dict, model_key: str, msgs: list[dict] | None = None) -> int:
+def _num_ctx_for(chat: dict, model_key: str, msgs: list[dict] | None = None,
+                 reply_tokens: int | None = None) -> int:
     limit = _ctx_limit(model_key, _role(chat))
     # Estimate what we will send this turn. Callers inside the agent loop pass the
     # prompt they already rendered rather than paying for a second full render.
@@ -897,7 +890,7 @@ def _num_ctx_for(chat: dict, model_key: str, msgs: list[dict] | None = None) -> 
     from config import EFFORT, DEFAULT_EFFORT
     tier = chat.get("effort") or cfg_effort_for(_role(chat)) or DEFAULT_EFFORT
     reply_budget = int((EFFORT.get(tier) or EFFORT[DEFAULT_EFFORT]).get("num_predict") or 0)
-    headroom = max(headroom, reply_budget + 512)
+    headroom = max(headroom, max(reply_budget, int(reply_tokens or 0)) + 512)
     want = oc.effective_num_ctx(used, limit, reply_headroom=headroom, floor=floor)
     # Ollama reloads the model whenever num_ctx changes, so keep this monotonic
     # per chat+model: grow when needed, never shrink.
@@ -926,10 +919,8 @@ def _profile(model_id: str) -> dict:
     return registry.get(model_id) or {}
 
 
-# Replaying every tool result verbatim overruns num_ctx, and Ollama truncates the
-# FRONT of the prompt when that happens. Keep the newest few in full and compress
-# the rest to a receipt. The 8K cap is sized so a whole source slice survives:
-# truncating one just sends the model back to read the missing tail.
+# Keep recent tool results in full and shorten older ones to fit context.
+# Allow up to 8K characters so a useful source excerpt survives.
 TOOL_RESULT_MAX_CHARS = 8000
 # Compact well below the threshold. Stopping just under it means the next tool
 # result trips it again and the prompt prefix is rewritten every step.
@@ -937,10 +928,8 @@ COMPACT_LOW_WATER = 0.55
 # Marks where earlier turns were folded into a summary. Messages before the
 # newest boundary are not rendered, but nothing is ever deleted.
 COMPACT_BOUNDARY_KIND = "compact_boundary"
-# The cheap reduction tier below summarization: drop old tool calls and results
-# from the render, keep the narrative. No model call, so it can fire often.
-# Reduction is progressive on purpose. Summarization alone lets the prompt run
-# roughly twice as long before anything shrinks it.
+# Drop older tool details before using model-based summarization.
+# Keep the conversation text; this step needs no model call.
 DETAIL_HORIZON_KIND = "detail_horizon"
 DETAIL_HORIZON_LOW_WATER = 0.55
 # Never evict below this many detail turns: the model needs its own last action
@@ -956,59 +945,6 @@ def _boundary_index(msgs: list[dict]) -> int:
     return -1
 
 
-def _read_identity(name: str, content: str) -> tuple[str, int, int] | None:
-    """Identify a read_file result as (path, start, end), or None."""
-    if name != "read_file":
-        return None
-    try:
-        payload = json.loads(content)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    path = payload.get("path")
-    start, end = payload.get("start"), payload.get("end")
-    if not path or not isinstance(start, int) or not isinstance(end, int):
-        return None
-    return str(path), start, end
-
-
-def _superseded_reads(window: list[dict]) -> set[int]:
-    """Indices (within `window`) of reads a later read has entirely replaced.
-
-    Scoped to the rendered window rather than the whole transcript: the cost is
-    bounded by what is actually being sent, and an append-only transcript makes
-    the old whole-history scan quadratic for no benefit.
-
-    This is not merely about size. The model re-sweeps a file with nudged bounds
-    (1-200, 140-280, then 1-240 …), so five passes over one file arrive as five
-    near-identical full copies. Repeating the same content back at the model is
-    what teaches it to keep exploring instead of converging.
-    """
-    superseded: set[int] = set()
-    newer: dict[str, list[tuple[int, int]]] = {}
-    for idx in range(len(window) - 1, -1, -1):
-        m = window[idx]
-        if m.get("role") != "tool":
-            continue
-        name = m.get("name") or ""
-        # A write invalidates earlier reads of that file: the content genuinely
-        # differs either side of an edit, so stop collapsing across it.
-        if name in {"write_file", "append_file", "edit_file"}:
-            newer.clear()
-            continue
-        key = _read_identity(name, m.get("content") or "")
-        if key is None:
-            continue
-        path, start, end = key
-        covered = newer.get(path) or []
-        if agent.intersection_size(start, end, covered) >= end - start + 1:
-            superseded.add(idx)
-        else:
-            newer[path] = agent.merge_intervals([*covered, (start, end)])
-    return superseded
-
-
 def _horizon_index(msgs: list[dict], after: int = -1) -> int:
     """Index of the newest detail horizon lying after `after`, or -1."""
     for i in range(len(msgs) - 1, after, -1):
@@ -1017,16 +953,87 @@ def _horizon_index(msgs: list[dict], after: int = -1) -> int:
     return -1
 
 
+def _retain_recent_tool_detail(chat: dict, limit: int) -> None:
+    """Set one recovery boundary so later tool turns can accumulate without changing the cached prefix."""
+    msgs = chat.get("messages") or []
+    start = max(_boundary_index(msgs), _horizon_index(msgs)) + 1
+    turns = [i for i in range(start, len(msgs))
+             if msgs[i].get("role") == "assistant" and msgs[i].get("tool_calls")]
+    if len(turns) > limit:
+        msgs.insert(turns[-max(1, limit)], {
+            "role": "system", "kind": DETAIL_HORIZON_KIND,
+            "ts": time.time(), "quiet": True,
+        })
+
+
+PINNED_READ_SHARE = 0.2
+
+
+def _pinned_reads(msgs: list[dict], start: int, end: int, model_key: str) -> set[int]:
+    """Keep earlier reads that still match the current file. Only inspect turns before the boundary."""
+    if end <= start:
+        return set()
+    budget = int(_ctx_limit(model_key, "agentic") * PINNED_READ_SHARE) if model_key else 0
+    seen: dict[str, list[tuple[int, int]]] = {}
+    changed: set[str] = set()
+    keep: set[int] = set()
+    used = 0
+    i = end - 1
+    while i >= start:
+        m = msgs[i]
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            i -= 1
+            continue
+        results = []
+        j = i + 1
+        while j < end and msgs[j].get("role") == "tool":
+            results.append(j)
+            j += 1
+        payloads = []
+        for k in results:
+            try:
+                payloads.append((msgs[k].get("name"), json.loads(msgs[k].get("content") or "")))
+            except (TypeError, ValueError):
+                payloads.append((msgs[k].get("name"), {}))
+        reads = []
+        for name, payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            path = str(payload.get("path") or "")
+            if name in {"write_file", "edit_file", "append_file"} and payload.get("changed") and path:
+                changed.add(path)
+            elif name == "read_file" and path and "content" in payload and not payload.get("error"):
+                reads.append((path, int(payload.get("start") or 1), int(payload.get("end") or 0)))
+        calls = m.get("tool_calls") or []
+        if reads and len(reads) == len(calls) == len(results):
+            fresh = any(
+                path not in changed and not any(a <= lo and hi <= b for a, b in seen.get(path, []))
+                for path, lo, hi in reads
+            )
+            # The stored assistant turn carries the UI work log, which is never sent.
+            cost = oc.estimate_messages_tokens([msgs[k] for k in results]) + 64 * len(calls)
+            if fresh and used + cost <= budget:
+                used += cost
+                keep.update([i, *results])
+                for path, lo, hi in reads:
+                    seen.setdefault(path, []).append((lo, hi))
+        i -= 1
+    return keep
+
+
+def _narrow_if_crowded(chat: dict, model_key: str, limit: int) -> bool:
+    """Narrow replay after a failed sample only when it fills over half the context window."""
+    if not model_key or _estimate_chat_tokens(chat, model_key) <= _ctx_limit(model_key, "agentic") // 2:
+        return False
+    _retain_recent_tool_detail(chat, limit)
+    return True
+
+
 def _advance_detail_horizon(chat: dict, model_key: str, msgs: list[dict] | None = None) -> bool:
-    """Drop older tool detail from the render when the prompt gets heavy.
+    """Hide older tool details behind a marker when context is tight.
 
-    Anchored to an inserted marker rather than a stored offset, so it keeps the
-    correctness of the boundary model (nothing deleted, no index can go stale) while
-    restoring the cheap tier that kept prompts in the fast zone. Between two
-    insertions the render is append-only, so the KV cache still holds.
-
-    Costs one pass over per-message estimates; the old replay floor re-rendered
-    the entire prompt up to 200 times to make the same decision.
+    Keep all messages on disk. Rendering stays append-only between markers,
+    so Ollama can reuse the prompt cache. Estimate each message once.
     """
     limit = _ctx_limit(model_key, _role(chat))
     threshold = float(st.load_settings().get("auto_compact_at", 0.85))
@@ -1108,7 +1115,7 @@ def _rewrite_stale_tool_result(name: str, content: str) -> str:
             "previous_maximum": payload.get("maximum"),
             "current_maximum": agent.MAX_EDIT_RANGES,
             "note": (
-                "This result came from an older Aether runtime. The limit is now higher; "
+                "This result came from an older Olith runtime. The limit is now higher; "
                 "do not ask the user to split or choose work because of this old error."
             ),
         })
@@ -1159,6 +1166,20 @@ def _tool_succeeded(name: str, result: str) -> bool:
     return payload.get("ok") is not False
 
 
+def _verification_summary(report: dict) -> str:
+    commands = report.get("commands") or []
+    ran = [command for command in commands if "result" in command]
+    passed = sum(command["result"].get("exit_code") == 0 for command in ran)
+    skipped = sum(command.get("status") == "needs_approval" for command in commands)
+    errors = sum(item.get("severity") == 1 for entry in report.get("language_servers", []) for item in entry.get("diagnostics", []))
+    parts = [f"{passed} command(s) passed, {len(ran) - passed} failed" if ran else "no test or build command was run"]
+    if skipped:
+        parts.append(f"{skipped} command(s) still need approval")
+    if errors:
+        parts.append(f"{errors} language-server error(s) remain")
+    return "Automatic checks: " + "; ".join(parts) + "."
+
+
 
 
 def _start_new_job(chat: dict) -> None:
@@ -1173,12 +1194,7 @@ def _start_new_job(chat: dict) -> None:
 
 
 def _rejection_nudge(rejections: dict[str, dict]) -> str:
-    """Restate the constraints the model kept violating, as one directive.
-
-    A rejected call is recoverable information: the tool said exactly what was
-    wrong. Repeating that verbatim beats the generic "you are looping" message,
-    which told the model to stop without telling it what to do instead.
-    """
+    """Build a retry instruction from the tool's rejection so the model knows what to change."""
     lines = []
     for payload in list(rejections.values())[-3:]:
         detail = payload.get("hint") or payload.get("error") or ""
@@ -1206,13 +1222,7 @@ COMPUTER_FRAME_KEEP = 2
 
 
 def _mark_computer(chat: dict | None, on: bool) -> None:
-    """Raise or drop the on-screen marker around a run that drives the desktop.
-
-    Bound to the run rather than to the toggle: an agentic chat sitting idle
-    with computer use armed is not using the computer, and a border that never
-    goes away stops meaning anything. What the toggle shows is the badge in the
-    composer; what this shows is that something is happening right now.
-    """
+    """Show the desktop overlay while a computer-use run is active. Hide it when the run stops."""
     try:
         if on and not (chat or {}).get("computer_use"):
             return
@@ -1220,7 +1230,7 @@ def _mark_computer(chat: dict | None, on: bool) -> None:
             # Desktop state (what is selected, how many blank lines) belongs to
             # the run, not to the process.
             computer.begin_run()
-        computer_overlay.set_overlay(bool(on), label="Aether is using your computer")
+        computer_overlay.set_overlay(bool(on), label="Olith is using your computer")
     except Exception:
         pass
 
@@ -1230,14 +1240,10 @@ def _mark_computer(chat: dict | None, on: bool) -> None:
 COMPUTER_STALL_LIMIT = 4
 
 
-# Identical desktop actions in a row before the run is corrected, counting past
-# the screenshots a model takes between them, and how many corrections it gets
-# before the run ends instead.
+# Limits for repeated desktop actions and the corrections allowed before stopping.
 COMPUTER_REPEAT_LIMIT = 4
 COMPUTER_REPEAT_BLOCKS = 3
-# Looks in a row with nothing done between them. Observations are exempt from
-# the duplicate-call guard, so this is the only brake on a run that keeps
-# looking: one took 265 screenshots without acting on any of them.
+# Limit consecutive observations with no action. Observations skip the duplicate-call guard.
 LOOK_LIMIT = 5
 
 
@@ -1265,13 +1271,7 @@ def _is_a_look(call: dict) -> bool:
 
 
 def _computer_repeat_key(args: dict, tool: str = "computer") -> str | None:
-    """Identity of an action for the run-away check, or None for a look.
-
-    Deliberately not keyed on which tool sent it. Pressing ctrl+a through the
-    desktop and then through the browser is the same thing happening to the
-    same screen twice, and treating the door as part of the identity would let
-    a run alternate its way out of the guard.
-    """
+    """Identify an action across browser and desktop tools. Return None for an observation."""
     steps = (args or {}).get("actions")
     if isinstance(steps, list) and steps:
         # A batch is one identity, so two identical batches are a run-away and
@@ -1290,15 +1290,7 @@ def _computer_repeat_key(args: dict, tool: str = "computer") -> str | None:
 
 
 def _computer_progress(result: str, stalls: int) -> tuple[str, int]:
-    """Count desktop actions that changed nothing, and end a run producing only
-    those.
-
-    The duplicate-call guard keys on identical arguments, and a model getting
-    nowhere on a desktop does not repeat itself: it nudges the coordinates and
-    tries again, which is a fresh signature every time. What actually says "this
-    is not working" is the screen. Four actions in a row that left it untouched
-    mean nothing is reaching the desktop, not that the fifth aim will be right.
-    """
+    """Stop after repeated actions leave the screen unchanged, even if coordinates differ."""
     try:
         payload = json.loads(result)
     except (TypeError, json.JSONDecodeError):
@@ -1321,13 +1313,7 @@ def _computer_progress(result: str, stalls: int) -> tuple[str, int]:
 
 
 def _prune_stored_frames(chat: dict) -> None:
-    """Drop the pixels of superseded screenshots from the saved transcript.
-
-    The render already stops sending them; this stops storing them. One frame is
-    ~40 KB of base64 and the chat file is rewritten after every tool call, so a
-    long desktop job would be writing megabytes per step to keep pictures of a
-    screen that has since changed.
-    """
+    """Remove older screenshot pixels from saved chats to keep repeated saves small."""
     frames = [m for m in (chat.get("messages") or []) if m.get("computer_frame")]
     for m in frames[:-COMPUTER_FRAME_KEEP]:
         if m.pop("images", None):
@@ -1335,13 +1321,10 @@ def _prune_stored_frames(chat: dict) -> None:
 
 
 def _frame_message(frame: dict) -> dict:
-    """A screenshot the computer tool produced, as a turn the model can see.
+    """Add a screenshot as an internal user turn so vision templates display it.
 
-    It rides as a user message because that is the role every vision model's
-    chat template renders images for. Ollama accepts `images` on a tool message
-    and most templates then drop them, which is the silent version of this
-    feature not working: the model acts on a screen it was never shown. The
-    flags mark it as machinery rather than something the user said.
+    Most templates ignore images on tool messages. Mark it as internal so it
+    does not count as a new user request.
     """
     return {
         "role": "user",
@@ -1356,23 +1339,43 @@ def _frame_message(frame: dict) -> dict:
     }
 
 
-def _call_signature(call: dict, project_root: Path | None) -> str:
-    """Identity for the repeat guard, including the target file's revision.
+def _shell_probe_identity(command: str, root: Path | None):
+    """Identical C/C++ probes stay identical when only renamed."""
+    if root is None:
+        return None
+    match = re.search(r"\bcat\s+>\s*([^\s<>;&|'\"]+\.(?:cpp|cxx|cc|c))\s*<<\s*['\"]?(\w+)['\"]?\s*\n(.*?)\n\2(?:\n|$)", command, re.S)
+    if not match:
+        return None
+    source = Path(match[1])
+    # Writing over real project source is an edit, not a probe.
+    if not source.is_absolute() and (root / source).is_file():
+        return None
+    revisions = {}
+    for include in re.findall(r'^\s*#include\s+"([^"\n]+)"', match[3], re.M):
+        path = (root / include).resolve()
+        if not path.is_relative_to(root.resolve()) or not path.is_file():
+            return None
+        revisions[str(path)] = agent._file_revision(path)
+    # The probe's own name shows up as source, object and binary paths.
+    name = re.compile(r"(?<![\w-])" + re.escape(source.stem) + r"(?![\w-])")
+    def normalize(text):
+        return name.sub("<probe>", text)
+    return {"command": normalize(command[:match.start(3)]) + match[3] + normalize(command[match.end(3):]), "inputs": revisions}
 
-    Past the repeat limit the guard replays a cached rejection and never runs
-    the tool again. Keyed on arguments alone that is permanent: an anchored edit
-    rejected while the file said one thing stayed rejected after the file was
-    changed to say exactly what the anchor wanted. Observed directly: the call
-    refused ten times as "Anchor text not found" applies cleanly when run.
-    Folding the revision in means a changed file is a new call and gets a real
-    attempt, while retrying against an unchanged file still counts as a repeat.
-    """
+
+def _call_signature(call: dict, project_root: Path | None) -> str:
+    """Include the file revision in repeat checks so an edit can retry after its source changes."""
     args = call.get("arguments") or {}
     payload: dict[str, Any] = {"n": call.get("name"), "a": args}
+    if call.get("name") == "run_shell":
+        try:
+            probe = _shell_probe_identity(str(args.get("command") or ""), project_root)
+        except (OSError, ValueError):
+            probe = None
+        if probe:
+            payload["a"] = {**args, "command": probe}
     if call.get("name") in _WORLD_TOOLS:
-        # Clicking the same button twice is ordinary work, so a repeat here is
-        # an action that left the world as it was. Each tool answers for itself:
-        # the frame id for the desktop, the page counter for the browser.
+        # Use each tool's change counter so a repeat click can run after the screen changes.
         payload["world"] = (computer.frame_id(), browser.state_id())
     target = args.get("path")
     if isinstance(target, str) and target:
@@ -1387,14 +1390,35 @@ def _call_signature(call: dict, project_root: Path | None) -> str:
     ).hexdigest()
 
 
-def _current_run_messages(chat: dict) -> list[dict]:
-    """Messages belonging to the job the model is working on right now.
+THINKING_REPLY_TOKENS = 8192
+SALVAGE_CHARS = 12000
 
-    Read coverage must not leak across user turns: content read for a previous
-    request is long gone from the prompt, so blocking a fresh read of it would
-    starve the new job. Everything from the latest real user message onward is
-    this run; loop nudges are internal and do not open a new one.
-    """
+
+def _salvage_directive(reasoning: str) -> str:
+    """Carry a cut-off step's reasoning into its retry instead of discarding it."""
+    text = reasoning.strip()
+    if len(text) > SALVAGE_CHARS:
+        text = "[earlier reasoning omitted]\n" + text[-SALVAGE_CHARS:]
+    return (
+        "[agent-loop] Your last reply ran out of room while still reasoning, so nothing ran. "
+        "Your reasoning so far is below. Do not start over. Decide from it and make the next "
+        "tool call now, or give the final answer if the work is done.\n<reasoning>\n"
+        + text + "\n</reasoning>"
+    )
+
+
+def _result_in_view(chat: dict, message: dict) -> bool:
+    """Whether a stored tool result still renders, or was dropped by a horizon or compaction."""
+    msgs = chat.get("messages") or []
+    idx = next((i for i, m in enumerate(msgs) if m is message), -1)
+    if idx < 0:
+        return False
+    boundary = _boundary_index(msgs)
+    return idx > max(boundary, _horizon_index(msgs, boundary))
+
+
+def _current_run_messages(chat: dict) -> list[dict]:
+    """Return messages from the current request. Ignore internal loop instructions when finding its start."""
     msgs = chat.get("messages") or []
     start = 0
     for idx in range(len(msgs) - 1, -1, -1):
@@ -1410,6 +1434,8 @@ def _build_messages(
     model_key: str,
     clarify_first: bool = False,
     tool_replay_limit: int | None = None,
+    repo_context: str = "",
+    plan_context: str | None = None,
 ) -> list[dict]:
     chat_role = _role(chat)
     sys = reg.system_prompt(chat_role, reg.installed().get(model_key) or {})
@@ -1429,12 +1455,26 @@ def _build_messages(
         sys += agent.tools_system_addon(
             agent.tool_defs_for(chat, _ctx_limit(model_key, chat_role), _profile(model_key))
         )
+        if st.load_settings().get("approval_mode") == "full_access":
+            sys += (
+                "\n\n# Approval mode: Full access\n"
+                "The user enabled Full access in Settings. Shell commands, Git/GitHub changes "
+                "and connected service actions run without authorization prompts. Carry out "
+                "the user's requested work without asking for permission to use those tools. "
+                "Stay within the requested task; ask only when necessary information is missing."
+            )
         proj = st.get_project(chat["project_id"]) if chat.get("project_id") else None
         if proj:
             sys += f"\n\nActive project: {proj['name']}\nRoot: {proj['root']}\n{proj.get('description') or ''}"
+            if repo_context:
+                sys += "\n\n" + repo_context
         canon = st.canon_as_prompt(chat.get("project_id"))
         if canon:
             sys += "\n\n" + canon
+        if not chat.get("subagent"):
+            direct = mcp_connections.prompt_block()
+            if direct:
+                sys += "\n\n" + direct
         if clarify_first:
             sys += (
                 "\n\n# Clarify-first is ON\n"
@@ -1443,7 +1483,7 @@ def _build_messages(
                 "in the Established canon, and skip anything you could answer yourself with a "
                 "tool. If the task is genuinely unambiguous, say so in one line and continue."
             )
-        plan = agent.todos_prompt_block(chat)
+        plan = agent.todos_prompt_block(chat) if plan_context is None else plan_context
         if plan:
             sys += "\n\n" + plan
     if chat.get("computer_use"):
@@ -1459,12 +1499,15 @@ def _build_messages(
                 f"\n\nThe desktop cannot be driven right now: {why}. Say so and do the "
                 "parts of the task that do not need it."
             )
+    elif chat_role == "agentic" and "subagent" not in chat:
+        # No browser schema here, but a run that cannot see a connected account
+        # goes hunting for a login. Keys keep their tool, and sessions say why not.
+        linked = connections.prompt_block(browser=False)
+        if linked:
+            sys += "\n\n" + linked
     all_msgs = chat.get("messages") or []
-    # Everything before the newest boundary is covered by its summary, already in
-    # `sys`, so rendering starts just after it. The boundary is a real message,
-    # not a stored index, so editing or deleting a turn cannot invalidate it.
-    # Between two boundaries the prompt is append-only, which is what lets Ollama
-    # reuse the KV cache.
+    # Start after the latest summary marker. Keep rendering append-only until
+    # the next marker so the prompt cache stays valid.
     boundary = _boundary_index(all_msgs)
     render = all_msgs[boundary + 1:]
     msgs: list[dict] = [{"role": "system", "content": sys}]
@@ -1481,7 +1524,7 @@ def _build_messages(
     # The narrative (user turns, assistant prose, debriefs) is untouched.
     horizon_abs = _horizon_index(all_msgs, boundary)
     detail_from = (horizon_abs - (boundary + 1)) if horizon_abs >= 0 else 0
-    superseded = _superseded_reads(render)
+    pinned = {i - (boundary + 1) for i in _pinned_reads(all_msgs, boundary + 1, horizon_abs, model_key)}
     # Only the newest frame shows the screen as it is now. The rest keep their
     # caption and lose the pixels, which would fill the window in ten steps.
     frame_idxs = [i for i, mm in enumerate(render) if mm.get("computer_frame")]
@@ -1508,7 +1551,7 @@ def _build_messages(
             continue
         # Older detail: drop the assistant tool-call turn, and the orphan check
         # below then drops its results too.
-        if idx < detail_from and (role == "tool" or (role == "assistant" and tool_calls)):
+        if idx < detail_from and idx not in pinned and (role == "tool" or (role == "assistant" and tool_calls)):
             if role == "assistant":
                 pending_tool_calls = False
             continue
@@ -1516,23 +1559,20 @@ def _build_messages(
             if not pending_tool_calls:
                 continue
             content = _rewrite_stale_tool_result(m.get("name") or "", content)
-            # Tool role, so the model sees a continuous turn rather than a new
-            # request. Everything after the boundary replays in full.
-            if idx in superseded:
-                body = json.dumps({
-                    "note": "Superseded: you read this exact range again later; "
-                            "the current content is in the newer result below.",
-                })
-            else:
-                body = content[:TOOL_RESULT_MAX_CHARS]
-                if len(content) > TOOL_RESULT_MAX_CHARS:
-                    body += "\n…[truncated, re-read a narrower slice if you need more]"
+            # Replay later results as tool turns. Keep earlier results unchanged
+            # until an explicit context boundary drops them.
+            body = content[:TOOL_RESULT_MAX_CHARS]
+            if len(content) > TOOL_RESULT_MAX_CHARS:
+                body += "\n…[truncated, re-read a narrower slice if you need more]"
             entry: dict[str, Any] = {"role": "tool", "content": body}
             if m.get("name"):
                 entry["tool_name"] = m["name"]
             msgs.append(entry)
             continue
         if role == "assistant":
+            if any(call.get("name") == "run_shell" and agent.is_internal_verification_command((call.get("arguments") or {}).get("command")) for call in tool_calls):
+                pending_tool_calls = False
+                continue
             # Loop-control placeholders are internal state, never conversation.
             # Dropping them here also heals older transcripts.
             if agent.is_internal_continuation_placeholder(content):
@@ -1548,7 +1588,7 @@ def _build_messages(
             # is the authority; replaying the deferral teaches it to ask again.
             if not tool_calls and agent.todos_incomplete(chat) and _is_plan_deferral(content):
                 continue
-            # A mutation call that copied Aether's replay placeholder never
+            # A mutation call that copied Olith's replay placeholder never
             # changed the file. Drop the poisoned call/result pair.
             if tool_calls and _contains_replay_elision(tool_calls):
                 pending_tool_calls = False
@@ -1557,7 +1597,8 @@ def _build_messages(
             # those breaks the assistant→tool sequence required by Ollama.
             if not content and not m.get("images") and not tool_calls:
                 continue
-            entry = {"role": "assistant", "content": content}
+            # Replay the model's own words, not Olith's record above them.
+            entry = {"role": "assistant", "content": m.get("model_content") or content}
             if m.get("images"):
                 entry["images"] = m["images"]
             if tool_calls:
@@ -1565,11 +1606,8 @@ def _build_messages(
                 # That round's native thinking only, not the UI work log.
                 if m.get("native_thinking"):
                     entry["thinking"] = m["native_thinking"]
-                # Keep full arguments in storage for the audit trail, but do not
-                # resend entire file bodies on every later agent iteration.
-                entry["tool_calls"] = agent.to_ollama_tool_calls(
-                    tool_calls, elide_large_inputs=True
-                )
+                # Keep full tool arguments. Placeholder text can be copied into later writes.
+                entry["tool_calls"] = agent.to_ollama_tool_calls(tool_calls)
             pending_tool_calls = bool(tool_calls)
             msgs.append(entry)
             continue
@@ -1612,23 +1650,14 @@ def _build_messages(
     return msgs
 
 
-# Ratio of Ollama's real prompt_eval_count to our estimate, learned per chat.
-# Clamped at 0.75 so a bad ratio cannot claim much extra window, and at 1.00 so
-# one saying we underestimate is honoured in full. Underestimating is the
-# dangerous direction: Ollama truncates the front of an overflowing prompt.
+# Learn the estimate correction per chat. Clamp it to 0.75–1.00 so a bad
+# measurement cannot claim too much context space.
 _ESTIMATE_BIAS_FLOOR = 0.75
 _ESTIMATE_BIAS_MIN_SAMPLES = 3
 
 
 def record_estimate_accuracy(chat: dict, model_key: str, estimated: int, actual: int) -> None:
-    """Learn how far our estimate sits from what Ollama actually counted.
-
-    The estimator is deliberately conservative, and measured against real agent
-    prompts it ran ~1.33x over. That is not free headroom: it is 42% of the
-    allocated context that nothing is ever allowed to use, which is what pushed
-    the replay floor into evicting the model's working set. Ollama reports the
-    true count on every step, so there is no reason to keep guessing.
-    """
+    """Adjust the token estimate using Ollama's reported prompt count."""
     if not isinstance(chat, dict) or estimated <= 0 or not actual or actual <= 0:
         return
     seen = chat.get("estimate_bias")
@@ -1654,14 +1683,7 @@ def _estimate_bias(chat: dict, model_key: str) -> float:
 
 
 def _estimate_chat_tokens(chat: dict, model_key: str, msgs: list[dict] | None = None) -> int:
-    """Estimate tokens that will actually be sent (system + memory + summary + turns).
-
-    `msgs` lets a caller that has already rendered the prompt reuse it. Rebuilding
-    it here is not free: _build_messages walks the whole transcript, and this used
-    to be called 4-200 times per agent step (once per _num_ctx_for, up to 8 across
-    compaction passes, and once per iteration of the replay floor's 200-round
-    eviction loop). That was pure CPU burned between model calls.
-    """
+    """Estimate the full outgoing prompt. Reuse msgs when already rendered to avoid rebuilding it."""
     if msgs is None:
         msgs = _build_messages(chat, model_key)
     used = oc.estimate_messages_tokens(msgs)
@@ -1673,12 +1695,7 @@ def _estimate_chat_tokens(chat: dict, model_key: str, msgs: list[dict] | None = 
 
 
 async def _compact_chat(chat: dict, model_key: str, upto: int) -> str:
-    """Summarize messages[:upto] into a structured continuity brief.
-
-    Summarizing with the same model that is running the job matters: the brief is
-    the only thing that survives the boundary, and a weaker model produced a prose
-    blob that dropped file paths and decisions the run still needed.
-    """
+    """Summarize messages[:upto] with the active model, preserving file paths, decisions and next steps."""
     key = model_key if model_key in reg.installed() else (reg.active("chat") or model_key)
     meta = await oc.ensure_model_loaded(key, meta=_meta(key, config.COMPACT_MODEL_ROLE))
     ctx = min(_ctx_limit(key, _role(chat)), 32768)
@@ -1722,15 +1739,10 @@ def _latest_user_index(msgs: list[dict]) -> int:
 
 
 def _compact_split_point(msgs: list[dict], keep: int) -> int:
-    """Where to place a boundary: keep the newest `keep` messages, never splitting
-    an assistant tool_call from its results.
+    """Keep the newest messages without splitting tool calls from their results.
 
-    The split deliberately may pass the latest user turn. In a long agent run that
-    turn sits at index 0 with nothing but tool churn after it, so clamping the
-    split to it meant `upto` was always 0 and compaction could never fire,
-    a run could only grow. The request itself is not lost: _build_messages re-emits
-    it verbatim after the summary, which is the shape Codex uses (initial context
-    + recent user messages + summary).
+    The boundary can pass the latest user turn; rendering repeats that request
+    after the summary.
     """
     upto = max(0, len(msgs) - max(1, keep))
     # Walk back off a tool result so the boundary never orphans one.
@@ -1740,14 +1752,7 @@ def _compact_split_point(msgs: list[dict], keep: int) -> int:
 
 
 async def _maybe_auto_compact(chat: dict, model_key: str, emit=None, msgs=None):
-    """Fold older turns into a summary when the projected prompt nears the limit.
-
-    Nothing is deleted. A boundary message is inserted into the transcript and
-    rendering resumes after it, so the full history stays on disk for resume and
-    audit, and no stored offset can go stale. The previous implementation sliced
-    chat["messages"] in place and saved, which destroyed the only copy of the run
-    and silently invalidated every index into it.
-    """
+    """Insert a summary boundary when the prompt nears its limit. Keep the full transcript on disk."""
     settings = st.load_settings()
     threshold = float(settings.get("auto_compact_at", 0.85))
     keep = int(settings.get("compact_keep_recent", 10))
@@ -2018,6 +2023,10 @@ async def _post_reply_jobs(cid: str, model_key: str) -> None:
         final = st.get_chat(cid)
         if not final:
             return
+        if _role(final) == "agentic" and final.get("project_id") and st.load_settings().get("semantic_search"):
+            # Refresh after agent/shell edits; generation batches wait for the
+            # active run to finish and reuse unchanged vectors.
+            await api_build_index(final["project_id"], IndexBuild(semantic=True))
         await _maybe_auto_title(final)
         used = _estimate_chat_tokens(final, model_key)
         limit = _ctx_limit(model_key, _role(final))
@@ -2098,7 +2107,7 @@ def _ingest_to_uploads(src: Path) -> Path:
     UPLOADS.mkdir(parents=True, exist_ok=True)
     src = Path(src)
     if src.stat().st_size > MAX_UPLOAD_BYTES:
-        raise ValueError("File is larger than Aether's 25 MB attachment limit")
+        raise ValueError("File is larger than Olith's 25 MB attachment limit")
     dest = UPLOADS / f"{uuid.uuid4().hex[:10]}_{src.name}"
     dest.write_bytes(src.read_bytes())
     return dest
@@ -2330,8 +2339,8 @@ async def api_send(cid: str, body: SendMessage):
                 await emit({
                     "type": "error",
                     "message": (
-                        "Aether is still busy with a previous response and did not free up. "
-                        "Press Stop, or restart Aether if this keeps happening."
+                        "Olith is still busy with a previous response and did not free up. "
+                        "Press Stop, or restart Olith if this keeps happening."
                     ),
                 })
                 await queue.put(None)
@@ -2413,13 +2422,7 @@ async def api_send(cid: str, body: SendMessage):
 
 
 def _empty_reply_reason(meta: dict, final_chunk: dict) -> str:
-    """Why a model that loaded fine still wrote nothing.
-
-    Ollama gives a GGUF that carries no chat template a passthrough one, so the
-    role tags Aether sends render into a prompt the weights never saw and a base
-    or text-completion model answers with an immediate end-of-sequence. That
-    reads as a dead app, so name the cause rather than showing a blank bubble.
-    """
+    """Explain an empty reply from a model without a usable chat template."""
     label = meta.get("label") or meta.get("id") or "The model"
     reason = str(final_chunk.get("done_reason") or "")
     generated = final_chunk.get("eval_count")
@@ -2504,17 +2507,15 @@ async def _plain_stream(chat: dict, meta: dict, model_key: str, effort: str | No
     yield {"type": "message", "message": assistant}
 
 
-# Park generously but not forever: the generation lock is held while we wait.
-# An unanswered question is cheap to expire because the tool result tells the
-# model to assume a default. A denied command derails a run, so shell approvals
-# keep a much longer window.
+# Give approvals more time than questions. An unanswered question can
+# continue with a default; a command still needs an answer.
 ASK_USER_TIMEOUT = 90.0
 # A denied command derails a run, so an approval the user simply has not
 # noticed yet must not expire quickly. The dock keeps it visible meanwhile.
 SHELL_APPROVAL_TIMEOUT = 300.0
 
-# Set AETHER_TIMING_LOG to a path to append one JSON line of per-step timings.
-_TIMING_LOG = os.environ.get("AETHER_TIMING_LOG", "")
+# Set OLITH_TIMING_LOG to a path to append one JSON line of per-step timings.
+_TIMING_LOG = os.environ.get("OLITH_TIMING_LOG", "")
 
 
 def _allowlist_for(settings: dict, project_id: str | None) -> dict:
@@ -2531,11 +2532,7 @@ def _allowlist_for(settings: dict, project_id: str | None) -> dict:
 
 
 def remember_shell_approval(project_id: str | None, command: str, scope: str) -> None:
-    """Persist an 'always allow' answer so the same prompt never returns.
-
-    Approving a command once and being asked again is the main reason approval
-    prompts feel like noise rather than a safety control.
-    """
+    """Save a command or program approval for later runs."""
     if scope not in {"command", "binary"}:
         return
     settings = st.load_settings()
@@ -2547,7 +2544,8 @@ def remember_shell_approval(project_id: str | None, command: str, scope: str) ->
         item = (command or "").strip()
     else:
         values = list(entry.get("binaries") or [])
-        item = agent.shell_primary_binary(command) or ""
+        binaries = agent.shell_review_binaries(command)
+        item = binaries[0] if len(binaries) == 1 else ""
     if item and item not in values:
         values.append(item)
         values = values[-200:]
@@ -2557,13 +2555,14 @@ def remember_shell_approval(project_id: str | None, command: str, scope: str) ->
 
 
 def _shell_gate(settings: dict, command: str, project_id: str | None = None) -> tuple[bool, str]:
-    """Decide whether a shell command needs the user's approval.
+    """Check whether a shell command needs approval.
 
-    Modes: always_ask, safe_auto (auto-run inspection/build/test/install), never_ask.
-    Falls back to the legacy confirm_shell_commands flag when no mode is stored.
-    Commands the user chose to remember are auto-approved in every mode but
-    always_ask, which by definition means "ask me anyway".
+    Full access skips approvals. Otherwise use the selected shell mode, falling
+    back to confirm_shell_commands for old settings. Remembered approvals apply
+    in safe_auto; always_ask still prompts.
     """
+    if settings.get("approval_mode") == "full_access":
+        return False, "Full access mode is on"
     mode = settings.get("shell_approval_mode")
     if mode not in {"always_ask", "safe_auto", "never_ask"}:
         mode = "always_ask" if settings.get("confirm_shell_commands", True) else "never_ask"
@@ -2576,11 +2575,22 @@ def _shell_gate(settings: dict, command: str, project_id: str | None = None) -> 
         allowed = _allowlist_for(settings, project_id)
         if (command or "").strip() in allowed["commands"]:
             return False, "you approved this exact command before"
-        binary = agent.shell_primary_binary(command)
-        if binary and binary in allowed["binaries"]:
-            return False, f"you always allow {binary}"
+        binaries = agent.shell_review_binaries(command)
+        if binaries and all(binary in allowed["binaries"] for binary in binaries):
+            return False, f"you always allow {', '.join(binaries)}"
         return True, why
-    return True, "Aether confirms every command"
+    return True, "Olith confirms every command"
+
+
+def _git_approval_why(arguments: dict) -> str:
+    """Say what a repository change does, above all when it goes public."""
+    options = arguments.get("options")
+    options = options if isinstance(options, dict) else {}
+    if arguments.get("action") != "create_repo":
+        return "Repository changes require your approval"
+    kind = "private" if options.get("private", True) else "PUBLIC"
+    push = " and pushes this project" if options.get("publish") in (True, "true") else ""
+    return f"Creates a {kind} GitHub repository{push}"
 
 
 def _apply_user_answers(chat: dict, questions: list[dict], reply: dict) -> str:
@@ -2626,10 +2636,8 @@ def _apply_user_answers(chat: dict, questions: list[dict], reply: dict) -> str:
 # 40k tokens back, or delegation costs more than doing the work inline.
 SUBAGENT_REPORT_MAX_CHARS = 6000
 
-# Events that park the run on the user. They must reach the client from a
-# sub-run too, or the sub-run waits on an answer nobody was asked for.
-# A model that mangles the same schema will keep doing so, so this budget is
-# per run and does not reset when an unrelated call succeeds.
+# Forward question and approval events from sub-tasks to the parent UI.
+# Malformed-call retries have a per-run budget that successful calls do not reset.
 MALFORMED_CALL_LIMIT = 3
 
 _PROMPT_EVENTS = frozenset({
@@ -2650,13 +2658,7 @@ async def _run_subagent(
     model_key: str,
     effort: str | None = None,
 ):
-    """Run one delegated sub-task over a fresh transcript.
-
-    Yields the same event shapes the parent stream uses, plus a final
-    `subagent_result` carrying the payload to hand back as the tool result. The
-    sub-run's own tool results never reach the parent's messages, which is the
-    entire benefit, and the reason the return value is capped.
-    """
+    """Run a sub-task with a fresh transcript. Forward its events and return a capped summary to the parent."""
     task = str(args.get("task") or "").strip()
     wanted = args.get("tools")
     child = {
@@ -2673,6 +2675,7 @@ async def _run_subagent(
         # Park sub-run prompts under the parent id. The child id is synthetic and
         # an answer posted to it would resolve nothing.
         "approval_key": parent.get("id"),
+        "editor_session_id": parent.get("editor_session_id"),
         "messages": [{"role": "user", "content": task}],
     }
     yield {"type": "status", "model": {"label": "Delegating a sub-task…"}, "key": model_key}
@@ -2729,16 +2732,49 @@ async def _run_subagent(
 
 
 async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None = None, think: bool | None = None):
-    """Run the native Ollama tool loop until the model returns an assistant message.
+    project = st.get_project(chat["project_id"]) if chat.get("project_id") else None
+    root = Path(project["root"]).resolve() if project else None
+    review = None
+    commands_context = ""
+    if root and root.is_dir() and not chat.get("subagent"):
+        chat.pop("verification", None)
+        chat.pop("change_review", None)
+        yield {"type": "status", "model": {"label": "Preparing project tools…"}, "key": model_key}
+        try:
+            commands = await asyncio.to_thread(project_commands.discover, root)
+            commands_context = project_commands.prompt(commands)
+            if st.load_settings().get("task_change_review", True):
+                review = await asyncio.to_thread(task_changes.ChangeSet(root).start)
+                chat["change_set_id"] = review.ident
+                st.save_chat(chat)
+        except Exception as exc:
+            commands_context += f"\nProject preparation unavailable: {exc}"
+    try:
+        async for event in _agent_loop_body(chat, meta, model_key, effort, think,
+                                            review=review, commands_context=commands_context):
+            yield event
+    finally:
+        if review:
+            try:
+                result = await asyncio.to_thread(review.finish, True)
+                chat["change_review"] = {"id": result["id"], "files": len(result["files"]), "partial": result["partial"]}
+                st.save_chat(chat)
+            except Exception as exc:
+                chat["change_review"] = {"id": review.ident, "error": str(exc)}
+                st.save_chat(chat)
+    if review:
+        yield {"type": "change_review", **chat["change_review"]}
 
-    This follows the same mechanical contract used by Ollama's documented agent
-    loop and OpenAI Codex: tool calls mean execute-and-follow-up; an assistant
-    message with no tool calls means the turn is complete.  There is deliberately
-    no global step ceiling.  Deterministic duplicate-call guards stop actual
-    cycles without killing long runs that are still making progress.
+
+async def _agent_loop_body(chat: dict, meta: dict, model_key: str, effort: str | None = None,
+                           think: bool | None = None, *, review=None, commands_context=""):
+    """Run tools and return their results until the model finishes or the tool budget is spent.
+
+    Repeated calls and stalled replies have separate guards.
     """
     settings = st.load_settings()
     repeat_limit = max(2, int(settings.get("agent_repeat_limit", 3)))
+    plan_context = agent.todos_prompt_block(chat)
     # Identical tool calls repeated across steps mean the model is spinning, not
     # working. The circuit breaker is independent of productive step count.
     call_counts: dict[str, int] = {}
@@ -2763,6 +2799,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
     # Whether this run has written anything yet. ask_user is allowed before the
     # first mutation and refused after it.
     mutated_this_run = False
+    verified_revision = ""
     plan_prose_stalls = 0
     plan_repeat_recoveries = 0
     force_action_next = False
@@ -2782,20 +2819,16 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
     )
     # Do not resume with the same oversized replay that just exhausted context.
     # Six turns hold a typical set of source slices and still leave room.
-    run_tool_replay_limit: int | None = (
-        6
-        if agent.todos_incomplete(chat)
+    if (
+        agent.todos_incomplete(chat)
         and (
             latest_user.get("course_correct")
             or latest_user.get("resume_job")
             or _is_simple_resume(latest_user.get("content") or "")
         )
-        else None
-    )
-    # No inspection gate and no plan-completion enforcement. Both counted the
-    # model's moves and then refused them. Reading "too much" means the working
-    # set keeps evaporating, and a task list is a tool, never a gate. See
-    # ARCHITECTURE.md for what they cost when they were in place.
+    ):
+        _narrow_if_crowded(chat, model_key, 6)
+    # Let the model inspect files and finish its plan without extra read-count gates.
     step_timings: list[dict] = []
     work_log: list[str] = []
     proj = st.get_project(chat["project_id"]) if chat.get("project_id") else None
@@ -2813,9 +2846,20 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
     # model actually calls ask_user, then stop.
     clarify_first = bool(settings.get("clarify_first_turn")) and not chat.get("asked_this_job")
     from config import EFFORT as _EFFORT
-    think_flag = bool(think) and bool(meta.get("think"))
-    if not (_EFFORT.get(agent_effort) or {}).get("think", True):
-        think_flag = False
+    # Agentic thinking follows the effort tier, not the chat toggle, which
+    # defaults off and left every run reasoning-free.
+    think_flag = bool(meta.get("think")) and bool((_EFFORT.get(agent_effort) or {}).get("think", True))
+    tool_budget = int(settings.get("agent_tool_budget", 80))
+    # 24K was tested and was no faster; a cut-off step's reasoning is salvaged instead.
+    thinking_reply_tokens = int(settings.get("agent_thinking_reply_tokens", THINKING_REPLY_TOKENS))
+    salvaged_reasoning = ""
+    ledger = evidence.Ledger(project_root)
+    honesty_checked = False
+    tool_calls_run = 0
+    wrapping_up = False
+    verify_rounds = 0
+    # The latest result message per call signature, to tell whether it is still in the prompt.
+    result_for: dict[str, dict] = {}
 
     def _log(line: str) -> str:
         line = (line or "").strip()
@@ -2826,6 +2870,18 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         if len(work_log) > 200:
             del work_log[:-180]
         return "\n".join(work_log)
+
+    # Build once per run, outside message rendering. A file edit must not rewrite
+    # the prefix on every step and force a full Ollama prompt evaluation.
+    repo_context = commands_context
+    if project_root and settings.get("repo_map_enabled", True):
+        yield {"type": "status", "model": {"label": "Mapping project…"}, "key": active_key}
+        try:
+            budget = min(int(settings.get("repo_map_tokens", 1400)), _ctx_limit(active_key, "agentic") // 40)
+            index = repo_index.ProjectIndex(agent.resolve_path(str(project_root), project_root))
+            repo_context += "\n\n" + await asyncio.to_thread(index.repo_map, latest_user.get("content") or "", budget)
+        except Exception as exc:
+            _log(f"[context] Repository map unavailable: {exc}")
 
     for step in itertools.count():
         # A budget, not a gate: it never refuses a move, it ends the sub-run and
@@ -2852,24 +2908,26 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
             yield {"type": "todos", **agent.todos_progress(chat.get("agent_todos"))}
         action_only = force_action_next
         force_action_next = False
-        # A length-truncated sample means there was no room left to serialize a
-        # tool call. Narrow replay to the newest four turns, then two.
+        # Recovery already gets the full window and a larger reply budget, so
+        # only narrow replay when the prompt really is crowding the context.
         if action_only:
-            run_tool_replay_limit = max(2, 6 - 2 * no_action_stalls)
+            _narrow_if_crowded(chat, active_key, max(2, 6 - 2 * no_action_stalls))
         # Render once per step and reuse it for the budget checks. Between two
         # boundaries this render is append-only, so the KV cache holds.
         msgs = _build_messages(
             chat,
             active_key,
             clarify_first=clarify_first,
-            tool_replay_limit=run_tool_replay_limit,
+            repo_context=repo_context,
+            plan_context=plan_context,
         )
         def _rerender():
             return _build_messages(
                 chat,
                 active_key,
                 clarify_first=clarify_first,
-                tool_replay_limit=run_tool_replay_limit,
+                repo_context=repo_context,
+                plan_context=plan_context,
             )
 
         # Progressive reduction, cheapest first: drop older tool detail, and only
@@ -2900,7 +2958,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
             directives.append(
                 "[agent-loop] A project mutation just succeeded. If the current plan milestone "
                 "is now complete, call todo_write before starting the next phase. Complete only that "
-                "one milestone; Aether promotes the next pending item automatically. If the same "
+                "one milestone; Olith promotes the next pending item automatically. If the same "
                 "milestone genuinely needs more work, continue it."
             )
             plan_checkpoint_due = False
@@ -2919,16 +2977,22 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         if rejection_nudge:
             directives.append(rejection_nudge)
             rejection_nudge = ""
+        if not chat.get("subagent") and not wrapping_up and tool_calls_run >= tool_budget:
+            wrapping_up = True
+            directives.append(
+                f"[agent-loop] Tool budget reached ({tool_budget} calls). Stop now and write your "
+                "final debrief: what is done, what is not, and what you would try next."
+            )
         if action_only:
             # A large native tool call is invisible until its JSON is complete.
             # Tell the model to stop narrating and emit the action.
             directives.append(agent.ACTION_ONLY_NUDGE)
+        if salvaged_reasoning:
+            directives.append(_salvage_directive(salvaged_reasoning))
+            salvaged_reasoning = ""
         if directives:
-            # Steering must not be a system message. Qwen's template hoists every
-            # system message to the front, so a "trailing" directive lands in the
-            # prefix and voids the cache: 33.8s for seven tokens against 3.5s for
-            # 3,101 appended ones. Riding on the newest tool result keeps the
-            # prompt append-only.
+            # Put per-step instructions on the newest tool result. Qwen moves system
+            # messages to the front, which would invalidate the cached prefix.
             text = "\n\n".join(directives)
             if msgs and msgs[-1].get("role") == "tool":
                 tail = dict(msgs[-1])
@@ -2937,8 +3001,16 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
             else:
                 msgs.append({"role": "user", "content": text})
         # Re-size the KV cache for what we are actually about to send this step.
-        opts = oc.model_options(active_meta, _num_ctx_for(chat, active_key, msgs=msgs))
+        thinking_step = bool(think_flag and not action_only)
+        # Tool schemas share the window, so size for them as well as the reply.
+        schema_tokens = oc.estimate_tokens(json.dumps(agent.tool_defs_for(chat, step_limit, step_profile), ensure_ascii=False))
+        opts = oc.model_options(active_meta, _num_ctx_for(
+            chat, active_key, msgs=msgs,
+            reply_tokens=thinking_reply_tokens + schema_tokens + 1024 if thinking_step else None))
         opts, _ = _apply_effort(active_meta, opts, agent_effort)
+        if thinking_step:
+            room = int(opts["num_ctx"]) - oc.estimate_messages_tokens(msgs) - schema_tokens - 1024
+            opts["num_predict"] = max(int(opts["num_predict"]), min(thinking_reply_tokens, room))
         if action_only:
             # Shrinking a retry that already hit the token limit guarantees
             # another truncation. Retry in the full configured context.
@@ -2958,7 +3030,6 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                 max(current_predict, current_predict * recovery_multiplier),
             )
             opts["num_predict"] = min(target_predict, available)
-            opts["temperature"] = min(float(opts.get("temperature") or 0.2), 0.1)
             seen = chat.setdefault("num_ctx_used", {})
             if isinstance(seen, dict):
                 seen[active_key] = recovery_ctx
@@ -2979,13 +3050,12 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         native_calls: list = []
         final_chunk: dict[str, Any] = {}
         base_sample_timeout = max(30, int(settings.get("agent_sample_timeout", 150)))
-        # Shrinking the budget is right for a model that returned nothing and
-        # wrong for one that ran out of clock: that needs more time, not less.
-        # At 82.6 tok/s an 8192-token reply needs ~99s of generation alone.
-        reply_budget = int((_EFFORT.get(agent_effort) or {}).get("num_predict") or 2048)
+        # Give timed-out replies more time. Shrink the budget only for empty replies.
+        # An 8192-token reply needs about 99 seconds at 82.6 tokens per second.
+        reply_budget = int(opts.get("num_predict") or 2048)
         # Conservative floor: half the measured rate, plus room for prompt eval.
         generation_floor = int(reply_budget / 40) + 60
-        if last_stall_timed_out:
+        if last_stall_timed_out or think_flag:
             sample_timeout = max(base_sample_timeout, generation_floor)
         else:
             sample_timeout = max(60, base_sample_timeout - no_action_stalls * 30)
@@ -2999,10 +3069,8 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                     msgs,
                     keep_alive=active_meta["keep_alive"],
                     options=opts,
-                    tools=agent.tool_defs_for(chat, _ctx_limit(active_key, "agentic"), step_profile),
-                    # Only the opening sample thinks. Thinking on every round
-                    # eats the whole output budget before a call is emitted.
-                    think=bool(think_flag and not action_only and step == 0),
+                    tools=None if wrapping_up else agent.tool_defs_for(chat, _ctx_limit(active_key, "agentic"), step_profile),
+                    think=thinking_step,
                 ):
                     final_chunk = chunk
                     msg = chunk.get("message") or {}
@@ -3058,10 +3126,8 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                 + oc.estimate_tokens(json.dumps(agent.tool_defs_for(chat, step_limit, step_profile), ensure_ascii=False))
                 + 128
             ),
-            # prompt_eval_count is the full prompt length whether or not the
-            # cache was reused, so it says nothing about reuse. The same request
-            # twice reports an identical count while wall time drops 19.3s to
-            # 5.5s. prompt_eval_s is the only signal that tracks it.
+            # Use prompt_eval_s to check cache reuse. prompt_eval_count includes
+            # the full prompt even when cached tokens were reused.
             "prompt_eval_count": prompt_evaluated,
             "prompt_eval_s": _secs("prompt_eval_duration"),
             "eval_count": final_chunk.get("eval_count"),
@@ -3101,6 +3167,10 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         assistant["thinking"] = "\n".join(work_log)
         calls = agent.extract_tool_calls({"content": content, "tool_calls": native_calls})
         calls = agent.dedupe_tool_calls(calls, limit=8)
+        if wrapping_up and calls:
+            calls = []
+            if not content:
+                content = "I hit the tool budget for this run before finishing. Changes so far are in place; say continue to keep going."
         if calls and not native_calls:
             # Weaker models write the call into the reply instead of the
             # tool_calls field. Worth seeing in the log when it happens.
@@ -3121,9 +3191,13 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
             # no longer counts against this turn.
             no_action_stalls = 0
             plan_prose_stalls = 0
-            # Tool step: fold any narration into thinking; keep content empty for UI
+            # Publish native tool commentary, never recovered call JSON or private thinking.
             if content:
                 assistant["thinking"] = _log(f"[note] {content[:600]}")
+                commentary = (body or "").strip()
+                if native_calls and commentary and "<tool_call" not in commentary.lower() and not agent.parse_content_tool_calls(commentary) and not agent.looks_like_broken_tool_call(commentary):
+                    assistant["commentary"] = commentary[:2000]
+                    yield {"type": "commentary", "content": assistant["commentary"]}
             assistant["content"] = ""
             assistant["interim"] = True
             assistant["thinking"] = "\n".join(work_log)
@@ -3135,9 +3209,12 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
             pending_frames: list[dict] = []
             for call in calls:
                 sig = _call_signature(call, project_root)
-                # Looking again is not repeating yourself. The guard below
-                # assumes identical arguments mean an identical result, which is
-                # false for an observation, and blocking those blinds a run.
+                tool_calls_run += 1
+                # Redoing a call whose result has left the prompt is not a repeat.
+                earlier = result_for.get(sig)
+                if earlier is not None and not _result_in_view(chat, earlier):
+                    call_counts[sig] = 0
+                # Do not count observations as duplicate calls; the screen may have changed.
                 if not _is_a_look(call):
                     call_counts[sig] = call_counts.get(sig, 0) + 1
                 if call_counts.get(sig, 0) > 2:
@@ -3236,9 +3313,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                 else:
                     looks_in_a_row = 0
                     look_blocks = 0
-                # The duplicate-call guard cannot see this one: pressing Return
-                # changes the screen every time, so the folded frame is new on
-                # every press. Here the repetition itself is the signal.
+                # Count repeated Return presses directly; each adds a line and changes the frame.
                 repeat_key = (
                     _computer_repeat_key(call["arguments"], call["name"])
                     if call["name"] in _WORLD_TOOLS else None
@@ -3309,6 +3384,8 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                         continue
                 # tool_start already drives the status line. Logging the activity
                 # line here as well printed every tool twice in the thinking log.
+                if call["name"] in {"run_shell", "connection_call"}:
+                    await asyncio.to_thread(ledger.before_shell, str(call["arguments"].get("command") or ""))
                 yield {"type": "tool_start", "name": call["name"], "arguments": call["arguments"]}
                 if call["name"] == "computer":
                     # The person watching their own cursor move gets to read
@@ -3316,7 +3393,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                     computer_overlay.set_label(computer.status_line(call["arguments"]))
                 elif call["name"] == "browser":
                     computer_overlay.set_label(
-                        f"Aether is using the browser ({call['arguments'].get('action')})"
+                        f"Olith is using the browser ({call['arguments'].get('action')})"
                     )
                 # Withholding a schema is advice, not enforcement: run_tool
                 # dispatches on name, so a withheld tool still executes.
@@ -3326,11 +3403,11 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                         "available": sorted(_allowed_tool_names(chat, step_limit, step_profile)),
                         "hint": "Use one of the available tools, or report what you have found.",
                     })
+                elif call["name"] == "run_shell" and agent._rewrite_shell_guard(call["arguments"].get("command") or "", project_root, chat):
+                    result = json.dumps(agent._rewrite_shell_guard(call["arguments"].get("command") or "", project_root, chat))
                 elif call["name"] == "delegate":
-                    # Same loop over a fresh transcript, so the sub-task's
-                    # reading costs the parent only its summary. The benefit is
-                    # context isolation, not parallelism. Price is one cold
-                    # prompt evaluation when control returns, 3.0s median.
+                    # Run the sub-task with its own transcript and return only its summary.
+                    # Execution stays sequential on the same model.
                     task = str((call.get("arguments") or {}).get("task") or "").strip()
                     if chat.get("subagent"):
                         result = json.dumps({
@@ -3391,13 +3468,21 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                         chat["asked_this_job"] = True
                         yield {"type": "ask_user_done", "cancelled": bool(reply.get("cancelled"))}
                         yield {"type": "status", "model": {"label": "Working…"}, "key": active_key}
-                elif call["name"] == "run_shell" and _shell_gate(
+                elif call["name"] == "connection_call" and chat.get("subagent"):
+                    result = json.dumps({"error": "Direct service connections are unavailable in sub-tasks"})
+                elif call["name"] == "connection_call" and mcp_connections.preflight(call["arguments"]):
+                    result = json.dumps(mcp_connections.preflight(call["arguments"]))
+                elif settings.get("approval_mode") != "full_access" and ((call["name"] == "connection_call" and mcp_connections.requires_approval(call["arguments"])) or (call["name"] == "git_status" and call["arguments"].get("action", "status") not in github_tools.READ_ACTIONS) or (call["name"] == "run_shell" and _shell_gate(
                     settings,
                     str(call.get("arguments", {}).get("command") or ""),
                     chat.get("project_id"),
-                )[0]:
-                    command = str(call.get("arguments", {}).get("command") or "").strip()
-                    why = _shell_gate(settings, command, chat.get("project_id"))[1]
+                )[0])):
+                    git_action = call["name"] == "git_status"
+                    direct_action = call["name"] == "connection_call"
+                    direct_ticket = mcp_connections.approval_ticket(call["arguments"]) if direct_action else None
+                    command = (("Service action " if direct_action else "Git/GitHub ") + json.dumps(call["arguments"], ensure_ascii=False)) if git_action or direct_action else str(call.get("arguments", {}).get("command") or "").strip()
+                    why = "This service tool can change data or does not declare itself read-only." if direct_action else _git_approval_why(call["arguments"]) if git_action else _shell_gate(settings, command, chat.get("project_id"))[1]
+                    binaries = [] if git_action or direct_action else agent.shell_review_binaries(command)
                     answer_key = _approval_key(chat)
                     # A dedicated event, not an ask_user card: an approval is a
                     # yes/no on one command.
@@ -3405,7 +3490,8 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                         "type": "shell_approval",
                         "chat_id": answer_key,
                         "command": command[:2000],
-                        "binary": agent.shell_primary_binary(command),
+                        "binary": binaries[0] if len(binaries) == 1 else "",
+                        "rememberable": not (git_action or direct_action),
                         "why": why,
                     }
                     fut = _park_prompt(answer_key, approval_event)
@@ -3422,17 +3508,16 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                         and reply.get("answers", {}).get("shell_approval") == "Run command"
                     )
                     if approved:
-                        remember_shell_approval(
-                            chat.get("project_id"), command, str(reply.get("remember") or "")
-                        )
+                        if not (git_action or direct_action):
+                            remember_shell_approval(chat.get("project_id"), command, str(reply.get("remember") or ""))
                         settings = st.load_settings()
-                        result = agent.run_tool(
-                            call["name"],
-                            call["arguments"],
-                            project_root,
-                            chat.get("project_id"),
-                            chat=chat,
-                        )
+                        if direct_action:
+                            result = json.dumps(await _index_work(mcp_connections.call, call["arguments"], approved=True, ticket=direct_ticket))
+                        else:
+                            result = await _index_work(agent.run_tool,
+                                call["name"], call["arguments"], project_root,
+                                chat.get("project_id"), chat=chat,
+                            )
                     elif reply.get("timed_out"):
                         # Reporting an unanswered prompt as a refusal sent the
                         # model looking for a reason the user never gave.
@@ -3456,6 +3541,18 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                         })
                     yield {"type": "shell_approval_done", "cancelled": not approved}
                     yield {"type": "status", "model": {"label": "Working…"}, "key": active_key}
+                elif call["name"] == "connection_call" and settings.get("approval_mode") == "full_access":
+                    result = json.dumps(await _index_work(
+                        mcp_connections.call, call["arguments"], approved=True,
+                        ticket=mcp_connections.approval_ticket(call["arguments"]),
+                    ))
+                elif call["name"] in {"git_status", "run_shell", "connection_call"} or (chat.get("editor_session_id") and call["name"] in {"write_file", "edit_file", "append_file"}) or (call["name"] == "search_files" and call["arguments"].get("mode", "regex") != "regex") or (call["name"] == "read_file" and call["arguments"].get("language_action")):
+                    # Parsing and embeddings can take time. Keep Stop and the UI
+                    # responsive while this read-only tool runs in a worker.
+                    result = await _index_work(
+                        agent.run_tool, call["name"], call["arguments"], project_root,
+                        chat.get("project_id"), chat=chat,
+                    )
                 else:
                     result = agent.run_tool(
                         call["name"],
@@ -3469,19 +3566,32 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                 # Success is judged on the real result, before any offloading
                 # rewrites it into a pointer.
                 tool_succeeded = _tool_succeeded(call["name"], result)
+                if call["name"] in {"write_file", "edit_file", "append_file", "run_shell", "connection_call"}:
+                    try:
+                        outcome = json.loads(result)
+                    except (TypeError, json.JSONDecodeError):
+                        outcome = None
+                    if call["name"] == "connection_call":
+                        await asyncio.to_thread(ledger.after_shell, "", None)
+                    elif call["name"] == "run_shell":
+                        await asyncio.to_thread(ledger.after_shell, str(call["arguments"].get("command") or ""),
+                                                outcome.get("exit_code") if isinstance(outcome, dict) else None)
+                    elif isinstance(outcome, dict) and call["name"] != "run_shell":
+                        ledger.after_write(call["name"], str(call["arguments"].get("path") or ""), outcome)
                 # Oversized output goes to disk and rides in the prompt as
                 # head + tail + path. Truncating instead cuts the tail the model
                 # needs next and sends it re-reading.
                 stored = agent.offload_tool_output(
                     call["name"], result, chat.get("id") or "", len(chat["messages"])
                 ) or result
-                chat["messages"].append({
+                result_for[sig] = {
                     "role": "tool",
                     "name": call["name"],
                     "content": stored,
                     "ts": time.time(),
                     "quiet": True,
-                })
+                }
+                chat["messages"].append(result_for[sig])
                 if call["name"] == "computer":
                     frame = computer.pop_frame()
                     if frame:
@@ -3506,9 +3616,16 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                     # consecutive stall once an edit or check actually succeeds.
                     repeat_stalls = 0
                     if call["name"] in {"write_file", "append_file", "edit_file"}:
+                        if json.loads(result).get("changed", True):
+                            call_counts.clear()
                         plan_checkpoint_due = bool(chat.get("agent_todos"))
                         # Building has started; questions are closed from here on.
                         mutated_this_run = True
+                    elif call["name"] == "run_shell" and project_root:
+                        try:
+                            project_commands.learn_build(project_root, call["arguments"].get("command") or "")
+                        except OSError as error:
+                            _log(f"[checks] Could not save compiler command: {error}")
                 st.save_chat(chat)
                 activity = agent.tool_activity_line(call["name"], call.get("arguments"), result)
                 yield {
@@ -3524,6 +3641,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                     "result": "",
                     "quiet": True,
                     "summary": activity,
+                    "ok": tool_succeeded,
                 }
                 if (
                     tool_succeeded
@@ -3554,7 +3672,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                 for frame in pending_frames:
                     chat["messages"].append(_frame_message(frame))
                 _prune_stored_frames(chat)
-                computer_overlay.set_label("Aether is using your computer")
+                computer_overlay.set_label("Olith is using your computer")
                 st.save_chat(chat)
             if repeat_stalls >= repeat_limit:
                 # An open plan is authority to recover on its own. Bounded
@@ -3575,7 +3693,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                         continue
                     assistant["content"] = (
                         "The model repeatedly retried a rejected tool operation without changing "
-                        "strategy. Aether stopped this run without changing the open plan."
+                        "strategy. Olith stopped this run without changing the open plan."
                     )
                     assistant["interim"] = False
                     assistant["thinking"] = "\n".join(work_log)
@@ -3613,16 +3731,9 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                 return
             continue
 
-        # A normal assistant response ends the turn. The plan does not get a
-        # vote: refusing a debrief while milestones are open deadlocks a model
-        # that has finished and cannot say so.
-        # One exception, about the shape of the reply rather than the plan. Qwen
-        # sometimes narrates its next action instead of taking it. That is a
-        # failed action, bounded by the same stall budget as an empty response.
-        # A tool call the model wrote into the reply but mangled. Parseable ones
-        # already ran above; this is the unparseable remainder, which would
-        # otherwise be shown to the user as raw JSON and end the run.
-        broken = agent.looks_like_broken_tool_call(content) if content else None
+        # A normal reply ends the turn. Retry promised actions and malformed calls
+        # instead of showing them as completed work.
+        broken = agent.looks_like_broken_tool_call(content) if content and not wrapping_up else None
         if broken and malformed_stalls < MALFORMED_CALL_LIMIT:
             # Its own budget, not the stall budget: that one resets on every
             # successful call, so a model alternating good and mangled calls
@@ -3649,7 +3760,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
 
         # `broken` already had its own budget above; charging the narration
         # budget for the same reply spends six retries on one failure.
-        if content and not broken and no_action_stalls < 3 and agent.looks_incomplete(content):
+        if content and not broken and not wrapping_up and no_action_stalls < 3 and agent.looks_incomplete(content):
             no_action_stalls += 1
             force_action_next = True
             _log(f"[loop] narration instead of an action ({no_action_stalls}/3)")
@@ -3662,11 +3773,8 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                 "key": active_key,
             }
             continue
-        # An open plan earns a couple of nudges, then gets out of the way. No
-        # nudge at all and a weak model writes a confident wrap-up far too early.
-        # The old gate's flaw was aborting the run afterwards; here the budget
-        # expires into acceptance and the debrief goes through.
-        if content and agent.todos_incomplete(chat) and plan_prose_stalls < 2:
+        # Nudge an unfinished plan a limited number of times, then accept the reply.
+        if content and not wrapping_up and agent.todos_incomplete(chat) and plan_prose_stalls < 2:
             plan_prose_stalls += 1
             plan_continuation_due = True
             _log(f"[plan] nudged to continue an open plan ({plan_prose_stalls}/2)")
@@ -3682,6 +3790,103 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         # Past the budget the turn ends on the model's own words and open
         # milestones stay open. Bulk-closing them rewrites the record.
         if content:
+            if review and settings.get("auto_verify_project", True):
+                current = await asyncio.to_thread(review.finish)
+                revision = hashlib.sha256(json.dumps([(f["file"], f["after_hash"]) for f in current["files"]]).encode()).hexdigest()
+                if current["files"] and revision != verified_revision:
+                    verified_revision = revision
+                    commands = await asyncio.to_thread(project_commands.discover, project_root)
+                    results = []
+                    changed = [f["file"] for f in current["files"]]
+                    for command in project_commands.applicable(commands, changed):
+                        text = project_commands.shell_command(project_root, command)
+                        gated, why = _shell_gate(st.load_settings(), text, chat.get("project_id"))
+                        script = command.get("script")
+                        if script:
+                            script_gate, script_why = _shell_gate(st.load_settings(), script, chat.get("project_id"))
+                            gated, why = gated or script_gate, why if gated else script_why
+                        if gated:
+                            results.append({"command": text, "status": "needs_approval", "reason": why})
+                            continue
+                        yield {"type": "status", "model": {"label": f"Checking project: {command['kind']}…"}, "key": active_key}
+                        await asyncio.to_thread(ledger.before_shell, text)
+                        output = await _index_work(agent.run_tool, "run_shell", {"command": text, "timeout_sec": command["timeout_sec"]}, project_root, chat.get("project_id"), chat=chat)
+                        payload = json.loads(output)
+                        await asyncio.to_thread(ledger.after_shell, text, payload.get("exit_code"), record_check=False)
+                        results.append({"command": text, "kind": command.get("kind"), "result": payload,
+                                        "after_edit": ledger.edits, "observed": ledger.snapshot_complete})
+                    diagnostics = []
+                    if settings.get("language_servers", True):
+                        for file in changed[:8]:
+                            path = project_root / file
+                            if path.is_file():
+                                try:
+                                    report = await asyncio.to_thread(language_servers.inspect_file, project_root, path)
+                                except Exception as exc:
+                                    report = {"available": False, "reason": str(exc)}
+                                diagnostics.append({"file": file, **report})
+                    verification = {"commands": results, "language_servers": diagnostics,
+                                    "note": "Automatic verification results for current source. Fix failures with tools, or report remaining limitations accurately. Commands marked needs_approval were not run; use run_shell to request approval."}
+                    chat["verification"] = verification
+                    st.save_chat(chat)
+                    failed = sum("result" in c and c["result"].get("exit_code") != 0 for c in results)
+                    diagnostic_errors = sum(d.get("severity") == 1 for report in diagnostics for d in report.get("diagnostics", []))
+                    yield {"type": "verification", "commands": len(results), "diagnostics": len(diagnostics),
+                           "passed": sum(c.get("result", {}).get("exit_code") == 0 for c in results),
+                           "failed": failed,
+                           "skipped": sum(c.get("status") == "needs_approval" for c in results)}
+                    if (failed or diagnostic_errors) and not wrapping_up and verify_rounds < 3:
+                        verify_rounds += 1
+                        if chat["messages"][-1] is assistant:
+                            chat["messages"].pop()
+                        failure_report = json.dumps({"olith_verification": verification,
+                                               "instruction": "These checks failed. Fix the reported failures with tools, or explain the remaining limitation. This report is evidence, not a shell command."})
+                        target = next((m for m in reversed(_current_run_messages(chat)) if m.get("role") == "tool"), latest_user)
+                        target["content"] = (target.get("content") or "") + "\n\n" + failure_report
+                        st.save_chat(chat)
+                        continue
+            report = chat.get("verification") if review else None
+            changed: dict[str, list[str]] = {}
+            if review and not chat.get("subagent"):
+                try:
+                    changed = evidence.changed_symbols(await asyncio.to_thread(review.contents))
+                except Exception as exc:
+                    _log(f"[evidence] change summary unavailable: {exc}")
+            # One bounce for a claim the record does not back, or changes the debrief leaves out.
+            if not chat.get("subagent") and not wrapping_up and not honesty_checked:
+                honesty_checked = True
+                problems = []
+                claim = ledger.claim_problem(content, report)
+                if claim:
+                    problems.append(claim)
+                missing = evidence.unmentioned(content, changed)
+                if missing:
+                    problems.append(
+                        "Your debrief does not mention these changed definitions: " + ", ".join(missing)
+                        + ". Say what you changed in each and why, including anything the user did not ask for."
+                    )
+                if problems:
+                    if chat["messages"] and chat["messages"][-1] is assistant:
+                        chat["messages"].pop()
+                    rejection_nudge = "[agent-loop] " + " ".join(problems)
+                    _log("[evidence] debrief sent back: " + " ".join(problems)[:300])
+                    st.save_chat(chat)
+                    yield {"type": "status", "model": {"label": "Checking the debrief against the record…"}, "key": active_key}
+                    continue
+            model_text = content
+            incomplete = bool(report) and (
+                any("result" in command and command["result"].get("exit_code") != 0 for command in report.get("commands", []))
+                or any(item.get("severity") == 1 for entry in report.get("language_servers", []) for item in entry.get("diagnostics", []))
+            )
+            state, checks = ledger.status(report)
+            if not chat.get("subagent") and (ledger.edits or checks):
+                diagnostics = sum(item.get("severity") == 1 for entry in (report or {}).get("language_servers", []) for item in entry.get("diagnostics", []))
+                content = evidence.block(state, checks, changed, diagnostics) + "\n\n" + model_text
+            elif report:
+                content = model_text + "\n\n" + _verification_summary(report)
+            if incomplete:
+                content = "This task is incomplete: automatic verification still fails for the current files.\n\n" + content
+            assistant["model_content"] = model_text
             assistant["content"] = content
             assistant["interim"] = False
             assistant["thinking"] = "\n".join(work_log)
@@ -3697,6 +3902,8 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         # A timeout means mid-generation, not idle, so the retry needs more time
         # rather than less.
         last_stall_timed_out = reason.startswith("sample timeout")
+        if assistant.get("native_thinking") and (reason == "length" or last_stall_timed_out):
+            salvaged_reasoning = assistant["native_thinking"]
         eval_count = final_chunk.get("eval_count")
         metric = f", {eval_count} generated tokens" if isinstance(eval_count, int) else ""
         assistant["content"] = ""
@@ -3721,7 +3928,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
 
         assistant["content"] = (
             "The model returned no assistant message or tool call after four progressively "
-            f"smaller recovery prompts ({reason}{metric}), so Aether stopped this turn. "
+            f"smaller recovery prompts ({reason}{metric}), so Olith stopped this turn. "
             "Successful tool changes remain in place."
         )
         assistant["interim"] = False
@@ -3963,10 +4170,38 @@ async def api_list_projects():
 
 @app.post("/api/projects")
 async def api_new_project(body: ProjectCreate):
-    root = Path(body.root)
-    if not root.exists():
-        raise HTTPException(400, f"Path does not exist: {body.root}")
-    return st.new_project(body.name, str(root.resolve()), body.description)
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "Enter a project name")
+    if body.create_folder:
+        # Use one portable folder name so creation cannot escape the projects folder.
+        if (len(name) > 120 or name in {".", ".."} or name.endswith((".", " "))
+                or re.search(r'[<>:"/\\|?*\x00-\x1f]', name)
+                or re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?", name)):
+            raise HTTPException(400, "Choose a folder name without slashes or special characters")
+        root = config.PROJECT_HOME.expanduser() / name
+        try:
+            root.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(400, f"Could not prepare Olith's projects folder: {exc}")
+        try:
+            root.mkdir()
+        except FileExistsError:
+            raise HTTPException(409, "That folder already exists. Choose another name or add it as an existing folder.")
+        except OSError as exc:
+            raise HTTPException(400, f"Could not create project folder: {exc}")
+    else:
+        if not body.root.strip():
+            raise HTTPException(400, "Choose an existing project folder")
+        root = Path(body.root).expanduser()
+        if not root.is_dir():
+            raise HTTPException(400, f"Folder does not exist: {body.root}")
+    return st.new_project(name, str(root.resolve()), body.description)
+
+
+@app.get("/api/project-location")
+async def api_project_location():
+    return {"root": str(config.PROJECT_HOME.expanduser().resolve())}
 
 
 @app.get("/api/projects/{pid}")
@@ -3989,8 +4224,205 @@ async def api_project_tree(pid: str, path: str = "."):
     proj = st.get_project(pid)
     if not proj:
         raise HTTPException(404)
+    if path == ".":
+        try:
+            await asyncio.to_thread(project_commands.discover, Path(proj["root"]))
+        except (OSError, ValueError):
+            pass
     listing = agent.run_tool("list_dir", {"path": path}, Path(proj["root"]), pid)
     return json.loads(listing)
+
+
+def _project_index(pid: str) -> repo_index.ProjectIndex:
+    project = st.get_project(pid)
+    if not project:
+        raise HTTPException(404, "Unknown project")
+    root = agent.resolve_path(project["root"], Path(project["root"]))
+    if not root.is_dir():
+        raise HTTPException(400, "Project folder is unavailable")
+    return repo_index.ProjectIndex(root)
+
+
+class IndexBuild(BaseModel):
+    semantic: bool = False
+    force: bool = False
+
+
+class IndexSearch(BaseModel):
+    query: str = Field(min_length=1, max_length=2000)
+    mode: str = "hybrid"
+    limit: int = Field(default=6, ge=1, le=20)
+
+
+class CommandOverrides(BaseModel):
+    commands: list[dict] = Field(default_factory=list, max_length=30)
+
+
+@app.get("/api/projects/{pid}/commands")
+async def api_project_commands(pid: str):
+    root = _project_index(pid).root
+    return {"commands": await asyncio.to_thread(project_commands.discover, root)}
+
+
+@app.put("/api/projects/{pid}/commands")
+async def api_project_commands_override(pid: str, body: CommandOverrides):
+    root = _project_index(pid).root
+    try:
+        return {"commands": project_commands.overrides(root, body.commands)}
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/chats/{cid}/changes")
+async def api_task_changes(cid: str):
+    chat = st.get_chat(cid)
+    if not chat:
+        raise HTTPException(404, "Unknown chat")
+    project = st.get_project(chat.get("project_id")) if chat.get("project_id") else None
+    if not project or not chat.get("change_set_id"):
+        return {"files": [], "note": "No task changes recorded for this chat."}
+    try:
+        review = task_changes.ChangeSet(Path(project["root"]), chat["change_set_id"])
+        return {**await asyncio.to_thread(review.review), "verification": chat.get("verification")}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+class UndoSelection(BaseModel):
+    selections: list[dict] = Field(min_length=1, max_length=100)
+    change_set_id: str
+
+
+@app.post("/api/chats/{cid}/changes/undo")
+async def api_task_undo(cid: str, body: UndoSelection):
+    if _gen_lock.locked():
+        raise HTTPException(409, "Wait for active agent work to finish before undoing changes")
+    chat = st.get_chat(cid)
+    if not chat:
+        raise HTTPException(404, "Unknown chat")
+    if chat.get("change_set_id") != body.change_set_id:
+        raise HTTPException(409, "A newer task has replaced this review. Reopen Changes.")
+    project = st.get_project(chat.get("project_id")) if chat.get("project_id") else None
+    if not project:
+        raise HTTPException(400, "No active project")
+    async with _gen_lock:
+        try:
+            review = task_changes.ChangeSet(Path(project["root"]), body.change_set_id)
+            result = await asyncio.to_thread(review.undo, body.selections)
+            chat["change_review"] = {"id": result["id"], "files": len(result["files"]), "partial": result["partial"]}
+            chat.pop("verification", None)
+            st.save_chat(chat)
+            await asyncio.to_thread(repo_index.ProjectIndex(Path(project["root"])).refresh)
+            return result
+        except (ValueError, OSError) as exc:
+            raise HTTPException(409, str(exc))
+
+
+@app.get("/api/projects/{pid}/index")
+async def api_index_status(pid: str):
+    index = _project_index(pid)
+    settings = st.load_settings()
+    status = await asyncio.to_thread(index.status, str(settings.get("embedding_model") or ""))
+    job = _index_states.get(pid, {})
+    return {**status, "job": job, "semantic_enabled": bool(settings.get("semantic_search")),
+            "embedding_model": settings.get("embedding_model", "nomic-embed-text")}
+
+
+@app.post("/api/projects/{pid}/index")
+async def api_build_index(pid: str, body: IndexBuild):
+    index = _project_index(pid)
+    if pid in _index_tasks and not _index_tasks[pid].done():
+        return {"job": _index_states[pid]}
+    settings = st.load_settings()
+    if body.semantic and not settings.get("semantic_search"):
+        raise HTTPException(400, "Enable semantic search in Settings first")
+    state = {"phase": "indexing", "files": 0, "embedded": 0, "error": None, "cancel": False}
+    _index_states[pid] = state
+
+    async def build():
+        try:
+            def progress(counts):
+                state.update(counts)
+                if state["cancel"]:
+                    raise InterruptedError("Indexing stopped")
+            stats = await asyncio.to_thread(index.refresh, body.force, progress)
+            state.update(stats)
+            if body.semantic:
+                embedder = repo_index.OllamaEmbedder(settings)
+                state["phase"] = "waiting"
+                while not state["cancel"]:
+                    # Release between batches so a chat can start. Embeddings
+                    # share the generation lock with the agent and title work.
+                    async with _gen_lock:
+                        if state["cancel"]:
+                            break
+                        state["phase"] = "embedding"
+                        done = await _index_work(index.embedding_batch, embedder)
+                    if not done:
+                        break
+                    state["embedded"] += done
+                    state["phase"] = "waiting"
+                    await asyncio.sleep(0)
+            state["phase"] = "stopped" if state["cancel"] else "ready"
+        except InterruptedError:
+            state["phase"] = "stopped"
+        except Exception as exc:
+            state["phase"], state["error"] = "error", str(exc)
+        finally:
+            _index_tasks.pop(pid, None)
+
+    _index_tasks[pid] = asyncio.create_task(build())
+    return {"job": state}
+
+
+@app.post("/api/projects/{pid}/index/stop")
+async def api_stop_index(pid: str):
+    _project_index(pid)
+    state = _index_states.get(pid)
+    if state:
+        # A running thread finishes its current batch before releasing the lock.
+        state["cancel"] = True
+    return {"ok": True}
+
+
+@app.post("/api/projects/{pid}/index/search")
+async def api_index_search(pid: str, body: IndexSearch):
+    index = _project_index(pid)
+    if body.mode == "map":
+        return {"map": await asyncio.to_thread(index.repo_map, body.query)}
+    if body.mode not in {"hybrid", "symbols", "references"}:
+        raise HTTPException(400, "Unknown search mode")
+    settings = st.load_settings()
+    embedder = repo_index.OllamaEmbedder(settings) if settings.get("semantic_search") and body.mode == "hybrid" else None
+    async def search():
+        result = await _index_work(index.search, body.query, body.mode, body.limit, embedder=embedder)
+        if embedder:
+            await api_build_index(pid, IndexBuild(semantic=True))
+        return result
+    if embedder:
+        # An interactive search can load a model too, so it uses the same lock.
+        try:
+            await asyncio.wait_for(_gen_lock.acquire(), timeout=GEN_LOCK_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise HTTPException(409, "Olith is working. Try again after the current run.")
+        try:
+            return await search()
+        finally:
+            _gen_lock.release()
+    return await search()
+
+
+async def _index_work(function, *args, **kwargs):
+    """A stopped request must not release the model lock over a live worker."""
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        try:
+            await worker
+        except Exception:
+            pass
+        raise
 
 
 @app.get("/api/context/{cid}")
@@ -4030,11 +4462,11 @@ class SecretIn(BaseModel):
     value: str
 
 
-# Aether's own face on a sign-in. The window opens on this page rather than on
+# Olith's own face on a sign-in. The window opens on this page rather than on
 # someone else's login form, so it can say who is asking and for what.
 CONSENT_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<title>Aether wants to connect to {label}</title>
+<title>Sign in to {label} in Olith's browser</title>
 <style>
   :root {{ color-scheme: dark; }}
   body {{
@@ -4048,12 +4480,7 @@ CONSENT_PAGE = """<!doctype html>
     box-shadow: 0 24px 60px rgba(0,0,0,0.45);
   }}
   .brand {{ display: flex; align-items: center; gap: 11px; margin-bottom: 22px; }}
-  .ring {{
-    width: 30px; height: 30px; border-radius: 50%;
-    background: conic-gradient(#ff2d55, #7c5cff, #4f7cff, #00d4ff, #ff2d55);
-    -webkit-mask: radial-gradient(circle, transparent 54%, #000 56%);
-    mask: radial-gradient(circle, transparent 54%, #000 56%);
-  }}
+  .mark {{ width: 30px; height: 30px; object-fit: contain; }}
   .brand b {{ font-size: 1.06rem; letter-spacing: 0.05em; font-weight: 700; }}
   h1 {{ font-size: 1.34rem; margin: 0 0 10px; font-weight: 650; }}
   p {{ margin: 0 0 14px; color: #b9c2d6; }}
@@ -4070,23 +4497,27 @@ CONSENT_PAGE = """<!doctype html>
           font-size: 0.82rem; color: #8b95a5; }}
 </style></head>
 <body><main class="card">
-  <div class="brand"><div class="ring"></div><b>AETHER</b></div>
-  <h1>Aether wants to connect to {label}</h1>
-  <p>This window belongs to Aether, on your own machine. It opened because you
-     pressed Connect in the Connections panel.</p>
+  <div class="brand">
+    <img class="mark" src="/static/assets/olith-mark.svg" alt="" />
+    <b>OLITH</b>
+  </div>
+  <h1>Sign in to {label} in Olith's browser</h1>
+  <p>This window belongs to Olith, on your own machine. It opened because you
+     chose Browser sign-in in the Connections panel.</p>
   <ul>
-    <li>You sign in on {label}'s own page, in this window. Aether does not fill
+    <li>You sign in on {label}'s own page, in this window. Olith does not fill
         the form and never sees your password.</li>
-    <li>What Aether keeps afterwards is the session, in its own browser profile,
-        the same thing any browser keeps. You can end it any time with Forget.</li>
-    <li>It lets Aether work in your {label} account when you ask it to. Nothing
-        happens in there on its own.</li>
+    <li>What Olith keeps afterwards is the session, in its own browser profile,
+        the same thing any browser keeps. Forget removes Olith's connection record;
+        sign out in this browser to end the website session.</li>
+    <li>This is website access for computer use, not authorization for direct
+        service tools. Choose Connect tools in Olith for those.</li>
   </ul>
   <div class="row">
     <a class="go" href="{sign_in_url}">Continue to {label}</a>
-    <span class="later">Then go back to Aether and press Check.</span>
+    <span class="later">Then return to Olith and confirm your browser session.</span>
   </div>
-  <p class="foot">If you did not press Connect in Aether, close this window.
+  <p class="foot">If you did not press Connect in Olith, close this window.
      Nothing has been shared.</p>
 </main></body></html>
 """
@@ -4094,7 +4525,7 @@ CONSENT_PAGE = """<!doctype html>
 
 @app.get("/connect/{cid}", response_class=HTMLResponse)
 async def api_connect_page(cid: str):
-    """Aether's own page, shown before any service's sign-in."""
+    """Olith's own page, shown before any service's sign-in."""
     entry = connections.spec(cid)
     if entry is None or not entry.get("sign_in_url"):
         raise HTTPException(404, "No such connection.")
@@ -4106,7 +4537,7 @@ async def api_connect_page(cid: str):
 
 @app.get("/api/connections")
 async def api_connections():
-    return connections.listing()
+    return await asyncio.to_thread(connections.listing)
 
 
 @app.post("/api/connections")
@@ -4120,7 +4551,9 @@ async def api_add_connection(body: ConnectionIn):
 @app.post("/api/connections/{cid}/sign-in")
 async def api_connection_sign_in(cid: str):
     try:
-        return connections.sign_in(cid)
+        # Browser launch/navigation is blocking and requests /connect/{cid}
+        # from this server. Running it on the event loop deadlocks that page.
+        return await asyncio.to_thread(connections.sign_in, cid)
     except KeyError as e:
         raise HTTPException(404, f"No connection called {cid}.") from e
     except ValueError as e:
@@ -4130,7 +4563,7 @@ async def api_connection_sign_in(cid: str):
 @app.post("/api/connections/{cid}/check")
 async def api_connection_check(cid: str):
     try:
-        return connections.check(cid)
+        return await asyncio.to_thread(connections.check, cid)
     except KeyError as e:
         raise HTTPException(404, f"No connection called {cid}.") from e
 
@@ -4142,14 +4575,30 @@ async def api_connection_secret(cid: str, body: SecretIn):
     if not body.value.strip():
         raise HTTPException(400, "A key cannot be empty.")
     try:
-        return connections.store_secret(cid, body.value)
+        return await asyncio.to_thread(connections.store_secret, cid, body.value)
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
 
 
+@app.post("/api/connections/{cid}/confirm")
+async def api_confirm_sign_in(cid: str):
+    try:
+        return await asyncio.to_thread(connections.confirm_sign_in, cid)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/connections/{cid}/status")
+async def api_browser_session_status(cid: str):
+    try:
+        return await asyncio.to_thread(connections.session_status, cid)
+    except KeyError as exc:
+        raise HTTPException(404, "No such browser sign-in.") from exc
+
+
 @app.delete("/api/connections/{cid}")
 async def api_forget_connection(cid: str):
-    return connections.forget(cid)
+    return await asyncio.to_thread(connections.forget, cid)
 
 
 @app.post("/api/computer-overlay")
@@ -4200,7 +4649,7 @@ async def api_upload(file: UploadFile = File(...)):
     dest = UPLOADS / f"{uuid.uuid4().hex[:10]}_{Path(name).name}"
     data = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, "File is larger than Aether's 25 MB attachment limit")
+        raise HTTPException(413, "File is larger than Olith's 25 MB attachment limit")
     dest.write_bytes(data)
     kind = "image" if Path(name).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"} else "file"
     out: dict[str, Any] = {
@@ -4267,7 +4716,11 @@ async def api_search(q: str = Form(...)):
         raise HTTPException(500, str(e))
 
 
+from integrations import router as integration_router
+app.include_router(integration_router)
+
+
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("AETHER_PORT") or 7878)
+    port = int(os.environ.get("OLITH_PORT") or 7878)
     uvicorn.run("server:app", host="127.0.0.1", port=port, reload=False)

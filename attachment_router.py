@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Decide when the model should open files from the chat file library.
+"""Decide when to read attached files from the chat library.
 
-Keeps attached docs available for the whole chat, but only nudges a read when
-the user asks, or is clearly stuck or referring to the docs. Not every turn.
+Keep files available throughout the chat. Suggest a read only when the
+message refers to them or the user needs help with them.
 """
 from __future__ import annotations
 

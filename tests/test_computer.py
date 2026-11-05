@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Computer use: the tool, its wiring, and the loop that keeps it honest.
+"""Test screenshot delivery, action results and loop guards without a display.
 
-What broke before was never the model's eyesight. It was that a screenshot went
-nowhere, so acting and observing were disconnected: the agent typed a search,
-had no way to see the results, and typed it again. These tests hold the joins
-that fix that: a frame comes back as an image, an action that changed nothing
-says so, and a run that only produces those is stopped rather than left to spin.
-
-Nothing here needs a display. Capture and injection are covered by driving a
-real widget on a nested X server (see the notes in `computer.py`); what is
-tested here is everything that decides what the model is shown and allowed.
+Real capture and input checks use a nested X server; see computer.py.
 """
 import json
 import os
@@ -87,11 +79,7 @@ class ActionValidationTests(unittest.TestCase):
         self.assertIn("screenshot", out["hint"])
 
     def test_an_unknown_action_is_named_even_with_no_desktop_at_all(self):
-        """A mistyped action is wrong whatever machine it arrives on.
-
-        Checked before the screen is probed, so a headless box answers the
-        question that was asked rather than reporting that it has no display.
-        """
+        """Validate action names before checking whether a display is available."""
         with patch.object(computer, "available", return_value=(False, "no display")):
             out = json.loads(computer.run({"action": "teleport"}))
             batch = json.loads(computer.run({"actions": [
@@ -116,10 +104,7 @@ class ActionValidationTests(unittest.TestCase):
         self.assertNotIn("ok", out)
 
     def test_a_repeat_count_is_capped(self):
-        # A model handed `count` so it need not spam a key must not be able to
-        # spam it inside one call instead. The driver is stubbed: an uncapped
-        # count here would put thousands of real keystrokes into whatever window
-        # happens to have focus.
+        # Cap repeated keys within a call. Stub the driver so no real input is sent.
         pressed = []
 
         class Recorder:
@@ -140,21 +125,14 @@ class ActionValidationTests(unittest.TestCase):
     def test_the_status_line_names_the_act_not_the_tool(self):
         self.assertEqual(
             computer.status_line({"action": "click", "x": 12, "y": 34}),
-            "Aether is clicking at 12, 34",
+            "Olith is clicking at 12, 34",
         )
         self.assertIn("typing", computer.status_line({"action": "type", "text": "hi"}))
         self.assertIn("looking", computer.status_line({"action": "screenshot"}))
 
 
 class SelectionTests(unittest.TestCase):
-    """The move that deleted a finished two-page paper.
-
-    Taken from the transcript of the run that did it: type the title, press
-    ctrl+a meaning "select this line", press Return. ctrl+a is Select All, so
-    Return replaced the whole document with a newline. The model did it twice
-    more while trying to recover, and never noticed, because at 47% scale it
-    could not read the page it had just emptied.
-    """
+    """Require confirmation before a key replaces a whole-document selection."""
 
     def setUp(self):
         computer.begin_run()
@@ -203,11 +181,7 @@ class SelectionTests(unittest.TestCase):
         self.assertNotIn("error", self._run({"action": "type", "text": "the next paragraph"}))
 
     def test_a_toolbar_click_does_not_drop_the_selection(self):
-        # The exact sequence of the run that lost its paper the second time:
-        # ctrl+a, six clicks at the font-size box trying to enlarge the title,
-        # then Return. Clicking a toolbar button leaves the document selected,
-        # so treating any click as a deselect stood the guard down right before
-        # the keypress that mattered.
+        # Toolbar clicks must not clear the document's select-all guard.
         self._run({"action": "key", "text": "ctrl+a"})
         for _ in range(6):
             self._run({"action": "click", "x": 424, "y": 151})
@@ -244,9 +218,7 @@ class SelectionTests(unittest.TestCase):
 
 
 class BlankLineTests(unittest.TestCase):
-    """The other half of the same run: ctrl+End, Return, Return, Return, click,
-    ctrl+End, Return... for 55 presses, trying to reach a place on a page it
-    could not read."""
+    """Limit repeated Return presses without text between them."""
 
     def setUp(self):
         computer.begin_run()
@@ -322,13 +294,7 @@ class LegibilityTests(unittest.TestCase):
 
 
 class BatchTests(unittest.TestCase):
-    """Several steps on one model turn.
-
-    The measured cost of a desktop job was 15.5s a step, of which 0.7s was the
-    action: what a run costs is how many times the model has to look and decide.
-    A heading is six keystrokes and no decisions in between, so it should cost
-    one turn, not six.
-    """
+    """Run a sequence of desktop actions in one turn with one final screenshot."""
 
     def setUp(self):
         computer.begin_run()
@@ -373,9 +339,7 @@ class BatchTests(unittest.TestCase):
         )
 
     def test_one_frame_comes_back_however_many_steps_ran(self):
-        # The screenshot is what the next decision is made from. The states in
-        # the middle of a sequence the model already chose are not decisions,
-        # and at ~1.6k tokens each they are what would fill the window.
+        # Return only the final screenshot from a batch to keep context small.
         self._run({"actions": self.HEADING})
         self.assertEqual(self.capture.call_count, 1)
 
@@ -440,12 +404,7 @@ class BatchTests(unittest.TestCase):
 
 
 class WidgetRefTests(unittest.TestCase):
-    """Aiming at a named widget instead of a guessed pixel.
-
-    The run that could not press Bold clicked six times at the same wrong spot,
-    because the only way it had to say "that button" was to estimate its
-    coordinates from an image scaled to 58%. A ref carries the real box.
-    """
+    """Click named widgets using their reported boxes."""
 
     def setUp(self):
         computer.begin_run()
@@ -554,9 +513,7 @@ class ToolWiringTests(unittest.TestCase):
         self.assertNotIn("computer", names)
 
     def test_an_alias_keeps_the_action_it_named(self):
-        # `press_key` says which action it wants; canonicalising to `computer`
-        # alone would throw that away, and nothing in the arguments tells a
-        # hotkey from typing since both carry only `text`.
+        # Preserve the action name; text alone cannot distinguish typing from a hotkey.
         call = agent.extract_tool_calls(
             {"tool_calls": [{"function": {"name": "press_key", "arguments": '{"text": "ctrl+l"}'}}]}
         )[0]
@@ -572,7 +529,7 @@ class ToolWiringTests(unittest.TestCase):
         self.assertIn("type at 4,9", line)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class FrameDeliveryTests(unittest.TestCase):
     """A screenshot has to reach the model as an image, and then get out of the
     way before it fills the window."""
@@ -624,7 +581,7 @@ class FrameDeliveryTests(unittest.TestCase):
         self.assertEqual(len(stored), server.COMPUTER_FRAME_KEEP)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class LoopGuardTests(unittest.TestCase):
     def test_a_repeat_against_an_unchanged_screen_is_still_a_repeat(self):
         call = {"name": "computer", "arguments": {"action": "click", "x": 4, "y": 5}}
@@ -711,9 +668,7 @@ class LoopGuardTests(unittest.TestCase):
             )
 
     def test_a_key_pressed_over_and_over_is_one_repeated_action(self):
-        # The failure this exists for: Return in a document changes the screen
-        # every time, so neither the unchanged-screen counter nor the
-        # frame-aware signature sees anything wrong with pressing it forever.
+        # Repeated Return presses need their own guard because each changes the screen.
         key = server._computer_repeat_key({"action": "key", "text": "Return"})
         self.assertEqual(key, server._computer_repeat_key({"action": "key", "text": "Return"}))
         self.assertNotEqual(key, server._computer_repeat_key({"action": "key", "text": "Tab"}))
@@ -744,22 +699,13 @@ class LoopGuardTests(unittest.TestCase):
         self.assertEqual(stalls, 0)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class RunawayKeyTests(unittest.IsolatedAsyncioTestCase):
-    """The wall a real run hit: a report typed into a Google Doc, formatting the
-    model did not like, and then Return pressed forever to push it around.
-
-    Neither earlier guard could see it. Return adds a line, so the screen
-    changes on every press: the unchanged-screen counter resets each time, and
-    the frame folded into the duplicate-call signature makes every press a new
-    call. What identifies it is the repetition itself.
-    """
+    """Catch repeated keys even when every press produces a new frame."""
 
     async def _run_pressing_return(self, presses, look_between=False, tool="computer"):
         performed = []
-        # Every press adds a line, so the frame is new each time. Holding this
-        # constant would let the duplicate-call guard catch it and prove
-        # nothing: it is exactly what does not happen on a real desktop.
+        # Advance the frame after each press to match the real behavior.
         frames = iter(range(1, 10_000))
 
         turns = []
@@ -829,9 +775,7 @@ class RunawayKeyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ctrl+z", corrections[0]["content"])
 
     async def test_a_model_that_ignores_the_correction_ends_the_run(self):
-        # Refusing one press in four only slows a run-away down, and the generic
-        # stall counter cannot end it either: a screenshot between two presses
-        # is a successful call and resets it.
+        # A successful screenshot must not reset the repeated-key guard.
         _, events, chat = await self._run_pressing_return(50)
         self.assertTrue(chat.get("interrupted"))
         final = [e for e in events if e.get("type") == "message"][-1]["message"]
@@ -839,10 +783,7 @@ class RunawayKeyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ctrl+z", final["content"])
 
     async def test_the_same_run_away_through_the_browser_is_also_stopped(self):
-        # It happened: ctrl+a through the browser, fourteen times, while the
-        # desktop tool was the only one the guard knew about. What the generic
-        # duplicate-call guard gave it back was advice about writing files, so
-        # the test looks for this guard's own correction, not merely a stop.
+        # Check for the shared document guard's correction when the browser sends select-all.
         performed, _, chat = await self._run_pressing_return(50, tool="browser")
         self.assertLess(len(performed), 6)
         self.assertTrue(chat.get("interrupted"))
@@ -861,13 +802,7 @@ class RunawayKeyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(chat.get("interrupted"))
 
     async def test_a_run_can_keep_looking_without_being_told_to_stop(self):
-        """Six snapshots in one run came back refused as duplicates.
-
-        The duplicate-call guard counts identical arguments and assumes an
-        identical result. For an observation that is false, since the point
-        of a second snapshot is that a menu opened since the first, and
-        refusing them took away the one move that gets a stuck run unstuck.
-        """
+        """Allow repeated observations because the screen may have changed."""
         looks = []
         turns = []
 
@@ -876,9 +811,7 @@ class RunawayKeyTests(unittest.IsolatedAsyncioTestCase):
                 yield {"message": {"content": "Done."}, "done": True, "done_reason": "stop"}
                 return
             turns.append(1)
-            # Look, act, look, act: the ordinary rhythm of driving a page. The
-            # snapshots are identical calls and must not be refused as repeats,
-            # which is a different question from whether looking is all it does.
+            # Allow repeated snapshots when actions happen between them.
             args_out = ({"action": "snapshot"} if len(turns) % 2
                         else {"action": "click", "ref": "e1"})
             yield {
@@ -895,10 +828,7 @@ class RunawayKeyTests(unittest.IsolatedAsyncioTestCase):
             if args.get("action") == "snapshot":
                 looks.append(args)
                 return json.dumps({"ok": True, "elements": [{"ref": "e1", "name": "Bold"}]})
-            # Only an act moves the page, which is what the real browser
-            # reports. Advancing on a look as well would give every snapshot a
-            # unique signature and leave this test unable to see the thing it
-            # is for.
+            # Advance the page counter only on actions, as the browser does.
             world[0] += 1
             return json.dumps({"ok": True, "action": "click", "ref": "e1"})
 
@@ -973,13 +903,7 @@ class RunawayKeyTests(unittest.IsolatedAsyncioTestCase):
         return looks, events, chat
 
     async def test_a_run_that_only_looks_is_stopped(self):
-        """A run took 265 screenshots in a row and never acted on one.
-
-        Exempting observations from the duplicate-call guard was right, since
-        a second snapshot after a menu opens is a new call, but it was
-        the only brake there was, and looking is how you decide what to do,
-        not a thing to do.
-        """
+        """Stop consecutive observations that never lead to an action."""
         looks, _, chat = await self._run_only_looking(400)
         self.assertLess(len(looks), 12, f"took {len(looks)} looks before anything stopped it")
         self.assertTrue(chat.get("interrupted"))
@@ -1052,7 +976,7 @@ class RunawayKeyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(performed), 3)
 
 
-@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+@unittest.skipIf(server is None, "server dependencies are installed in Olith's .venv")
 class ModelRoutingTests(unittest.TestCase):
     """Computer use belongs to any model that can see, not to one of them."""
 
@@ -1083,9 +1007,7 @@ class ModelRoutingTests(unittest.TestCase):
             self.assertNotEqual(server._model_key(chat, model_key="blind:30b"), "blind:30b")
 
     def test_a_grounding_model_is_preferred_when_nothing_was_chosen(self):
-        # Seeing a button and being able to say where it is are different
-        # skills. Six clicks at the same wrong spot is what the second one
-        # missing looks like, and it is not fixed by a bigger general model.
+        # Prefer models trained to locate controls on screen.
         registry = {
             "seer:27b": {"id": "seer:27b", "vision": True, "tools": True},
             "qwen3-vl:8b": {"id": "qwen3-vl:8b", "vision": True, "tools": True},

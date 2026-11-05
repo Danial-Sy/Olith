@@ -1,23 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Per-model policy: tiers, the rejected dials, and tool-name aliases.
+"""Test model-size options and tool-name aliases.
 
-Every size-based dial was implemented, benchmarked against real models, and
-turned off because it measured worse. What these tests protect is that
-outcome: the mechanisms still work when the ablation asks for them, and no
-tier turns one on. A future change has to beat a measurement, not an argument.
-
-See `scripts/bench_tool_choice.py` for the harness and ARCHITECTURE.md for the
-summary.
+Keep size-based options disabled unless benchmarks support a change.
+See scripts/bench_tool_choice.py and ARCHITECTURE.md.
 """
 import json
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import agent
+import mcp_connections
 import policy
 
 B = 1_000_000_000
@@ -71,15 +68,13 @@ class NothingIsEnabledTests(unittest.TestCase):
             self.assertFalse(pol["lean_schemas"], f"{tier} re-enabled leaning")
 
     def test_every_size_receives_the_same_schemas(self):
-        # Including the sizes the dials used to change. A 0.5B and a 27B get
-        # identical tools, because nothing size-based survived measurement.
-        # Computer use is the one thing that does change the set, and it is a
-        # property of the chat rather than of the model, so it is on here to
-        # keep the comparison against the complete list.
+        # Use the same tools for every model size. Enable account and computer
+        # tools through their connection and chat settings.
         chat = {"delegate_available": True, "computer_use": True}
         expected = json.dumps(agent.TOOL_DEFS, ensure_ascii=False)
         for params in (0.5, 3, 7.6, 14.8, 27, 30):
-            got = agent.tool_defs_for(chat, 65536, _profile(params))
+            with patch.object(mcp_connections, "active", return_value=[{"id": "fixture"}]):
+                got = agent.tool_defs_for(chat, 65536, _profile(params))
             self.assertEqual(json.dumps(got, ensure_ascii=False), expected, f"{params}B")
 
     def test_an_unprofiled_run_is_identical_too(self):
@@ -195,11 +190,7 @@ class MechanismsStillWorkTests(unittest.TestCase):
 
 
 class AliasTests(unittest.TestCase):
-    """The one thing that shipped, because it cannot regress anything.
-
-    A model emitting a real tool name never reaches the alias table, so a
-    strong model's behaviour is unchanged by construction.
-    """
+    """Leave real tool names unchanged when aliases are enabled."""
 
     def test_the_names_models_actually_reach_for_resolve(self):
         for alias, real in (("execute_command", "run_shell"), ("bash", "run_shell"),

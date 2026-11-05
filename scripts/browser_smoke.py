@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Danial Syed
-"""Drive a real headless Chrome through browser.py and check what happened.
+"""Test browser.py against a real headless Chrome and a local test page.
 
-The unit tests hold the decisions; this holds the protocol. Run it after
-touching browser.py, or on a machine where the browser behaves differently:
-
+Run after browser changes:
     .venv/bin/python scripts/browser_smoke.py
-
-It serves its own page, so nothing here depends on a site staying the same.
 """
 from __future__ import annotations
 
@@ -53,7 +49,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def main() -> int:
-    root = Path(tempfile.mkdtemp(prefix="aether-smoke-"))
+    root = Path(tempfile.mkdtemp(prefix="olith-smoke-"))
     (root / "page.html").write_text(PAGE, encoding="utf-8")
     class Quiet(SimpleHTTPRequestHandler):
         def log_message(self, *_args):  # the fixture's traffic is not the output
@@ -63,8 +59,7 @@ def main() -> int:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}/page.html"
 
-    # Headless, and on its own port and profile, so a smoke run never touches
-    # the browser Aether is actually using.
+    # Use a separate headless Chrome, port and profile for this test.
     browser.PORT = 9411
     browser.PROFILE = root / "profile"
     real_launch = browser._launch
@@ -104,8 +99,7 @@ def main() -> int:
         body = "One paragraph. " * 60
         call(action="type", text=body)
         landed = browser.evaluate("document.getElementById('doc').innerText")
-        # Counted rather than matched as a substring: the insert goes in at the
-        # caret, which is mid-word in the text the element already had.
+        # Check inserted character counts because the caret starts mid-word.
         check("a long insert arrives whole",
               len(landed) - len("edit me") == len(body),
               f"{len(body)} sent, {len(landed) - len('edit me')} added")

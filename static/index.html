@@ -5,7 +5,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Aether</title>
+  <title>Olith</title>
+  <link rel="icon" type="image/svg+xml" href="/static/assets/olith-mark.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -18,7 +19,7 @@
 <body class="is-warming">
   <div id="warmSplash" class="warm-splash" role="status" aria-live="polite">
     <div class="warm-inner">
-      <div class="brand-mark warm-ring" aria-hidden="true"></div>
+      <div class="brand-mark warm-mark" aria-hidden="true"></div>
       <p class="warm-title">Warming up</p>
       <p class="warm-sub" id="warmSub">Loading your model…</p>
     </div>
@@ -26,7 +27,8 @@
   <div id="app" class="app app-hidden">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
-        <div class="brand-name">Aether</div>
+        <img class="brand-logo" src="/static/assets/olith-mark.svg" alt="" width="28" height="28" />
+        <div class="brand-name">Olith</div>
         <button class="icon-btn brand-gear side-tab" data-panel="settings"
                 id="btnSettings" title="Settings" aria-label="Settings">⚙</button>
       </div>
@@ -49,8 +51,11 @@
           <div class="chat-list" id="chatListAgentic"></div>
         </div>
         <div class="side-panel" id="panel-projects">
-          <button class="btn-ghost full" id="btnNewProject">+ Add project folder</button>
+          <div class="workspace-heading"><div><span class="panel-kicker">YOUR WORKSPACE</span><h2>Projects <span id="projectCount">0</span></h2></div><button class="workspace-add" id="btnNewProject" title="Add project folder" aria-label="Add project folder">+</button></div>
+          <label class="sr-only" for="projectSearch">Search local projects</label><input id="projectSearch" class="workspace-search" placeholder="Find a project…" type="search" />
           <div class="project-list" id="projectList"></div>
+          <button class="btn-ghost full project-review" id="btnTaskChanges">Review task changes</button>
+          <section class="repo-library" aria-label="GitHub repositories"><div class="workspace-section-heading"><h3>GitHub repositories</h3><button class="workspace-refresh" id="refreshProjectRepos" aria-label="Refresh GitHub repositories" title="Refresh GitHub repositories">↻</button></div><p id="projectRepoAccount" class="workspace-note">Connect GitHub in Connections to browse your repos.</p><button class="workspace-connect" id="projectConnectGitHub">Open Connections ↗</button><div id="projectRepoBrowser" hidden><label class="sr-only" for="projectRepoSearch">Search repositories</label><input type="search" class="workspace-search" id="projectRepoSearch" placeholder="Find a repository…" /><p id="projectRepoStatus" class="workspace-note" role="status"></p><div id="projectRepoList" class="project-repos"></div><button class="btn-ghost full" id="projectCloneOther">Clone by repository name</button></div></section>
         </div>
         <div class="side-panel" id="panel-memory">
           <form id="memoryForm" class="memory-form">
@@ -70,10 +75,21 @@
           <p class="ctx-hint">Every model on Ollama, and every GGUF on Hugging Face.</p>
         </div>
         <div class="side-panel" id="panel-connections">
-          <div class="panel-label">Connected</div>
+          <div class="workspace-heading"><div><span class="panel-kicker">ACCOUNTS &amp; TOOLS</span><h2>Connections</h2></div><button class="workspace-refresh" id="refreshIntegrations" title="Refresh connection status" aria-label="Refresh connection status">↻</button></div>
+          <p id="connectionActivity" class="connection-activity" role="status" aria-live="polite" hidden></p>
+          <p class="workspace-note">Each service appears once. Browser sessions, service tools, CLIs and editors all count as connections.</p>
+          <label class="sr-only" for="connectionSearch">Search connections</label>
+          <input id="connectionSearch" type="search" class="workspace-search" placeholder="Find a service…" />
+          <label class="sr-only" for="connectionCategory">Connection category</label>
+          <select id="connectionCategory" class="workspace-search"><option value="">All categories</option></select>
+          <div class="panel-label" id="connConnectedCount">Connected</div>
           <div class="conn-list" id="connList"></div>
-          <div class="panel-label">Add</div>
-          <div class="conn-list" id="connAvailable"></div>
+          <div class="panel-label" id="connCatalogCount">Disconnected</div>
+          <div class="conn-list" id="connAvailable">
+          <div class="integration-status-card" id="githubConnectionCard"><div class="integration-card-heading"><img class="integration-app-icon" src="/static/assets/connections/github.svg" alt="" width="28" height="28" /><strong>GitHub</strong><span class="connection-badge" id="githubConnectionBadge">Checking</span></div><p id="githubConnectionNote">Checking your GitHub account…</p><button class="btn-ghost full" id="btnGitHub">Connect GitHub</button></div>
+          <div class="integration-status-card" id="editorConnectionCard"><div class="integration-card-heading"><img class="integration-app-icon" src="/static/assets/connections/vscode.svg" alt="" width="28" height="28" /><strong>VS Code</strong><span class="connection-badge" id="editorConnectionBadge">Not connected</span></div><p id="editorConnectionNote">Pair an editor to work directly in your files.</p><div id="editorSessions"></div><button class="btn-ghost full" id="btnVSCode">Connect VS Code</button></div>
+          </div>
+          <button type="button" class="conn-add" id="btnAddToolConnection">+ Connect service tools or CLI</button>
           <hr class="conn-sep" />
           <button type="button" class="conn-add" id="btnAddSite">+ Sign in to another site</button>
           <button type="button" class="conn-add" id="btnAddKey">+ Keep an API key</button>
@@ -100,14 +116,16 @@
           </label>
           <p class="ctx-hint">Lets file tools reach anywhere your user account can read, not just the allowed roots. Shell commands still run, so only enable this if you are comfortable with that.</p>
           <label class="field">
-            <span>Shell command approval</span>
+            <span>Approval mode</span>
             <select id="setShellApproval">
-              <option value="always_ask">Ask every time</option>
-              <option value="safe_auto">Auto-run safe commands</option>
-              <option value="never_ask">Never ask</option>
+              <option value="always_ask">Ask before every command</option>
+              <option value="safe_auto">Balanced · auto-run safe commands</option>
+              <option value="never_ask">Shell only · no command approvals</option>
+              <option value="full_access">Full access · no action approvals</option>
             </select>
           </label>
-          <p class="ctx-hint">Auto-run safe commands lets Aether work without interrupting you: it runs your project's code, edits its files, installs packages and uses git freely. It stops only for things you would want to catch: deleting files (rm, shred), sudo, disk and system commands, writes into system folders, piping a download straight into a shell, and git push / reset --hard / clean -f. Approve one of those with "Always allow" and it will not ask again. Ask every time confirms every command; Never ask runs everything unattended.</p>
+          <p class="ctx-hint">Balanced runs safe commands automatically and asks before destructive commands, GitHub changes and service actions. Ask before every command also confirms safe shell commands. Shell only skips command approvals while keeping GitHub and service approvals.</p>
+          <p id="fullAccessWarning" class="full-access-warning" role="status" hidden>Use at your own risk. Full access lets Olith run commands, delete files, change repositories and act through connected services without asking for authorization. Actions can be irreversible. Only enable this if you trust Olith with your files and accounts.</p>
           <p class="ctx-hint">The window each job gets. A model that cannot serve the size you pick is clamped to its own limit, and a single model can be given its own window from the context dial next to the composer.</p>
           <label class="field">
             <span>Chat window</span>
@@ -125,6 +143,26 @@
             <span>Repeated-call stop limit</span>
             <input type="number" id="setAgentRepeatLimit" min="2" max="10" value="3" />
           </label>
+          <label class="field check">
+            <span>Repository context map</span>
+            <input type="checkbox" id="setRepoMap" class="theme-check" checked />
+          </label>
+          <label class="field check">
+            <span>Semantic code search</span>
+            <input type="checkbox" id="setSemantic" class="theme-check" />
+          </label>
+          <label class="field">
+            <span>Embedding model</span>
+            <input type="text" id="setEmbeddingModel" value="nomic-embed-text" spellcheck="false" />
+          </label>
+          <label class="field">
+            <span>Embedding device</span>
+            <select id="setEmbeddingDevice">
+              <option value="cpu">CPU (save GPU memory)</option>
+              <option value="auto">Ollama automatic</option>
+            </select>
+          </label>
+          <p class="ctx-hint">Install an embedding model in Ollama first, then build its index from the project's Index panel. Code search works with text and symbols while embeddings are unavailable.</p>
           <button class="btn-ghost" id="btnSaveSettings">Save</button>
           <div class="model-status" id="modelStatus"></div>
         </div>
@@ -167,23 +205,26 @@
         <div class="chat-area" id="chatArea">
           <div class="empty-state" id="emptyState">
             <div class="empty-hero">
-              <div class="brand-mark" id="emptyRing" aria-hidden="true"></div>
+              <div class="brand-mark" id="emptyMark" aria-hidden="true"></div>
               <p class="empty-tagline" id="emptyTagline">What can we tackle together?</p>
             </div>
-            <h1 id="emptyTitle" hidden>Aether</h1>
+            <h1 id="emptyTitle" hidden>Olith</h1>
           </div>
           <div class="messages" id="messages" hidden></div>
         </div>
         <aside class="project-drawer" id="projectDrawer" hidden>
           <div class="drawer-head">
-            <strong>Project</strong>
-            <select id="projectSelect"></select>
+            <span class="panel-kicker">ACTIVE WORKSPACE</span>
+            <label class="sr-only" for="projectSelect">Active project</label><select id="projectSelect"></select>
+            <p id="selectedProjectPath" class="workspace-note">Choose a local project to give Olith context.</p>
+            <div id="selectedProjectLinks" class="project-link-badges"></div>
           </div>
           <div class="drawer-tree" id="projectTree"></div>
         </aside>
       </section>
 
       <footer class="composer">
+        <p id="fullAccessIndicator" class="full-access-indicator" hidden>Full access is on · actions run without approval</p>
         <div id="approvalDock" class="approval-dock" hidden></div>
         <div id="agentTodoPanel" class="agent-todo-panel" hidden>
           <button type="button" class="agent-todo-toggle" id="agentTodoToggle" aria-expanded="true">
@@ -292,14 +333,13 @@
 
   <div class="model-warm" id="modelWarmOverlay" hidden>
     <div class="model-warm-card">
-      <div class="brand-mark warm-ring spin" id="modelWarmRing" aria-hidden="true"></div>
+      <div class="brand-mark warm-mark is-working" id="modelWarmMark" aria-hidden="true"></div>
       <div class="model-warm-title" id="modelWarmTitle">Warming model…</div>
       <div class="model-warm-sub">This only takes a moment</div>
     </div>
   </div>
 
-  <!-- The model library. A full screen rather than a pane: two sources, four
-       sorts, a size filter and an endless scroll do not fit in a sidebar. -->
+  <!-- Full-screen model library with search, filters and scrolling. -->
   <div class="library" id="libraryScreen" hidden>
     <header class="library-top">
       <div class="library-sources" role="tablist">
@@ -334,8 +374,7 @@
 
     <div class="library-scroll" id="libraryScroll">
       <div class="library-grid" id="libraryGrid"></div>
-      <!-- The sentinel scrolls with the grid. Outside the scroller it would
-           never leave the viewport, and the loader would run to exhaustion. -->
+      <!-- Keep the loading sentinel inside the grid scroller. -->
       <div class="library-foot" id="libraryFoot"></div>
     </div>
   </div>
@@ -355,21 +394,82 @@
 
   <input type="file" id="filePicker" multiple accept="*/*" hidden />
 
+  <dialog id="commandsDialog">
+    <div class="dialog-card dialog-wide">
+      <h2 id="commandsTitle">Project checks</h2>
+      <p class="ctx-hint">Olith discovers these from project files and runs applicable checks before finishing a task. Editing a row creates a manual override. Reset returns to discovery.</p>
+      <div id="commandRows"></div>
+      <div class="index-actions">
+        <button type="button" class="btn-ghost" id="btnAddCommand">Add command</button>
+        <button type="button" class="btn-ghost" id="btnSaveCommands">Save overrides</button>
+        <button type="button" class="btn-ghost" id="btnResetCommands">Reset to discovered</button>
+        <button type="button" class="btn-ghost" id="btnCloseCommands">Close</button>
+      </div>
+      <p id="commandStatus" class="ctx-hint" role="status"></p>
+    </div>
+  </dialog>
+
+  <dialog id="changesDialog">
+    <div class="dialog-card dialog-wide">
+      <h2>Task changes</h2>
+      <p class="ctx-hint">Changes are compared with the files at the start of this task, including your uncommitted work. Select edit blocks to undo. Files changed again since review are protected.</p>
+      <p id="changesStatus" class="ctx-hint" role="status"></p>
+      <div id="changeRows"></div>
+      <div class="index-actions">
+        <button type="button" class="btn-ghost" id="btnUndoChanges">Undo selected blocks</button>
+        <button type="button" class="btn-ghost" id="btnCloseChanges">Close</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="indexDialog">
+    <div class="dialog-card dialog-wide">
+      <div class="row"><h2 id="indexTitle">Project index</h2><button type="button" class="btn-ghost" id="btnCloseIndex">Close</button></div>
+      <p class="ctx-hint" id="indexStatus" role="status" aria-live="polite"></p>
+      <div class="index-actions">
+        <button type="button" class="btn-ghost" id="btnRefreshIndex">Refresh index</button>
+        <button type="button" class="btn-ghost" id="btnEmbedIndex">Build semantic index</button>
+        <button type="button" class="btn-ghost" id="btnStopIndex" hidden>Stop indexing</button>
+      </div>
+      <label class="field"><span>Find code</span><input id="indexQuery" placeholder="Where are payment tokens authenticated?" /></label>
+      <div class="index-actions">
+        <select id="indexSearchMode" aria-label="Search mode">
+          <option value="hybrid">Concepts and text</option>
+          <option value="symbols">Definitions</option>
+          <option value="references">Identifier occurrences</option>
+          <option value="map">Repository map</option>
+        </select>
+        <button type="button" class="btn-ghost" id="btnSearchIndex">Search</button>
+      </div>
+      <p class="ctx-hint">Indexes stay on this computer. Ignored files, common dependency folders, and symlinks are excluded. Add project-specific exclusions to .olithignore. Identifier occurrences help navigation; they do not guarantee a complete refactor.</p>
+      <p id="indexSearchNote" class="ctx-hint" role="status"></p>
+      <pre id="indexResults" class="index-results" tabindex="0" aria-label="Code search results"></pre>
+    </div>
+  </dialog>
+
   <dialog id="projectDialog">
     <form method="dialog" id="projectDialogForm" class="dialog-card">
-      <h2>Add project</h2>
+      <h2 id="projectDialogTitle">Create project</h2>
+      <label><span>Project setup</span>
+        <select id="projectSetup" class="dialog-field">
+          <option value="create">Create project in Olith</option>
+          <option value="existing">Add existing folder</option>
+        </select>
+      </label>
       <label><span>Name</span> <input class="dialog-field" name="name" required placeholder="My Project" /></label>
-      <label><span>Folder path</span>
+      <p id="projectLocation" class="ctx-hint" role="status"></p>
+      <label id="projectExistingFolder" hidden><span>Folder path</span>
         <div class="path-row">
-          <input class="dialog-field" name="root" id="projectRootInput" required placeholder="~/Projects/MyRepo" />
+          <input class="dialog-field" name="root" id="projectRootInput" disabled placeholder="~/Projects/MyRepo" />
           <button type="button" class="btn-ghost" id="btnBrowseProject">Browse</button>
         </div>
       </label>
       <label><span>Notes</span> <input class="dialog-field" name="description" placeholder="Optional" /></label>
       <div class="dialog-actions">
         <button type="button" class="btn-ghost" id="btnProjectCancel">Cancel</button>
-        <button type="button" class="btn-primary" id="btnProjectOk">Create</button>
+        <button type="submit" class="btn-primary" id="btnProjectOk">Create project</button>
       </div>
+      <p id="projectError" class="ctx-hint" role="alert" hidden></p>
     </form>
   </dialog>
 
@@ -420,6 +520,90 @@
     </form>
   </dialog>
 
+  <dialog id="gitDialog"><div class="dialog-card integration-card">
+    <div class="integration-heading"><h2 id="gitTitle">Repository</h2><button type="button" class="btn-ghost" id="closeGit">Close</button></div>
+    <p id="gitSummary" class="ctx-hint"></p>
+    <form id="gitForm"><label class="field"><span>Action</span><select id="gitAction"></select></label><div id="gitFields"></div><button class="btn-primary" type="submit" id="gitRun">Run action</button></form>
+    <pre id="gitResult" class="integration-result" aria-live="polite"></pre>
+  </div></dialog>
+  <dialog id="githubDialog"><div class="dialog-card integration-card">
+    <div class="integration-heading"><h2>GitHub repositories</h2><button type="button" class="btn-ghost" id="closeGitHub">Close</button></div>
+    <p id="githubAccount" aria-live="polite"></p>
+    <p class="ctx-hint">Use your existing GitHub CLI sign-in, or a token kept in your operating system keyring. Browser sign-in is separate. <a href="https://github.com/settings/personal-access-tokens" target="_blank" rel="noopener noreferrer">Create a token</a> with access to the repositories you need.</p>
+    <form id="githubConnectForm"><label class="field"><span>GitHub access token</span><input id="githubToken" type="password" autocomplete="off" required /></label><button class="btn-primary" type="submit">Connect</button> <button type="button" class="btn-ghost" id="disconnectGitHub">Forget saved token</button></form>
+    <details class="github-browser"><summary>Optional browser sign-in</summary><p class="ctx-hint">For using the GitHub website in Olith's browser. Repository access above uses your token or GitHub CLI.</p><div id="githubBrowserConnection"></div></details>
+    <div class="dialog-actions"><button type="button" class="btn-ghost" id="refreshGitHub">Refresh repositories</button><button type="button" class="btn-ghost" id="cloneGitHub">Clone repository</button><button type="button" class="btn-primary" id="createGitHub">Create repository</button></div>
+    <div id="githubRepos" class="integration-repos"></div>
+  </div></dialog>
+  <dialog id="ideDialog"><div class="dialog-card integration-card">
+    <div class="integration-heading"><h2>Connect VS Code</h2><button type="button" class="btn-ghost" id="closeIDE">Close</button></div>
+    <p>Keep Olith running. Download the extension, then follow these steps in VS Code:</p>
+    <p id="ideConnectionStatus" class="connection-summary" role="status">Not connected yet.</p>
+    <div class="integration-install"><button class="btn-primary" id="installIDE" type="button" hidden>Install / update in VS Code</button><a class="btn-ghost" id="downloadIDE" href="/api/ide/extension" download>Download VS Code extension</a></div>
+    <p id="ideDownloadStatus" class="ctx-hint" role="status"></p>
+    <ol>
+      <li>Click <strong>Install / update in VS Code</strong> above, or press <strong>Ctrl+Shift+P</strong>, run <strong>Extensions: Install from VSIX…</strong>, and select the latest <strong>olith-vscode</strong> download. Then run <strong>Developer: Reload Window</strong> in VS Code to activate the update.</li>
+      <li>Use <strong>File → Open Folder…</strong> to open your local project. The extension needs a trusted workspace.</li>
+      <li>Click <strong>Generate pairing code</strong> below. In VS Code, press <strong>Ctrl+Shift+P</strong>, run <strong>Olith: Connect to Olith</strong>, and enter the code.</li>
+      <li>Open the <strong>Olith</strong> icon in VS Code’s left sidebar, or run <strong>Olith: Open Chat</strong>. Check the project name at the top; hover it for the full path. Pick an installed Agentic model beside the send button, then send a message.</li>
+    </ol>
+    <p>Enter this one-time code in VS Code within two minutes:</p><output id="idePairCode" class="ide-pair-code" aria-live="polite"></output>
+    <button type="button" class="btn-primary" id="newIDECode">Generate pairing code</button>
+    <p id="idePairStatus" class="ctx-hint" role="status">Generate a code when you are ready to connect.</p>
+    <p class="ctx-hint">Try “Explain how this project starts up.” Highlight code and right-click → Olith: Send Selection to discuss it. For a reported error, press Ctrl+. on its squiggle and choose Fix with Olith. The clipboard icon reviews task changes; Send becomes Stop while Olith works. Click ↻ beside the model picker to refresh installed models. Restart Olith after updating and reload VS Code after installing the extension. Pair once per workspace; saved pairings reconnect automatically after restarts.</p>
+  </div></dialog>
+  <dialog id="toolConnectionDialog">
+    <form id="toolConnectionForm" class="dialog-card dialog-wide">
+      <h2>Connect service tools</h2>
+      <label><span>Service</span><span class="connection-service-choice"><span id="toolConnectionPresetIcon" class="connection-logo-slot" aria-hidden="true"></span><select id="toolConnectionPreset" class="dialog-field"><option value="">Custom MCP server</option></select></span></label>
+      <p id="toolConnectionPresetNote" class="ctx-hint"></p>
+      <a id="toolConnectionDocs" target="_blank" rel="noopener noreferrer" hidden>Provider setup instructions ↗</a>
+      <button id="toolConnectionRailwayCLI" type="button" class="btn-ghost" hidden>Use an installed Railway CLI instead</button>
+      <div id="toolConnectionCLI" class="tool-connection-fields" hidden>
+        <label id="toolConnectionProviderField"><span>CLI provider</span><select id="toolConnectionProvider" class="dialog-field"></select></label>
+        <p class="ctx-hint">Run this setup once in your own terminal, then verify the login here. Olith reuses the CLI's credentials without copying them. Project linking happens separately when you choose a project.</p>
+        <pre id="toolConnectionCLISetup" class="cli-setup"></pre>
+        <details id="toolConnectionLinuxHelp" class="cli-linux-help" hidden>
+          <summary>Linux: install permission errors (EACCES / sudo)</summary>
+          <p class="ctx-hint">If a global npm install fails with EACCES, npm recommends a user-owned Node installation or npm directory. See the <a href="https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally/" target="_blank" rel="noopener noreferrer">npm permissions guide</a>. For a system-wide installation, you may need administrator permission for the install command:</p>
+          <pre id="toolConnectionSudoInstall" class="cli-setup"></pre>
+          <p class="ctx-hint">Run the provider sign-in command and Olith as your normal user, without sudo, so Olith can reuse your login.</p>
+        </details>
+        <button id="toolConnectionCopyCLI" type="button" class="btn-ghost">Copy setup instructions</button>
+      </div>
+      <details id="toolConnectionSettings" open><summary>Connection settings</summary><div class="tool-connection-fields">
+      <label><span>Name</span><input id="toolConnectionLabel" class="dialog-field" required maxlength="100" placeholder="My service" /></label>
+      <details><summary>Connection identifier</summary><label><span>Connection ID</span><input id="toolConnectionId" class="dialog-field" required pattern="[a-z0-9][a-z0-9_-]{0,63}" placeholder="my-service" /></label></details>
+      <label><span>Connection method</span><select id="toolConnectionTransport" class="dialog-field"><option value="cli">Installed service CLI</option><option value="http" selected>Hosted MCP server</option><option value="stdio">Local MCP command</option></select></label>
+      <div id="toolConnectionHTTP" class="tool-connection-fields">
+        <label><span>Server URL</span><input id="toolConnectionURL" type="url" class="dialog-field" placeholder="https://service.example/mcp" /></label>
+        <label><span>Sign-in method</span><select id="toolConnectionAuth" class="dialog-field"><option value="oauth">Sign in with browser (OAuth)</option><option value="bearer">Access token</option><option value="none">No sign-in required</option></select></label>
+        <label id="toolConnectionTokenField"><span>Access token</span><input id="toolConnectionToken" class="dialog-field" type="password" autocomplete="off" placeholder="Saved in your system keyring" /></label>
+        <details id="toolConnectionOAuth"><summary>OAuth app settings, if your provider requires them</summary>
+          <p class="ctx-hint" id="toolConnectionCallback"></p>
+          <label><span>Client ID or HTTPS client metadata URL</span><input id="toolConnectionClientId" class="dialog-field" autocomplete="off" /></label>
+          <label><span>Client secret</span><input id="toolConnectionClientSecret" class="dialog-field" type="password" autocomplete="off" placeholder="Leave blank to keep the saved secret" /></label>
+          <label><span>Scopes</span><input id="toolConnectionScope" class="dialog-field" placeholder="Leave blank to use the provider's defaults" /></label>
+        </details>
+      </div>
+      <div id="toolConnectionLocal" class="tool-connection-fields" hidden>
+        <p class="ctx-hint">Olith starts this installed program when its tools are needed. Arguments are saved on disk; keep credentials in environment variables below.</p>
+        <label><span>Executable</span><input id="toolConnectionCommand" class="dialog-field" placeholder="railway" /></label>
+        <label><span>Arguments (JSON array)</span><textarea id="toolConnectionArgs" class="dialog-field" rows="2" placeholder='["mcp"]'></textarea></label>
+        <label><span>Secret environment variables (JSON object)</span><textarea id="toolConnectionEnv" class="dialog-field" rows="2" placeholder='{"API_KEY": "your-key"}' autocomplete="off"></textarea></label>
+        <p id="toolConnectionEnvNote" class="ctx-hint">Optional. Values go to your system keyring.</p>
+      </div>
+      </div></details>
+      <label class="tool-connection-enabled"><input id="toolConnectionEnabled" type="checkbox" checked /> Use this connection in Agentic tasks</label>
+      <p id="toolConnectionStatus" class="ctx-hint" role="status"></p>
+      <a id="toolConnectionAuthorize" class="btn-primary" target="_blank" rel="noopener noreferrer" hidden>Continue sign-in ↗</a>
+      <div class="dialog-actions"><button id="toolConnectionClose" type="button" class="btn-ghost">Close</button><button id="toolConnectionCancel" type="button" class="btn-ghost" hidden>Cancel sign-in</button><button id="toolConnectionSave" type="submit" class="btn-primary">Save and connect</button></div>
+    </form>
+  </dialog>
+  <script src="/static/connection_logos.js"></script>
+  <script src="/static/browser_connections.js"></script>
   <script src="/static/app.js"></script>
+  <script src="/static/tool_connections.js"></script>
+  <script src="/static/integrations.js"></script>
 </body>
 </html>
