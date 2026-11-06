@@ -2309,6 +2309,12 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
         "shell_approval_mode": "safe_auto",
     }
     META = {"id": "test-model", "keep_alive": "1m", "temperature": 0.2, "context": 32768}
+    SERVICE = {
+        "id": "fixture", "label": "Fixture service", "revision": "fixture-revision",
+        "enabled": True, "status": "connected",
+        "tools": [{"name": "delete_fixture", "inputSchema": {"type": "object", "properties": {}},
+                   "annotations": {"readOnlyHint": False, "destructiveHint": True}}],
+    }
 
     def _sampler(self, command="sudo apt install p7zip-full"):
         calls = []
@@ -2327,7 +2333,7 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
         return fake_stream_chat
 
     @contextlib.contextmanager
-    def _harness(self, command="sudo apt install p7zip-full"):
+    def _harness(self, command="sudo apt install p7zip-full", *, services=()):
         async def no_compact(chat, model_key, emit=None, msgs=None):
             return chat, False
 
@@ -2338,6 +2344,7 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.st, "save_chat", side_effect=lambda v: v),
             patch.object(server, "SHELL_APPROVAL_TIMEOUT", 5.0),
             patch.object(server.st, "load_settings", return_value=dict(self.SETTINGS)),
+            patch.object(server.mcp_connections, "active", return_value=list(services)),
         ):
             yield
 
@@ -2374,7 +2381,7 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
         calls = [
             ("run_shell", {"command": "rm -rf disposable-fixture"}),
             ("git_status", {"action": "push"}),
-            ("connection_call", {"connection_id": "fixture", "tool": "delete_fixture", "arguments": {}}),
+            ("connection_call", {"server": "fixture", "tool": "delete_fixture", "arguments": {}}),
         ]
         for name, arguments in calls:
             with self.subTest(tool=name):
@@ -2390,11 +2397,9 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
                     yield {"message": message, "done": True, "done_reason": "stop"}
 
                 chat = {"id": "full-access-test", "messages": [{"role": "user", "content": "Run the fixture action"}]}
-                with self._harness(), \
+                with self._harness(services=[self.SERVICE]), \
                      patch.object(server.st, "load_settings", return_value={**self.SETTINGS, "approval_mode": "full_access"}), \
                      patch.object(server.oc, "stream_chat", new=sampler), \
-                     patch.object(server.mcp_connections, "preflight", return_value=None), \
-                     patch.object(server.mcp_connections, "approval_ticket", return_value=("revision", "fingerprint")), \
                      patch.object(server, "_index_work", new=AsyncMock(side_effect=lambda fn, *a, **kw: fn(*a, **kw))), \
                      patch.object(server.mcp_connections, "call", return_value={"ok": True}) as service_call:
                     async def collect():
@@ -2406,12 +2411,17 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(any(event.get("type") == "shell_approval" for event in events))
                     self.assertTrue(any(event.get("type") == "tool_start" for event in events))
                     if name == "connection_call":
-                        service_call.assert_called_once_with(arguments, approved=True, ticket=("revision", "fingerprint"))
+                        service_call.assert_called_once_with(
+                            arguments, approved=True, ticket=server.mcp_connections.approval_ticket(arguments),
+                        )
                     else:
                         self.assertTrue(any(call.args[:2] == (name, arguments) for call in server.agent.run_tool.call_args_list))
 
     async def test_unattended_shell_does_not_grant_service_or_github_actions(self):
-        for name, arguments in [("git_status", {"action": "push"}), ("connection_call", {"tool": "change"})]:
+        for name, arguments in [
+            ("git_status", {"action": "push"}),
+            ("connection_call", {"server": "fixture", "tool": "delete_fixture", "arguments": {}}),
+        ]:
             with self.subTest(tool=name):
                 count = 0
 
@@ -2422,12 +2432,9 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
                     yield {"message": message, "done": True, "done_reason": "stop"}
 
                 chat = {"id": "legacy-shell-test", "messages": [{"role": "user", "content": "Run fixture"}]}
-                with self._harness(), \
+                with self._harness(services=[self.SERVICE]), \
                      patch.object(server.st, "load_settings", return_value={**self.SETTINGS, "shell_approval_mode": "never_ask"}), \
                      patch.object(server.oc, "stream_chat", new=sampler), \
-                     patch.object(server.mcp_connections, "preflight", return_value=None), \
-                     patch.object(server.mcp_connections, "requires_approval", return_value=True), \
-                     patch.object(server.mcp_connections, "approval_ticket", return_value=(1, 2)), \
                      patch.object(server.mcp_connections, "call") as service_call:
                     events = []
                     async for event in server._agent_loop(chat, self.META, "agent", think=False):
